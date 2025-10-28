@@ -135,6 +135,12 @@ def green_button_monitor():
         return
 
     try:
+        # Initialize GPIO if not already done
+        try:
+            GPIO.setmode(GPIO.BCM)
+        except:
+            pass  # Already initialized
+
         # Set up green button pin as input with pull-up resistor
         GPIO.setup(GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         print(f"Green button monitor started on GPIO {GREEN_BUTTON_PIN}")
