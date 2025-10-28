@@ -31,6 +31,7 @@ DATA_LENGTH = 15
 SERIAL_PORT = "/dev/ttyAMA0"  # Primary UART on GPIO 14/15 (pins 8/10)
 SERIAL_BAUD = 115200
 PUMP_STOP_RELAY_PIN = 27  # GPIO pin 27 for pump stop/alert relay
+GREEN_BUTTON_PIN = 17  # GPIO pin 17 for green button (active low with pull-up)
 PUMP_STOP_DURATION = 15  # seconds for PS command
 AUTO_ALERT_DURATION = 10  # seconds for auto-alert
 
@@ -69,6 +70,7 @@ self_test_mode = False  # Track if we're in self-test
 self_test_window = None  # Reference to self-test window
 update_mode = False  # Track if we're in update screen
 update_window = None  # Reference to update window
+serial_command_received = False  # Track if any serial command has been received (for color change)
 
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
@@ -107,6 +109,55 @@ def pump_stop_relay(duration=PUMP_STOP_DURATION):
         print(f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) deactivated")
     except Exception as e:
         print(f"Error controlling relay: {e}")
+
+def change_colors_to_green():
+    """Change display colors from red to green if within 2 gallons of target"""
+    global serial_command_received, last_totalizer_liters, requested_gallons
+
+    # Calculate current actual gallons
+    actual_gallons = last_totalizer_liters * LITERS_TO_GALLONS
+
+    # Check if within 2 gallons of target
+    if abs(actual_gallons - requested_gallons) <= 2.0:
+        if not serial_command_received:
+            serial_command_received = True
+            # Change the number labels to green
+            requested_number_label.config(foreground="green")
+            actual_label.config(foreground="green")
+            print(f"Display colors changed to green (within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})")
+    else:
+        print(f"Cannot change to green: not within 2 gallons ({actual_gallons:.1f}/{requested_gallons:.0f})")
+
+def green_button_monitor():
+    """Monitor GPIO pin for green button press (active low with pull-up)"""
+    if not GPIO_AVAILABLE:
+        print("GPIO not available, green button monitoring disabled")
+        return
+
+    try:
+        # Set up green button pin as input with pull-up resistor
+        GPIO.setup(GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        print(f"Green button monitor started on GPIO {GREEN_BUTTON_PIN}")
+
+        last_button_state = GPIO.HIGH
+
+        while True:
+            # Read current button state
+            current_state = GPIO.input(GREEN_BUTTON_PIN)
+
+            # Detect button press (transition from HIGH to LOW)
+            if last_button_state == GPIO.HIGH and current_state == GPIO.LOW:
+                print("Green button pressed!")
+                # Call color change function in main thread
+                root.after(0, change_colors_to_green)
+                # Debounce delay
+                time.sleep(0.3)
+
+            last_button_state = current_state
+            time.sleep(0.05)  # Check every 50ms
+
+    except Exception as e:
+        print(f"Green button monitor error: {e}")
 
 def show_log_viewer():
     """Display log viewer window with button controls"""
@@ -899,7 +950,7 @@ requested_text_label = ttk.Label(root, text="Requested Gallons:",
 requested_text_label.pack(pady=5)
 
 requested_number_label = ttk.Label(root, text=f"{REQUESTED_GALLONS:.0f}",
-                                  font=("Helvetica", 120, "bold"), foreground="yellow", background="black")
+                                  font=("Helvetica", 120, "bold"), foreground="red", background="black")
 requested_number_label.pack(pady=5)
 
 # Actual Gallons Label (very large, center)
@@ -908,7 +959,7 @@ actual_text_label = ttk.Label(root, text="Actual Gallons:", font=("Helvetica", 3
 actual_text_label.pack(pady=5)
 
 actual_label = ttk.Label(root, text="0.0", font=("Helvetica", 240, "bold"),
-                         foreground="cyan", background="black")
+                         foreground="red", background="black")
 actual_label.pack(pady=10)
 
 # Status Label (for connection errors)
@@ -1030,6 +1081,10 @@ else:
 # Start serial listener in background thread (works without IOL)
 serial_thread = threading.Thread(target=serial_listener, daemon=True)
 serial_thread.start()
+
+# Start green button monitor in background thread
+green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
+green_button_thread.start()
 
 update_dashboard()
 
