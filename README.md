@@ -53,14 +53,44 @@ Supported commands (115200 baud, RS485):
 
 ## Installation
 
-### Prerequisites
+### Quick Install (Recommended)
+
+The easiest way to install the IOL Dashboard is using the automated installation script:
+
+```bash
+# Clone repository
+git clone https://github.com/austins05/Big-Beautiful-Box.git
+cd Big-Beautiful-Box
+
+# Run installation script
+chmod +x install.sh
+./install.sh
+```
+
+The installation script will automatically:
+- Update system packages
+- Install all Python dependencies (tkinter, serial, lgpio)
+- Configure HDMI for 7-inch display (1024x600 resolution)
+- Configure UART on GPIO pins 14/15 for RS485 serial
+- Enable auto-login for the current user
+- Disable screen blanking and idle timeout
+- Install and enable the systemd service
+- Prompt for reboot when complete
+
+**Note**: The script will prompt for sudo password when needed and ask for confirmation before modifying system files.
+
+### Manual Installation
+
+If you prefer to install manually or need to customize the installation:
+
+#### Prerequisites
 
 ```bash
 # Update system
 sudo apt update && sudo apt upgrade -y
 
 # Install Python dependencies
-sudo apt install -y python3-tk python3-serial python3-lgpio git
+sudo apt install -y python3-tk python3-serial python3-lgpio git build-essential cmake
 
 # Install IOL-HAT software (if using IO-Link master)
 # Clone and build from your IOL-HAT repository
@@ -121,13 +151,15 @@ systemctl status iol_dashboard.service
 ## File Structure
 
 ```
-iol-dashboard/
+Big-Beautiful-Box/
+├── install.sh                      # Automated installation script
 ├── dashboard.py                    # Main Python application
 ├── start_iol_dashboard.sh          # Startup script for systemd
 ├── iol_dashboard.service           # Systemd service configuration
 ├── RPi/
 │   ├── __init__.py
 │   └── GPIO.py                     # GPIO compatibility wrapper for Pi 5 (lgpio)
+├── .gitignore                      # Git ignore file
 └── README.md                       # This file
 ```
 
