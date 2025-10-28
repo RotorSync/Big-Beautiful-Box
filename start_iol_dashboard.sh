@@ -7,6 +7,23 @@ if [ -d "/run/user/1000" ]; then
     export XAUTHORITY=$(ls /run/user/1000/.mutter-Xwayland* 2>/dev/null | head -1)
 fi
 
+# Disable screen blanking and power management
+export DISPLAY=:0
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+
+# X11 settings
+xset s off 2>/dev/null          # Disable screen saver
+xset s noblank 2>/dev/null      # Disable screen blanking
+xset -dpms 2>/dev/null          # Disable DPMS (Energy Star) features
+
+# GNOME settings (these are critical for Ubuntu)
+gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
+gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null
+gsettings set org.gnome.desktop.screensaver idle-activation-enabled false 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
+
 # Log file location
 LOG_FILE="/home/user/iol_dashboard.log"
 
@@ -34,6 +51,18 @@ python3 dashboard.py >> "$LOG_FILE" 2>&1 &
 DASHBOARD_PID=$!
 
 echo "$(date): Dashboard PID: $DASHBOARD_PID" >> "$LOG_FILE"
+
+# Keep disabling screen blanking every 2 minutes (in background)
+while kill -0 $DASHBOARD_PID 2>/dev/null; do
+    sleep 120
+    # Re-apply X11 settings
+    xset s off 2>/dev/null
+    xset s noblank 2>/dev/null
+    xset -dpms 2>/dev/null
+    # Re-apply GNOME settings
+    gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
+    gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
+done &
 
 # Wait for dashboard to exit (ignore IOL master crashes)
 wait $DASHBOARD_PID

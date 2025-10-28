@@ -56,8 +56,9 @@ log_info "  3. Clone and build IOL-HAT software"
 log_info "  4. Configure HDMI for 7-inch display"
 log_info "  5. Configure UART for RS485 serial"
 log_info "  6. Configure auto-login"
-log_info "  7. Disable screen blanking"
-log_info "  8. Install systemd service"
+log_info "  7. Disable screen blanking (systemd)"
+log_info "  8. Configure GNOME power management"
+log_info "  9. Install systemd service"
 echo ""
 log_warn "This will modify system configuration files."
 log_warn "Continue? (y/n)"
@@ -186,7 +187,7 @@ fi
 
 # Step 7: Disable screen blanking and idle timeout
 echo ""
-log_info "Step 7/8: Disabling screen blanking and idle timeout..."
+log_info "Step 7/9: Disabling screen blanking and idle timeout..."
 
 LOGIND_CONFIG="
 # Disable idle timeout and screen blanking
@@ -201,9 +202,41 @@ else
     log_info "Idle timeout configuration already present."
 fi
 
-# Step 8: Install systemd service
+# Step 8: Configure GNOME power management (critical for Ubuntu)
 echo ""
-log_info "Step 8/8: Installing systemd service..."
+log_info "Step 8/9: Configuring GNOME power management settings..."
+
+# Create a script to apply GNOME settings (runs as the user)
+cat > /tmp/apply_gnome_settings.sh << 'EOF'
+#!/bin/bash
+export DISPLAY=:0
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+
+gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
+gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null
+gsettings set org.gnome.desktop.screensaver idle-activation-enabled false 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
+
+echo "GNOME power management settings applied"
+EOF
+
+chmod +x /tmp/apply_gnome_settings.sh
+
+# Try to apply settings now if we're in a graphical session
+if [ -n "$DISPLAY" ]; then
+    /tmp/apply_gnome_settings.sh
+    log_info "GNOME settings applied to current session."
+else
+    log_warn "Not in graphical session. GNOME settings will be applied on first boot."
+fi
+
+rm /tmp/apply_gnome_settings.sh
+
+# Step 9: Install systemd service
+echo ""
+log_info "Step 9/9: Installing systemd service..."
 
 # Create dashboard directory if it doesn't exist
 mkdir -p "$INSTALL_HOME/iol-dashboard"

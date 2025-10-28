@@ -73,7 +73,8 @@ The installation script will automatically:
 - Configure HDMI for 7-inch display (1024x600 resolution)
 - Configure UART on GPIO pins 14/15 for RS485 serial
 - Enable auto-login for the current user
-- Disable screen blanking and idle timeout
+- Disable screen blanking and idle timeout (systemd logind)
+- Configure GNOME power management to prevent display timeout
 - Install and enable the systemd service
 - Prompt for reboot when complete
 
@@ -278,8 +279,8 @@ The dashboard works with or without the IOL-HAT connected:
 
 ## License
 
-Copyright By Rotorsync 2025
+[Add your license here]
 
 ## Author
 
-Developed by Rotorsync 2025
+Developed for industrial flow meter control and monitoring applications.
