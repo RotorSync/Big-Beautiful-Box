@@ -24,13 +24,18 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'no
 gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null
 gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
 
+# Disable system notifications and warnings
+gsettings set org.gnome.desktop.notifications show-banners false 2>/dev/null
+gsettings set org.gnome.desktop.notifications show-in-lock-screen false 2>/dev/null
+
 # Log file location
 LOG_FILE="/home/user/iol_dashboard.log"
 
 # Try to start the IOL master application (optional - may fail if IOL-HAT disconnected)
 cd /home/user/iol-hat/src-master-application
 echo "$(date): Attempting to start IOL Master Application..." >> "$LOG_FILE"
-./bin/debug/iol_master_app >> "$LOG_FILE" 2>&1 &
+# Suppress IOL-HAT errors when hardware is not connected (redirect stderr to /dev/null)
+./bin/debug/iol_master_app >> "$LOG_FILE" 2>/dev/null &
 IOL_MASTER_PID=$!
 
 # Wait a moment to see if it crashes immediately
@@ -62,6 +67,7 @@ while kill -0 $DASHBOARD_PID 2>/dev/null; do
     # Re-apply GNOME settings
     gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
     gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
+    gsettings set org.gnome.desktop.notifications show-banners false 2>/dev/null
 done &
 
 # Wait for dashboard to exit (ignore IOL master crashes)
