@@ -8,6 +8,9 @@ IN = 0
 OUT = 1
 HIGH = 1
 LOW = 0
+PUD_OFF = 0
+PUD_DOWN = 1
+PUD_UP = 2
 
 _mode = None
 _chip = None
@@ -21,7 +24,7 @@ def setmode(mode):
 def setwarnings(flag):
     pass  # lgpio doesn't need warnings
 
-def setup(pin, direction):
+def setup(pin, direction, pull_up_down=PUD_OFF):
     global _chip, _pins
     if _chip is None:
         raise RuntimeError("Must call setmode() first")
@@ -29,6 +32,13 @@ def setup(pin, direction):
         lgpio.gpio_claim_output(_chip, pin, LOW)
     else:
         lgpio.gpio_claim_input(_chip, pin)
+        # Set pull up/down resistor
+        if pull_up_down == PUD_UP:
+            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_UP)
+        elif pull_up_down == PUD_DOWN:
+            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_DOWN)
+        else:
+            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_NONE)
     _pins[pin] = direction
 
 def output(pin, value):
