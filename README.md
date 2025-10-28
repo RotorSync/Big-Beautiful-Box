@@ -246,8 +246,8 @@ The dashboard works with or without the IOL-HAT connected:
 
 ## License
 
-[Add your license here]
+Copyright By Rotorsync 2025
 
 ## Author
 
-Developed for industrial flow meter control and monitoring applications.
+Developed by Rotorsync 2025
