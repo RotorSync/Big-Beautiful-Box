@@ -12,6 +12,42 @@ This system provides:
 - Flow-rate-based dynamic shutoff timing
 - Fault-tolerant operation (runs even without flow meter connected)
 
+## 🧠 Raspberry Pi GPIO Pin Usage (IOL HAT)
+
+Based on the information from the [**Crowd Supply IOL HAT**](https://www.crowdsupply.com/pinetech/iol-hat) page, the **IOL HAT** uses the following GPIO pins on the Raspberry Pi:
+
+---
+
+### 🔌 Port 1 & 2
+| Function | GPIO | Physical Pin | Description |
+|-----------|------|---------------|--------------|
+| **Chip Select (CE0)** | GPIO 8 | Pin 24 | SPI Chip Select for Ports 1 & 2 |
+| **Interrupt** | GPIO 24 | Pin 18 | Interrupt line for Ports 1 & 2 |
+
+---
+
+### 🔌 Port 3 & 4
+| Function | GPIO | Physical Pin | Description |
+|-----------|------|---------------|--------------|
+| **Chip Select (CE1)** | GPIO 7 | Pin 26 | SPI Chip Select for Ports 3 & 4 |
+| **Interrupt** | GPIO 25 | Pin 22 | Interrupt line for Ports 3 & 4 |
+
+---
+
+### ⚙️ Standard SPI Interface
+| Function | GPIO | Physical Pin | Description |
+|-----------|------|---------------|--------------|
+| **SPI MOSI** | GPIO 10 | Pin 19 | Master Out Slave In |
+| **SPI MISO** | GPIO 9 | Pin 21 | Master In Slave Out |
+| **SPI SCLK** | GPIO 11 | Pin 23 | SPI Clock |
+
+---
+
+### 📝 Notes
+- The IOL HAT uses the Raspberry Pi’s **standard SPI interface**.
+- Ports **1/2** share `CE0` and interrupt line `GPIO 24`.
+- Ports **3/4** share `CE1` and interrupt line `GPIO 25`.
+
 ## Hardware Requirements
 
 ### Raspberry Pi
@@ -282,5 +318,4 @@ The dashboard works with or without the IOL-HAT connected:
 [Add your license here]
 
 ## Author
-
-Developed for industrial flow meter control and monitoring applications.
+Developed by Rotorsync 2025
