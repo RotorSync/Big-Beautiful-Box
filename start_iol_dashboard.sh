@@ -34,8 +34,7 @@ LOG_FILE="/home/user/iol_dashboard.log"
 # Try to start the IOL master application (optional - may fail if IOL-HAT disconnected)
 cd /home/user/iol-hat/src-master-application
 echo "$(date): Attempting to start IOL Master Application..." >> "$LOG_FILE"
-# Suppress IOL-HAT errors when hardware is not connected (redirect stderr to /dev/null)
-./bin/debug/iol_master_app >> "$LOG_FILE" 2>/dev/null &
+./bin/debug/iol_master_app >> "$LOG_FILE" 2>&1 &
 IOL_MASTER_PID=$!
 
 # Wait a moment to see if it crashes immediately
