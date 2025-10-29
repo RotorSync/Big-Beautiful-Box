@@ -19,7 +19,9 @@ _pins = {}
 def setmode(mode):
     global _mode, _chip
     _mode = mode
-    _chip = lgpio.gpiochip_open(4)  # Pi 5 uses gpiochip4
+    # Only open chip once - don't re-open if already initialized
+    if _chip is None:
+        _chip = lgpio.gpiochip_open(0)  # Pi 5 uses gpiochip4
 
 def setwarnings(flag):
     pass  # lgpio doesn't need warnings
@@ -28,6 +30,14 @@ def setup(pin, direction, pull_up_down=PUD_OFF):
     global _chip, _pins
     if _chip is None:
         raise RuntimeError("Must call setmode() first")
+
+    # If pin already setup, free it first
+    if pin in _pins:
+        try:
+            lgpio.gpio_free(_chip, pin)
+        except:
+            pass  # Ignore errors if already freed
+
     if direction == OUT:
         lgpio.gpio_claim_output(_chip, pin, LOW)
     else:

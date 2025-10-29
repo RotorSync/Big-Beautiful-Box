@@ -7,6 +7,9 @@ import struct
 import socket
 import serial
 import threading
+import subprocess
+import os
+from PIL import Image, ImageTk
 
 # Add /home/user to path for RPi.GPIO wrapper on Pi 5
 sys.path.insert(0, "/home/user")
@@ -60,7 +63,7 @@ FLOW_STOPPED_THRESHOLD = 0.001  # L/s - flow is considered stopped below this
 FLOW_METER_TIMEOUT = 5  # seconds - flow meter considered disconnected after this
 menu_mode = False  # Track if we're in menu mode
 menu_window = None  # Reference to menu window
-menu_selected_index = 0  # Currently selected menu item (0=logs, 1=self-test, 2=update, 3=shutdown, 4=reboot, 5=exit)
+menu_selected_index = 0  # Currently selected menu item (0=logs, 1=self-test, 2=update, 3=shutdown, 4=reboot, 5=exit-desktop, 6=exit-menu)
 menu_buttons = []  # List of menu button widgets
 menu_arrows = []  # List of arrow label widgets
 log_viewer_mode = False  # Track if we're in log viewer
@@ -71,6 +74,9 @@ self_test_window = None  # Reference to self-test window
 update_mode = False  # Track if we're in update screen
 update_window = None  # Reference to update window
 serial_command_received = False  # Track if any serial command has been received (for color change)
+exit_confirm_window = None  # Reference to exit confirmation window
+exit_confirm_handler = None  # Function to call on confirmation
+exit_cancel_handler = None  # Function to call on cancel
 
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
@@ -97,18 +103,75 @@ def calculate_trigger_threshold(flow_rate_l_per_s):
 
 def pump_stop_relay(duration=PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
+    relay_log = "/home/user/relay_test.log"
+
+    # Log function entry
+    with open(relay_log, 'a') as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - pump_stop_relay() CALLED\n")
+        f.write(f"Duration: {duration} seconds\n")
+        f.write(f"GPIO_AVAILABLE: {GPIO_AVAILABLE}\n")
+        f.write(f"PUMP_STOP_RELAY_PIN: {PUMP_STOP_RELAY_PIN}\n")
+
     if not GPIO_AVAILABLE:
-        print("GPIO not available, cannot control relay")
+        msg = "GPIO not available, cannot control relay"
+        print(msg)
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - ERROR: {msg}\n")
         return
 
     try:
+        # GPIO already initialized during startup - just control the output
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - About to set GPIO {PUMP_STOP_RELAY_PIN} HIGH\n")
+
         GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.HIGH)
-        print(f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) activated for {duration} seconds")
+
+        msg = f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
+        print(msg)
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to HIGH\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleeping for {duration} seconds...\n")
+
         time.sleep(duration)
+
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleep complete, about to set GPIO {PUMP_STOP_RELAY_PIN} LOW\n")
+
         GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.LOW)
-        print(f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) deactivated")
+
+        msg = f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) deactivated"
+        print(msg)
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to LOW\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            f.write(f"{'='*60}\n")
     except Exception as e:
-        print(f"Error controlling relay: {e}")
+        msg = f"Error controlling relay: {e}"
+        print(msg)
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - EXCEPTION: {msg}\n")
+            import traceback
+            f.write(traceback.format_exc())
+            f.write(f"{'='*60}\n")
+
+
+def get_ip_address():
+    """Get the current IP address of the system"""
+    try:
+        result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
+        ip = result.stdout.strip().split()[0] if result.stdout.strip() else "No IP"
+        return ip
+    except:
+        return "No IP"
+
+def get_username():
+    """Get the current username"""
+    try:
+        return os.getenv('USER', 'unknown')
+    except:
+        return 'unknown'
 
 def change_colors_to_green():
     """Change display colors from red to green if within 2 gallons of target"""
@@ -121,9 +184,15 @@ def change_colors_to_green():
     if abs(actual_gallons - requested_gallons) <= 2.0:
         if not serial_command_received:
             serial_command_received = True
-            # Change the number labels to green
-            requested_number_label.config(foreground="green")
-            actual_label.config(foreground="green")
+            # Change the number colors to green by redrawing
+            draw_requested_number(f"{requested_gallons:.0f}", "green")
+            current_actual = last_totalizer_liters * LITERS_TO_GALLONS
+            draw_actual_number(f"{current_actual:.1f}", "green")
+            # Show big thumbs up on the right side and start animation!
+            if thumbs_up_label:
+                thumbs_up_label.place(relx=0.85, rely=0.5, anchor="center")
+                if thumbs_up_frames:  # Only animate if we have GIF frames
+                    animate_thumbs_up()
             print(f"Display colors changed to green (within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})")
     else:
         print(f"Cannot change to green: not within 2 gallons ({actual_gallons:.1f}/{requested_gallons:.0f})")
@@ -335,7 +404,7 @@ def run_self_test():
         results_text.insert(tk.END, "\n=== Test Complete ===\n")
 
         # Color tags
-        results_text.tag_config("pass", foreground="green")
+        results_text.tag_config("pass", foreground="red")
         results_text.tag_config("fail", foreground="red")
         results_text.tag_config("skip", foreground="yellow")
 
@@ -542,13 +611,13 @@ def update_menu_highlight():
 def menu_navigate_up():
     """Move selection up in menu"""
     global menu_selected_index
-    menu_selected_index = (menu_selected_index - 1) % 6  # Wrap around - 6 menu items
+    menu_selected_index = (menu_selected_index - 1) % 7  # Wrap around - 7 menu items
     update_menu_highlight()
 
 def menu_navigate_down():
     """Move selection down in menu"""
     global menu_selected_index
-    menu_selected_index = (menu_selected_index + 1) % 6  # Wrap around - 6 menu items
+    menu_selected_index = (menu_selected_index + 1) % 7  # Wrap around - 7 menu items
     update_menu_highlight()
 
 def menu_select():
@@ -566,15 +635,81 @@ def menu_select():
     elif menu_selected_index == 4:
         reboot_system()
     elif menu_selected_index == 5:
+        exit_to_desktop()
+    elif menu_selected_index == 6:
         close_menu()
+
+def exit_to_desktop():
+    """Exit the dashboard and return to desktop with confirmation"""
+    # Create confirmation window
+    confirm_window = tk.Toplevel()
+    confirm_window.title("Exit Confirmation")
+    confirm_window.attributes('-fullscreen', True)
+    confirm_window.configure(bg='black')
+    
+    # Confirmation message
+    message = tk.Label(confirm_window, text="EXIT TO DESKTOP?", 
+                       font=("Helvetica", 48, "bold"), fg="red", bg="black")
+    message.pack(expand=True, pady=50)
+    
+    # Instructions
+    instructions = tk.Label(confirm_window, text="Press OV to CONFIRM or PS to CANCEL",
+                           font=("Helvetica", 26, "bold"), fg="cyan", bg="black")
+    instructions.pack(pady=30)
+    
+    # Countdown timer
+    countdown_label = tk.Label(confirm_window, text="Auto-cancel in 10 seconds",
+                              font=("Helvetica", 22), fg="white", bg="black")
+    countdown_label.pack(pady=20)
+    
+    countdown = [10]  # Use list to allow modification in nested function
+    
+    def cancel_exit():
+        global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
+        confirm_window.destroy()
+        exit_confirm_window = None
+        exit_confirm_handler = None
+        exit_cancel_handler = None
+        # Menu window is already open behind this dialog - just let it reappear
+    
+    def confirm_exit():
+        print("Exiting dashboard to desktop...")
+        confirm_window.destroy()
+        root.destroy()
+        sys.exit(0)
+    
+    def update_countdown():
+        countdown[0] -= 1
+        if countdown[0] <= 0:
+            cancel_exit()
+        else:
+            countdown_label.config(text=f"Auto-cancel in {countdown[0]} seconds")
+            confirm_window.after(1000, update_countdown)
+    
+    # Bind keyboard shortcuts for confirmation
+    confirm_window.bind('<Escape>', lambda e: cancel_exit())
+    
+    # Store the confirmation handlers globally so serial listener can access them
+    global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
+    exit_confirm_window = confirm_window
+    exit_confirm_handler = confirm_exit
+    exit_cancel_handler = cancel_exit
+    
+    # Start countdown
+    confirm_window.after(1000, update_countdown)
 
 def close_menu():
     """Close the menu and return to main dashboard"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index
+    global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
     menu_mode = False
     menu_selected_index = 0
     menu_buttons = []
     menu_arrows = []
+    # Reset exit confirmation globals
+    exit_confirm_window = None
+    exit_confirm_handler = None
+    exit_cancel_handler = None
     if menu_window:
         menu_window.destroy()
         menu_window = None
@@ -613,9 +748,21 @@ def show_menu():
     wifi_label = tk.Label(wifi_frame, text=f"{wifi_symbol} {wifi_status}",
                          font=("Helvetica", 18, "bold"), fg=wifi_color, bg="black")
     wifi_label.pack()
+    
+    # Add IP address
+    ip_address = get_ip_address()
+    ip_label = tk.Label(wifi_frame, text=f"IP: {ip_address}",
+                       font=("Helvetica", 16), fg="white", bg="black")
+    ip_label.pack()
+    
+    # Add username
+    username = get_username()
+    user_label = tk.Label(wifi_frame, text=f"User: {username}",
+                         font=("Helvetica", 16), fg="white", bg="black")
+    user_label.pack()
 
     # Position indicator
-    position = tk.Label(menu_window, text="Option 1 of 6", font=("Helvetica", 20),
+    position = tk.Label(menu_window, text="Option 1 of 7", font=("Helvetica", 20),
                        fg="white", bg="black")
     position.pack(pady=5)
 
@@ -678,6 +825,17 @@ def show_menu():
     menu_buttons.append(reboot_btn)
     menu_arrows.append(reboot_arrow)
 
+
+    # Exit to Desktop button with arrow
+    exit_desktop_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
+                         fg="yellow", bg="black")
+    exit_desktop_arrow.pack()
+    exit_desktop_btn = tk.Button(button_frame, text="EXIT TO DESKTOP", font=("Helvetica", 26, "bold"),
+                         bg="red4", fg="white", command=exit_to_desktop,
+                         width=18, height=1, borderwidth=2)
+    exit_desktop_btn.pack(pady=5)
+    menu_buttons.append(exit_desktop_btn)
+    menu_arrows.append(exit_desktop_arrow)
     # Exit button with arrow
     exit_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
                          fg="yellow", bg="black")
@@ -918,8 +1076,6 @@ def initialize_gpio():
     try:
         # Disable warnings about channels already in use
         GPIO.setwarnings(False)
-        # Clean up any previous GPIO state
-        GPIO.cleanup()
         # Configure GPIO
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(PUMP_STOP_RELAY_PIN, GPIO.OUT)
@@ -950,57 +1106,179 @@ root.title("Tank Dashboard")
 root.configure(bg="black")
 root.attributes("-fullscreen", True)
 
-# Requested Gallons - split into label and number
-requested_text_label = ttk.Label(root, text="Requested Gallons:",
-                                font=("Helvetica", 36, "bold"), foreground="white", background="black")
-requested_text_label.pack(pady=5)
+# Get screen dimensions
+screen_width = root.winfo_screenwidth()
+screen_height = root.winfo_screenheight()
 
-requested_number_label = ttk.Label(root, text=f"{REQUESTED_GALLONS:.0f}",
-                                  font=("Helvetica", 120, "bold"), foreground="red", background="black")
-requested_number_label.pack(pady=5)
+# Create ONE full-screen canvas for everything
+canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+canvas.pack(fill='both', expand=True)
 
-# Actual Gallons Label (very large, center)
-actual_text_label = ttk.Label(root, text="Actual Gallons:", font=("Helvetica", 36, "bold"),
-                              foreground="white", background="black")
-actual_text_label.pack(pady=5)
+# Draw full-screen barber pole stripes
+def draw_fullscreen_stripes():
+    """Draw barber pole stripes across entire screen"""
+    # Get actual canvas size after it's been packed
+    canvas.update()
+    width = canvas.winfo_width()
+    height = canvas.winfo_height()
 
-actual_label = ttk.Label(root, text="0.0", font=("Helvetica", 240, "bold"),
-                         foreground="red", background="black")
-actual_label.pack(pady=10)
+    stripe_height = 30
+    dark_yellow = "#CC9900"
+
+    for i, stripe_y in enumerate(range(0, height, stripe_height)):
+        stripe_color = "red" if i % 2 == 0 else dark_yellow
+        canvas.create_rectangle(0, stripe_y, width, stripe_y + stripe_height,
+                               fill=stripe_color, outline="", tags="stripes")
+
+# Draw stripes after window is created
+root.update()
+# draw_fullscreen_stripes()  # Disabled - using solid black background
+
+def draw_requested_number(text, color="red"):
+    """Draw the requested number with white outline on full-screen canvas"""
+    # Delete old requested number
+    canvas.delete("requested")
+
+    # Position: centered horizontally, 20% from top
+    x = canvas.winfo_width() // 2
+    y = int(canvas.winfo_height() * 0.28)
+    font = ("Helvetica", 180, "bold")
+
+    # Draw white outline (8 positions around the text)
+    #     for dx, dy in [(-5,-5), (-5,0), (-5,5), (0,-5), (0,5), (5,-5), (5,0), (5,5)]:
+    #         canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="requested")
+
+    # Draw black text on top so stripes show through
+    canvas.create_text(x, y, text=text, font=font, fill="red", tags="requested")
+
+# Draw text labels on canvas (centered)
+canvas.update()
+center_x = canvas.winfo_width() // 2
+height = canvas.winfo_height()
+
+canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:", font=("Helvetica", 36, "bold"),
+                  fill="white", tags="labels")
+
+# Draw initial requested value
+draw_requested_number(f"{REQUESTED_GALLONS:.0f}", "red")
+
+canvas.create_text(center_x, int(height * 0.45), text="Actual Gallons:", font=("Helvetica", 36, "bold"),
+                  fill="white", tags="labels")
+
+def draw_actual_number(text, color="red"):
+    """Draw the actual number with white outline on full-screen canvas"""
+    # Delete old actual number
+    canvas.delete("actual")
+
+    # Position: centered horizontally, 65% from top
+    x = canvas.winfo_width() // 2
+    y = int(canvas.winfo_height() * 0.65)
+    font = ("Helvetica", 240, "bold")
+
+    # Draw white outline (8 positions around the text)
+    #     for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
+    #         canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="actual")
+
+    # Draw black text on top so stripes show through
+    canvas.create_text(x, y, text=text, font=font, fill="red", tags="actual")
+
+# Draw initial value
+draw_actual_number("0.0", "red")
 
 # Status Label (for connection errors)
 status_label = ttk.Label(root, text="", font=("Helvetica", 24),
                         foreground="yellow", background="black")
-status_label.pack(pady=5)
+# status_label.pack(pady=5)
 
 # Flow Meter Disconnected Warning (flashing)
 flowmeter_disconnected_label = ttk.Label(root, text="FLOW METER\nDISCONNECTED",
                                          font=("Helvetica", 60, "bold"),
                                          foreground="red", background="black")
-flowmeter_disconnected_label.pack(pady=5)
-flowmeter_disconnected_label.pack_forget()
+# flowmeter_disconnected_label.pack(pady=5)
+# flowmeter_disconnected_label.pack_forget()
 
 # Warning Label (flashing)
 warning_label = ttk.Label(root, text="OVER TARGET!", font=("Helvetica", 72, "bold"),
                           foreground="red", background="black")
-warning_label.pack(pady=5)
-warning_label.pack_forget()
+# warning_label.pack(pady=5)
+# warning_label.pack_forget()
 
 # Manual Mode Label (flashing when override is active)
 manual_label = ttk.Label(root, text="MANUAL", font=("Helvetica", 90, "bold"),
                          foreground="orange", background="black")
-manual_label.pack(pady=5)
-manual_label.pack_forget()
+# manual_label.pack(pady=5)
+# manual_label.pack_forget()
+
+# Thumbs up animated GIF support
+thumbs_up_frames = []
+thumbs_up_frame_index = [0]  # Use list for mutable reference
+thumbs_up_label = None
+thumbs_up_animation_id = None
+
+def load_thumbs_up_gif():
+    """Load animated GIF for thumbs up display"""
+    global thumbs_up_frames, thumbs_up_label
+    
+    gif_path = "/home/user/thumbs_up.gif"
+    
+    # Try to load GIF file if it exists
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(gif_path)
+        
+        # Extract all frames from GIF
+        thumbs_up_frames = []
+        try:
+            while True:
+                # Resize frame to fit nicely on screen (300x300)
+                frame = img.copy()
+                frame = frame.resize((300, 300), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(frame)
+                thumbs_up_frames.append(photo)
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass  # End of frames
+        
+        print(f"Loaded {len(thumbs_up_frames)} frames from thumbs up GIF")
+        
+        # Create label for animated GIF
+        if thumbs_up_frames:
+            thumbs_up_label = tk.Label(root, image=thumbs_up_frames[0], bg="black")
+        else:
+            # Fallback to emoji if GIF has no frames
+            thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 200),
+                                       foreground="yellow", background="black")
+    except Exception as e:
+        print(f"Could not load thumbs up GIF: {e}")
+        # Fallback to emoji
+        thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 200),
+                                   foreground="yellow", background="black")
+
+def animate_thumbs_up():
+    """Animate the thumbs up GIF"""
+    global thumbs_up_animation_id
+    
+    if thumbs_up_frames and thumbs_up_label:
+        thumbs_up_frame_index[0] = (thumbs_up_frame_index[0] + 1) % len(thumbs_up_frames)
+        thumbs_up_label.config(image=thumbs_up_frames[thumbs_up_frame_index[0]])
+        thumbs_up_animation_id = root.after(100, animate_thumbs_up)  # 10 FPS
+
+# Load the GIF on startup
+load_thumbs_up_gif()
 
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, override_mode
 
     actual = read_flow_meter()
-    actual_label.config(text=f"{actual:.1f}")
+
+    # Temporarily show barber pole stripes
+    color = "red"
+
+    draw_actual_number(f"{actual:.1f}", color)
 
     # Update requested gallons number
-    requested_number_label.config(text=f"{requested_gallons:.0f}")
+    draw_requested_number(f"{requested_gallons:.0f}", color)
 
     # Check if flow meter has timed out (no successful reads in X seconds)
     flow_meter_disconnected = (time.time() - last_successful_read_time) > FLOW_METER_TIMEOUT
@@ -1039,39 +1317,32 @@ def update_dashboard():
     if override_mode:
         status_parts.append("OVERRIDE: ON")
 
-    status_label.config(text=" | ".join(status_parts))
+    # Draw status text on canvas
+    canvas.delete("status")
+    if status_parts:
+        canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=" | ".join(status_parts),
+                          font=("Helvetica", 20), fill="yellow", tags="status")
+
+    # Draw warnings on canvas
+    canvas.delete("warning")
 
     # Priority 1: Flow Meter Disconnected (highest priority - flashing)
     if flow_meter_disconnected:
         if int(time.time() * 2) % 2 == 0:
-            flowmeter_disconnected_label.pack(pady=20)
-        else:
-            flowmeter_disconnected_label.pack_forget()
-        manual_label.pack_forget()
-        warning_label.pack_forget()
+            canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88), text="FLOW METER\nDISCONNECTED",
+                             font=("Helvetica", 60, "bold"), fill="red", tags="warning")
 
     # Priority 2: Manual Mode (when override is ON)
     elif override_mode:
-        flowmeter_disconnected_label.pack_forget()
         if int(time.time() * 2) % 2 == 0:
-            manual_label.pack(pady=20)
-        else:
-            manual_label.pack_forget()
-        warning_label.pack_forget()  # Hide over target warning in manual mode
+            canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88), text="MANUAL",
+                             font=("Helvetica", 90, "bold"), fill="orange", tags="warning")
 
     # Priority 3: Over Target Warning (normal operation)
-    else:
-        flowmeter_disconnected_label.pack_forget()
-        manual_label.pack_forget()  # Hide manual label when not in override
-
-        # Flash warning if over target (only if override mode is OFF)
-        if actual > requested_gallons + WARNING_THRESHOLD:
-            if int(time.time() * 2) % 2 == 0:
-                warning_label.pack(pady=20)
-            else:
-                warning_label.pack_forget()
-        else:
-            warning_label.pack_forget()
+    elif actual > requested_gallons + WARNING_THRESHOLD:
+        if int(time.time() * 2) % 2 == 0:
+            canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88), text="OVER TARGET!",
+                             font=("Helvetica", 72, "bold"), fill="red", tags="warning")
 
     root.after(UPDATE_INTERVAL, update_dashboard)
 
