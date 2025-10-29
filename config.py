@@ -58,9 +58,9 @@ LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 # Coast distance (gallons) = FLOW_CURVE_SLOPE * flow_rate_gpm + FLOW_CURVE_INTERCEPT
 # Calibration data:
 #   - 22 GPM → 0.45 gal coast
-#   - 70 GPM → 1.92 gal coast (adjusted +0.17 gal from previous 1.75)
-FLOW_CURVE_SLOPE = 0.030625           # Slope of coast distance vs flow rate
-FLOW_CURVE_INTERCEPT = -0.22375       # Y-intercept of coast distance curve
+#   - 70 GPM → 1.58 gal coast (adjusted -0.17 gal from original 1.75)
+FLOW_CURVE_SLOPE = 0.0235416667       # Slope of coast distance vs flow rate
+FLOW_CURVE_INTERCEPT = -0.067916667   # Y-intercept of coast distance curve
 
 
 # =============================================================================
