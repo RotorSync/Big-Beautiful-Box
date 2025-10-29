@@ -41,14 +41,16 @@ def setup(pin, direction, pull_up_down=PUD_OFF):
     if direction == OUT:
         lgpio.gpio_claim_output(_chip, pin, LOW)
     else:
-        lgpio.gpio_claim_input(_chip, pin)
-        # Set pull up/down resistor
+        # Claim input with pull resistor flags
+        # lgpio uses flags during claim, not a separate set function
+        flags = 0
         if pull_up_down == PUD_UP:
-            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_UP)
+            flags = lgpio.SET_PULL_UP
         elif pull_up_down == PUD_DOWN:
-            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_DOWN)
+            flags = lgpio.SET_PULL_DOWN
         else:
-            lgpio.gpio_set_pull_up_down(_chip, pin, lgpio.SET_PULL_NONE)
+            flags = lgpio.SET_PULL_NONE
+        lgpio.gpio_claim_input(_chip, pin, flags)
     _pins[pin] = direction
 
 def output(pin, value):
