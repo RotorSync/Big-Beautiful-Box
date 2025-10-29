@@ -149,7 +149,7 @@ def get_username():
     except:
         return 'unknown'
 
-def change_colors_to_green():
+def change_colors_to_green(from_button=False):
     """Change display colors from red to green if within 2 gallons of target"""
     global serial_command_received, last_totalizer_liters, requested_gallons
 
@@ -158,8 +158,10 @@ def change_colors_to_green():
 
     # Check if within 2 gallons of target
     if abs(actual_gallons - requested_gallons) <= 2.0:
-        if not serial_command_received:
-            serial_command_received = True
+        # Button press always works, auto-alert only works once
+        if from_button or not serial_command_received:
+            if not from_button:
+                serial_command_received = True
             # Change the number colors to green by redrawing
             draw_requested_number(f"{requested_gallons:.0f}", "green")
             current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -169,7 +171,10 @@ def change_colors_to_green():
                 thumbs_up_label.place(relx=0.85, rely=0.5, anchor="center")
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
-            print(f"Display colors changed to green (within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})")
+            source = "button press" if from_button else "auto-alert"
+            print(f"Display colors changed to green ({source}, within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})")
+        else:
+            print(f"Color change already triggered by auto-alert ({actual_gallons:.1f}/{requested_gallons:.0f})")
     else:
         print(f"Cannot change to green: not within 2 gallons ({actual_gallons:.1f}/{requested_gallons:.0f})")
 
@@ -199,8 +204,8 @@ def green_button_monitor():
             # Detect button press (transition from HIGH to LOW)
             if last_button_state == GPIO.HIGH and current_state == GPIO.LOW:
                 print("Green button pressed!")
-                # Call color change function in main thread
-                root.after(0, change_colors_to_green)
+                # Call color change function in main thread with from_button=True
+                root.after(0, lambda: change_colors_to_green(from_button=True))
                 # Debounce delay
                 time.sleep(0.3)
 
