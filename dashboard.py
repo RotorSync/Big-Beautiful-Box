@@ -11,8 +11,12 @@ import subprocess
 import os
 from PIL import Image, ImageTk
 
-# Add /home/user to path for RPi.GPIO wrapper on Pi 5
-sys.path.insert(0, "/home/user")
+# Import configuration
+import config
+
+# Add paths for libraries
+sys.path.insert(0, config.RPI_GPIO_PATH)
+sys.path.insert(0, config.IOL_HAT_PATH)
 
 try:
     import RPi.GPIO as GPIO
@@ -21,46 +25,18 @@ except ImportError:
     GPIO_AVAILABLE = False
     print("WARNING: RPi.GPIO not available, relay control disabled")
 
-# Add IOL-HAT examples to path
-sys.path.insert(0, "/home/user/iol-hat/examples/python")
 import iolhat
-
-# Configuration
-REQUESTED_GALLONS = 50  # Default, will be updated via serial
-WARNING_THRESHOLD = 2
-UPDATE_INTERVAL = 200  # milliseconds
-IOL_PORT = 1  # Port 2 in the system (Port 1 in code - 0-indexed)
-DATA_LENGTH = 15
-SERIAL_PORT = "/dev/ttyAMA0"  # Primary UART on GPIO 14/15 (pins 8/10)
-SERIAL_BAUD = 115200
-PUMP_STOP_RELAY_PIN = 27  # GPIO pin 27 for pump stop/alert relay
-GREEN_BUTTON_PIN = 17  # GPIO pin 17 for green button (active low with pull-up)
-PUMP_STOP_DURATION = 15  # seconds for PS command
-AUTO_ALERT_DURATION = 10  # seconds for auto-alert
-
-# Flow-based shutoff curve coefficients (based on calibration data)
-# Coast distance (gallons) = FLOW_CURVE_SLOPE * flow_rate_gpm + FLOW_CURVE_INTERCEPT
-# Adjusted: 22 GPM→0.45gal coast, 70 GPM→1.75gal coast
-# (Shut off 0.05 gal later at low flow, 0.05 gal sooner at high flow)
-FLOW_CURVE_SLOPE = 0.0270833333
-FLOW_CURVE_INTERCEPT = -0.14583333
-
-# Conversion factors
-LITERS_TO_GALLONS = 0.264172
-LITERS_PER_SEC_TO_GPM = 15.850323  # L/s to GPM conversion (60 * 0.264172)
 
 # Global variables
 last_totalizer_liters = 0.0
 last_flow_rate = 0.0
 connection_error = False
 error_message = ""
-requested_gallons = REQUESTED_GALLONS
+requested_gallons = config.REQUESTED_GALLONS
 serial_connected = False
 override_mode = False
 last_alert_triggered = False
 last_successful_read_time = time.time()
-FLOW_STOPPED_THRESHOLD = 0.001  # L/s - flow is considered stopped below this
-FLOW_METER_TIMEOUT = 5  # seconds - flow meter considered disconnected after this
 menu_mode = False  # Track if we're in menu mode
 menu_window = None  # Reference to menu window
 menu_selected_index = 0  # Currently selected menu item (0=logs, 1=self-test, 2=update, 3=shutdown, 4=reboot, 5=exit-desktop, 6=exit-menu)
@@ -90,20 +66,20 @@ def calculate_trigger_threshold(flow_rate_l_per_s):
         Gallons before target to trigger shutoff (predicted coast distance)
     """
     # Convert L/s to GPM
-    flow_rate_gpm = flow_rate_l_per_s * LITERS_PER_SEC_TO_GPM
+    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
 
     # Calculate predicted coast distance using calibration curve
     # coast_distance = 0.0270833333 * flow_rate_gpm - 0.14583333
-    predicted_coast = FLOW_CURVE_SLOPE * flow_rate_gpm + FLOW_CURVE_INTERCEPT
+    predicted_coast = config.FLOW_CURVE_SLOPE * flow_rate_gpm + config.FLOW_CURVE_INTERCEPT
 
     # Ensure we don't have negative threshold (minimum 0.1 gallon before target)
     threshold = max(predicted_coast, 0.1)
 
     return threshold
 
-def pump_stop_relay(duration=PUMP_STOP_DURATION):
+def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
-    relay_log = "/home/user/relay_test.log"
+    relay_log = config.RELAY_TEST_LOG
 
     # Log function entry
     with open(relay_log, 'a') as f:
@@ -111,7 +87,7 @@ def pump_stop_relay(duration=PUMP_STOP_DURATION):
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - pump_stop_relay() CALLED\n")
         f.write(f"Duration: {duration} seconds\n")
         f.write(f"GPIO_AVAILABLE: {GPIO_AVAILABLE}\n")
-        f.write(f"PUMP_STOP_RELAY_PIN: {PUMP_STOP_RELAY_PIN}\n")
+        f.write(f"PUMP_STOP_RELAY_PIN: {config.PUMP_STOP_RELAY_PIN}\n")
 
     if not GPIO_AVAILABLE:
         msg = "GPIO not available, cannot control relay"
@@ -123,11 +99,11 @@ def pump_stop_relay(duration=PUMP_STOP_DURATION):
     try:
         # GPIO already initialized during startup - just control the output
         with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - About to set GPIO {PUMP_STOP_RELAY_PIN} HIGH\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - About to set GPIO {config.PUMP_STOP_RELAY_PIN} HIGH\n")
 
-        GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.HIGH)
+        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH)
 
-        msg = f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
+        msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
         print(msg)
         with open(relay_log, 'a') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to HIGH\n")
@@ -137,11 +113,11 @@ def pump_stop_relay(duration=PUMP_STOP_DURATION):
         time.sleep(duration)
 
         with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleep complete, about to set GPIO {PUMP_STOP_RELAY_PIN} LOW\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleep complete, about to set GPIO {config.PUMP_STOP_RELAY_PIN} LOW\n")
 
-        GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.LOW)
+        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
 
-        msg = f"Alert relay (GPIO {PUMP_STOP_RELAY_PIN}) deactivated"
+        msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
         print(msg)
         with open(relay_log, 'a') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to LOW\n")
@@ -178,7 +154,7 @@ def change_colors_to_green():
     global serial_command_received, last_totalizer_liters, requested_gallons
 
     # Calculate current actual gallons
-    actual_gallons = last_totalizer_liters * LITERS_TO_GALLONS
+    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
 
     # Check if within 2 gallons of target
     if abs(actual_gallons - requested_gallons) <= 2.0:
@@ -186,7 +162,7 @@ def change_colors_to_green():
             serial_command_received = True
             # Change the number colors to green by redrawing
             draw_requested_number(f"{requested_gallons:.0f}", "green")
-            current_actual = last_totalizer_liters * LITERS_TO_GALLONS
+            current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
             draw_actual_number(f"{current_actual:.1f}", "green")
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
@@ -211,14 +187,14 @@ def green_button_monitor():
             pass  # Already initialized
 
         # Set up green button pin as input with pull-up resistor
-        GPIO.setup(GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        print(f"Green button monitor started on GPIO {GREEN_BUTTON_PIN}")
+        GPIO.setup(config.GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        print(f"Green button monitor started on GPIO {config.GREEN_BUTTON_PIN}")
 
         last_button_state = GPIO.HIGH
 
         while True:
             # Read current button state
-            current_state = GPIO.input(GREEN_BUTTON_PIN)
+            current_state = GPIO.input(config.GREEN_BUTTON_PIN)
 
             # Detect button press (transition from HIGH to LOW)
             if last_button_state == GPIO.HIGH and current_state == GPIO.LOW:
@@ -350,9 +326,9 @@ def run_self_test():
         if GPIO_AVAILABLE:
             try:
                 # Quick relay pulse test (0.5 seconds)
-                GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.HIGH)
+                GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH)
                 time.sleep(0.5)
-                GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.LOW)
+                GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
                 results_text.insert(tk.END, "PASS (Relay pulsed)\n", "pass")
             except Exception as e:
                 results_text.insert(tk.END, f"FAIL ({e})\n", "fail")
@@ -365,7 +341,7 @@ def run_self_test():
         results_text.update()
         try:
             import serial
-            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+            ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
             ser.close()
             results_text.insert(tk.END, "PASS\n", "pass")
         except Exception as e:
@@ -376,7 +352,7 @@ def run_self_test():
         results_text.insert(tk.END, "3. IOL-HAT Communication: ")
         results_text.update()
         try:
-            raw_data = iolhat.pd(IOL_PORT, 0, DATA_LENGTH, None)
+            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
             if len(raw_data) >= 15 and raw_data != b'\x00' * len(raw_data):
                 results_text.insert(tk.END, "PASS (Data received)\n", "pass")
             else:
@@ -861,14 +837,14 @@ def read_flow_meter():
 
     try:
         # Read process data from IO-Link device
-        raw_data = iolhat.pd(IOL_PORT, 0, DATA_LENGTH, None)
+        raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
 
         if len(raw_data) >= 15:
             # Check if data is all zeros (indicates IO-Link timeout/no response)
             if raw_data == b'\x00' * len(raw_data):
                 connection_error = True
                 error_message = "Device not responding (all-zero data)"
-                return last_totalizer_liters * LITERS_TO_GALLONS
+                return last_totalizer_liters * config.LITERS_TO_GALLONS
 
             # Decode the data according to Picomag format
             totalizer_liters = struct.unpack('>f', raw_data[4:8])[0]
@@ -880,29 +856,29 @@ def read_flow_meter():
             error_message = ""
             last_successful_read_time = time.time()
 
-            return totalizer_liters * LITERS_TO_GALLONS
+            return totalizer_liters * config.LITERS_TO_GALLONS
         else:
             connection_error = True
             error_message = "Invalid data length"
-            return last_totalizer_liters * LITERS_TO_GALLONS
+            return last_totalizer_liters * config.LITERS_TO_GALLONS
 
     except Exception as e:
         connection_error = True
         error_message = str(e)
-        return last_totalizer_liters * LITERS_TO_GALLONS
+        return last_totalizer_liters * config.LITERS_TO_GALLONS
 
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode
 
-    debug_log = "/home/user/serial_debug.log"
+    debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
 
     try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.5)
+        ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=0.5)
         ser.reset_input_buffer()
         serial_connected = True
-        msg = f"Serial listener started on {SERIAL_PORT} at {SERIAL_BAUD} baud"
+        msg = f"Serial listener started on {config.SERIAL_PORT} at {config.SERIAL_BAUD} baud"
         print(msg)
         with open(debug_log, 'a') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
@@ -1078,9 +1054,9 @@ def initialize_gpio():
         GPIO.setwarnings(False)
         # Configure GPIO
         GPIO.setmode(GPIO.BCM)
-        GPIO.setup(PUMP_STOP_RELAY_PIN, GPIO.OUT)
-        GPIO.output(PUMP_STOP_RELAY_PIN, GPIO.LOW)
-        print(f"GPIO initialized: Relay on pin {PUMP_STOP_RELAY_PIN}")
+        GPIO.setup(config.PUMP_STOP_RELAY_PIN, GPIO.OUT)
+        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
+        print(f"GPIO initialized: Relay on pin {config.PUMP_STOP_RELAY_PIN}")
         return True
     except Exception as e:
         print(f"Failed to initialize GPIO: {e}")
@@ -1090,14 +1066,14 @@ def initialize_iol():
     """Initialize IO-Link port"""
     try:
         # Power on the port
-        iolhat.power(IOL_PORT, 1)
+        iolhat.power(config.IOL_PORT, 1)
         # Set LED to green
-        iolhat.led(IOL_PORT, iolhat.LED_GREEN)
+        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
         time.sleep(0.5)
-        print(f"IO-Link Port {IOL_PORT+1} initialized successfully")
+        print(f"IO-Link Port {config.IOL_PORT+1} initialized successfully")
         return True
     except Exception as e:
-        print(f"Failed to initialize IO-Link Port {IOL_PORT+1}: {e}")
+        print(f"Failed to initialize IO-Link Port {config.IOL_PORT+1}: {e}")
         return False
 
 # Tkinter GUI setup
@@ -1160,7 +1136,7 @@ canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:", font
                   fill="white", tags="labels")
 
 # Draw initial requested value
-draw_requested_number(f"{REQUESTED_GALLONS:.0f}", "red")
+draw_requested_number(f"{config.REQUESTED_GALLONS:.0f}", "red")
 
 canvas.create_text(center_x, int(height * 0.45), text="Actual Gallons:", font=("Helvetica", 36, "bold"),
                   fill="white", tags="labels")
@@ -1281,23 +1257,23 @@ def update_dashboard():
     draw_requested_number(f"{requested_gallons:.0f}", color)
 
     # Check if flow meter has timed out (no successful reads in X seconds)
-    flow_meter_disconnected = (time.time() - last_successful_read_time) > FLOW_METER_TIMEOUT
+    flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
 
     # Auto-disable override when flow stops
-    if override_mode and last_flow_rate < FLOW_STOPPED_THRESHOLD:
+    if override_mode and last_flow_rate < config.FLOW_STOPPED_THRESHOLD:
         override_mode = False
-        print(f"Flow stopped ({last_flow_rate:.6f} L/s < {FLOW_STOPPED_THRESHOLD} L/s), auto-disabling override mode")
+        print(f"Flow stopped ({last_flow_rate:.6f} L/s < {config.FLOW_STOPPED_THRESHOLD} L/s), auto-disabling override mode")
 
     # Calculate dynamic trigger threshold based on current flow rate
-    flow_rate_gpm = last_flow_rate * LITERS_PER_SEC_TO_GPM
+    flow_rate_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
     trigger_threshold = calculate_trigger_threshold(last_flow_rate)
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
     if not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
         last_alert_triggered = True
-        print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {AUTO_ALERT_DURATION}s")
-        relay_thread = threading.Thread(target=pump_stop_relay, args=(AUTO_ALERT_DURATION,), daemon=True)
+        print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
+        relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
         relay_thread.start()
     elif actual < requested_gallons - trigger_threshold:
         last_alert_triggered = False  # Reset for next cycle
@@ -1339,12 +1315,12 @@ def update_dashboard():
                              font=("Helvetica", 90, "bold"), fill="orange", tags="warning")
 
     # Priority 3: Over Target Warning (normal operation)
-    elif actual > requested_gallons + WARNING_THRESHOLD:
+    elif actual > requested_gallons + config.WARNING_THRESHOLD:
         if int(time.time() * 2) % 2 == 0:
             canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88), text="OVER TARGET!",
                              font=("Helvetica", 72, "bold"), fill="red", tags="warning")
 
-    root.after(UPDATE_INTERVAL, update_dashboard)
+    root.after(config.UPDATE_INTERVAL, update_dashboard)
 
 # Initialize GPIO and IO-Link and start serial listener
 gpio_ok = initialize_gpio()
