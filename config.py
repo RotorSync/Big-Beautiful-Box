@@ -12,7 +12,7 @@ Edit values here to customize behavior without modifying the main code.
 
 # GPIO pin assignments (BCM mode)
 PUMP_STOP_RELAY_PIN = 27      # GPIO pin for pump stop/alert relay
-GREEN_BUTTON_PIN = 17         # GPIO pin for green button (active low with pull-up)
+GREEN_BUTTON_PIN = 22         # GPIO pin for green button (active low with pull-up)
 
 
 # =============================================================================
@@ -29,7 +29,7 @@ SERIAL_BAUD = 115200          # Serial baud rate (must match sender device)
 # =============================================================================
 
 # Duration settings for relay activation (in seconds)
-PUMP_STOP_DURATION = 15       # How long to hold relay on for PS (Pump Stop) command
+PUMP_STOP_DURATION = 5       # How long to hold relay on for PS (Pump Stop) command
 AUTO_ALERT_DURATION = 10      # How long to hold relay on for auto-alert
 
 
@@ -69,7 +69,7 @@ FLOW_CURVE_INTERCEPT = -0.14583333    # Y-intercept of coast distance curve
 # =============================================================================
 
 # Target fill amount and warnings
-REQUESTED_GALLONS = 50        # Default target fill amount (can be changed via serial)
+REQUESTED_GALLONS = 60        # Default target fill amount (can be changed via serial)
 WARNING_THRESHOLD = 2         # Gallons before target to show warning color
 
 
