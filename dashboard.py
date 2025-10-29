@@ -37,6 +37,8 @@ serial_connected = False
 override_mode = False
 last_alert_triggered = False
 last_successful_read_time = time.time()
+was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
+colors_are_green = False  # Track if colors have been changed to green
 menu_mode = False  # Track if we're in menu mode
 menu_window = None  # Reference to menu window
 menu_selected_index = 0  # Currently selected menu item (0=logs, 1=self-test, 2=update, 3=shutdown, 4=reboot, 5=exit-desktop, 6=exit-menu)
@@ -151,35 +153,55 @@ def get_username():
 
 def change_colors_to_green(from_button=False):
     """Change display colors from red to green if within 2 gallons of target"""
-    global serial_command_received, last_totalizer_liters, requested_gallons
+    global serial_command_received, last_totalizer_liters, requested_gallons, colors_are_green
+
+    button_log = "/home/user/button_debug.log"
+    with open(button_log, 'a') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] change_colors_to_green() called with from_button={from_button}\n")
 
     # Calculate current actual gallons
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    with open(button_log, 'a') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Actual: {actual_gallons:.1f}, Requested: {requested_gallons:.0f}, Diff: {abs(actual_gallons - requested_gallons):.1f}\n")
 
     # Check if within 2 gallons of target
     if abs(actual_gallons - requested_gallons) <= 2.0:
+        with open(button_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Within 2 gallon threshold! serial_command_received={serial_command_received}\n")
         # Button press always works, auto-alert only works once
         if from_button or not serial_command_received:
+            with open(button_log, 'a') as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Proceeding with color change...\n")
             if not from_button:
                 serial_command_received = True
+
+            # Set the flag so update_dashboard keeps colors green
+            colors_are_green = True
+
             # Change the number colors to green by redrawing
             draw_requested_number(f"{requested_gallons:.0f}", "green")
             current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
             draw_actual_number(f"{current_actual:.1f}", "green")
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
-                thumbs_up_label.place(relx=0.85, rely=0.5, anchor="center")
+                thumbs_up_label.place(relx=0.85, rely=0.55, anchor="center")
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             source = "button press" if from_button else "auto-alert"
-            print(f"Display colors changed to green ({source}, within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})")
+            with open(button_log, 'a') as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Display colors changed to green ({source}, within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})\n")
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] colors_are_green flag set to True\n")
         else:
-            print(f"Color change already triggered by auto-alert ({actual_gallons:.1f}/{requested_gallons:.0f})")
+            with open(button_log, 'a') as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Color change already triggered by auto-alert ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
     else:
-        print(f"Cannot change to green: not within 2 gallons ({actual_gallons:.1f}/{requested_gallons:.0f})")
+        with open(button_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] NOT within 2 gallon threshold - cannot change to green ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
 
 def green_button_monitor():
     """Monitor GPIO pin for green button press (active low with pull-up)"""
+    button_log = "/home/user/button_debug.log"
+
     if not GPIO_AVAILABLE:
         print("GPIO not available, green button monitoring disabled")
         return
@@ -193,7 +215,11 @@ def green_button_monitor():
 
         # Set up green button pin as input with pull-up resistor
         GPIO.setup(config.GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        print(f"Green button monitor started on GPIO {config.GREEN_BUTTON_PIN}")
+        msg = f"Green button monitor started on GPIO {config.GREEN_BUTTON_PIN}"
+        print(msg)
+        with open(button_log, 'a') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
         last_button_state = GPIO.HIGH
 
@@ -203,6 +229,8 @@ def green_button_monitor():
 
             # Detect button press (transition from HIGH to LOW)
             if last_button_state == GPIO.HIGH and current_state == GPIO.LOW:
+                with open(button_log, 'a') as f:
+                    f.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} *** GREEN BUTTON PRESSED! ***\n")
                 print("Green button pressed!")
                 # Call color change function in main thread with from_button=True
                 root.after(0, lambda: change_colors_to_green(from_button=True))
@@ -874,7 +902,7 @@ def read_flow_meter():
 
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
-    global requested_gallons, serial_connected, override_mode
+    global requested_gallons, serial_connected, override_mode, colors_are_green
 
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
@@ -994,6 +1022,7 @@ def serial_listener():
                                     try:
                                         adjustment = int(line)
                                         requested_gallons += adjustment
+                                        colors_are_green = False  # Reset colors when requested gallons changes
                                         msg = f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
                                         print(msg)
                                         with open(debug_log, 'a') as f:
@@ -1126,11 +1155,11 @@ def draw_requested_number(text, color="red"):
     font = ("Helvetica", 180, "bold")
 
     # Draw white outline (8 positions around the text)
-    #     for dx, dy in [(-5,-5), (-5,0), (-5,5), (0,-5), (0,5), (5,-5), (5,0), (5,5)]:
-    #         canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="requested")
+    for dx, dy in [(-5,-5), (-5,0), (-5,5), (0,-5), (0,5), (5,-5), (5,0), (5,5)]:
+        canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="requested")
 
-    # Draw black text on top so stripes show through
-    canvas.create_text(x, y, text=text, font=font, fill="red", tags="requested")
+    # Draw text with specified color on top
+    canvas.create_text(x, y, text=text, font=font, fill=color, tags="requested")
 
 # Draw text labels on canvas (centered)
 canvas.update()
@@ -1157,11 +1186,11 @@ def draw_actual_number(text, color="red"):
     font = ("Helvetica", 240, "bold")
 
     # Draw white outline (8 positions around the text)
-    #     for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
-    #         canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="actual")
+    for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
+        canvas.create_text(x+dx, y+dy, text=text, font=font, fill="white", tags="actual")
 
-    # Draw black text on top so stripes show through
-    canvas.create_text(x, y, text=text, font=font, fill="red", tags="actual")
+    # Draw text with specified color on top
+    canvas.create_text(x, y, text=text, font=font, fill=color, tags="actual")
 
 # Draw initial value
 draw_actual_number("0.0", "red")
@@ -1249,12 +1278,18 @@ load_thumbs_up_gif()
 
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
-    global last_alert_triggered, override_mode
+    global last_alert_triggered, override_mode, was_flowing, colors_are_green
 
     actual = read_flow_meter()
 
-    # Temporarily show barber pole stripes
-    color = "red"
+    # Use green if flag is set, otherwise red
+    color = "green" if colors_are_green else "red"
+
+    # Debug log color being used
+    button_log = "/home/user/button_debug.log"
+    if colors_are_green:
+        with open(button_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [UPDATE_DASHBOARD] colors_are_green={colors_are_green}, using color={color}\n")
 
     draw_actual_number(f"{actual:.1f}", color)
 
@@ -1263,6 +1298,33 @@ def update_dashboard():
 
     # Check if flow meter has timed out (no successful reads in X seconds)
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+
+    # Detect flow state
+    is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+
+    # Log requested and actual when flow stops
+    if was_flowing and not is_flowing:
+        fill_log = "/home/user/fill_history.log"
+        # Determine if shutoff was automatic or manual
+        shutoff_type = "Auto" if last_alert_triggered else "Manual"
+        with open(fill_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {requested_gallons:.3f} gal | Actual: {actual:.3f} gal | Diff: {actual - requested_gallons:+.3f} gal | {shutoff_type}\n")
+        print(f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}")
+        # Hide thumbs up when flow stops
+        if thumbs_up_label:
+            thumbs_up_label.place_forget()
+            print("Thumbs up hidden - flow stopped")
+
+    # Reset colors when new fill cycle starts
+    if not was_flowing and is_flowing:
+        colors_are_green = False
+        # Hide thumbs up when new cycle starts
+        if thumbs_up_label:
+            thumbs_up_label.place_forget()
+        print("New fill cycle started - colors reset to red, thumbs up hidden")
+
+    # Update flow state for next cycle
+    was_flowing = is_flowing
 
     # Auto-disable override when flow stops
     if override_mode and last_flow_rate < config.FLOW_STOPPED_THRESHOLD:
