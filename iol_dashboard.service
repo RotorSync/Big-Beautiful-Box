@@ -1,0 +1,17 @@
+[Unit]
+Description=IOL Dashboard and Master
+After=network.target graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/Big-Beautiful-Box/start_iol_dashboard.sh
+Restart=always
+RestartSec=5
+User=pi
+Group=pi
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=graphical.target
