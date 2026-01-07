@@ -81,6 +81,11 @@ pending_fill_shutoff_type = ""  # Shutoff type from last fill
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 override_enabled_time = 0  # Timestamp when override mode was last enabled
+# Mix/Fill mode variables
+current_mode = "fill"  # Current mode: "fill" or "mix"
+fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
+mix_requested_gallons = 40  # Preset for mix mode (default 40)
+mode_indicator_label = None  # Label to display "MIX" in corner
 
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
@@ -146,6 +151,76 @@ def save_totals():
     except Exception as e:
         print(f"Error saving season total: {e}")
 
+def load_mode_presets():
+    """Load fill and mix mode gallon presets from file"""
+    global fill_requested_gallons, mix_requested_gallons, current_mode
+
+    try:
+        with open('/home/pi/mode_presets.txt', 'r') as f:
+            lines = f.readlines()
+            if len(lines) >= 3:
+                fill_requested_gallons = float(lines[0].strip())
+                mix_requested_gallons = float(lines[1].strip())
+                current_mode = lines[2].strip()
+                if current_mode not in ['fill', 'mix']:
+                    current_mode = 'fill'
+    except:
+        fill_requested_gallons = config.REQUESTED_GALLONS
+        mix_requested_gallons = 40
+        current_mode = 'fill'
+
+def save_mode_presets():
+    """Save fill and mix mode gallon presets to file"""
+    global fill_requested_gallons, mix_requested_gallons, current_mode
+
+    try:
+        with open('/home/pi/mode_presets.txt', 'w') as f:
+            f.write(f"{fill_requested_gallons}\n")
+            f.write(f"{mix_requested_gallons}\n")
+            f.write(f"{current_mode}\n")
+    except Exception as e:
+        print(f"Error saving mode presets: {e}")
+
+def switch_mode(new_mode):
+    """Switch between fill and mix modes"""
+    global current_mode, requested_gallons, fill_requested_gallons, mix_requested_gallons
+    global mode_indicator_label, colors_are_green, serial_command_received
+
+    if new_mode == current_mode:
+        return  # Already in this mode
+
+    # Save current requested gallons to the current mode
+    if current_mode == 'fill':
+        fill_requested_gallons = requested_gallons
+    else:
+        mix_requested_gallons = requested_gallons
+
+    # Switch to new mode and load its preset
+    current_mode = new_mode
+    if current_mode == 'fill':
+        requested_gallons = fill_requested_gallons
+    else:
+        requested_gallons = mix_requested_gallons
+
+    # Reset color state for new fill
+    colors_are_green = False
+    serial_command_received = False
+
+    # Update mode indicator
+    if mode_indicator_label:
+        if current_mode == 'mix':
+            mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+        else:
+            mode_indicator_label.place_forget()
+
+    # Save presets
+    save_mode_presets()
+
+    # Update the display
+    draw_requested_number(f"{requested_gallons:.0f}", "red")
+
+    print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
+
 def add_to_totals(gallons):
     """Add gallons to both daily and season totals"""
     global daily_total, season_total
@@ -207,10 +282,6 @@ def record_pending_fill():
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
 
-        # Hide thumbs up after recording
-        if thumbs_up_label:
-            thumbs_up_label.place_forget()
-            print("Thumbs up hidden - fill recorded")
     else:
         print("No pending fill to record")
 
@@ -321,7 +392,7 @@ def change_colors_to_green(from_button=False):
             draw_actual_number(f"{current_actual:.1f}", "green")
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
-                thumbs_up_label.place(relx=0.85, rely=0.55, anchor="center")
+                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             source = "button press" if from_button else "auto-alert"
@@ -342,7 +413,7 @@ def change_colors_to_green(from_button=False):
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
             # Show thumbs up but DO NOT change colors to green
             if thumbs_up_label:
-                thumbs_up_label.place(relx=0.85, rely=0.55, anchor="center")
+                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             with open(button_log, 'a') as f:
@@ -1620,6 +1691,7 @@ def read_flow_meter():
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
+    global fill_requested_gallons, mix_requested_gallons, current_mode
 
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
@@ -1873,6 +1945,12 @@ def serial_listener():
                                         if requested_gallons < 0:
                                             requested_gallons = 0
                                         colors_are_green = False  # Reset colors when requested gallons changes
+                                        # Update the current mode's preset
+                                        if current_mode == 'fill':
+                                            fill_requested_gallons = requested_gallons
+                                        else:
+                                            mix_requested_gallons = requested_gallons
+                                        save_mode_presets()
                                         msg = f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
                                         print(msg)
                                         with open(debug_log, 'a') as f:
@@ -1909,6 +1987,29 @@ def serial_listener():
                                         print(msg)
                                         with open(debug_log, 'a') as f:
                                             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+
+
+                                elif line == 'TU':
+                                    msg = "Serial: Thumbs Up command received"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, lambda: change_colors_to_green(from_button=True))
+                                    root.after(0, record_pending_fill)
+
+                                elif line == 'MIX':
+                                    msg = "Serial: Mix mode command received"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, lambda: switch_mode('mix'))
+
+                                elif line == 'FILL':
+                                    msg = "Serial: Fill mode command received"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, lambda: switch_mode('fill'))
 
                                 else:
                                     # Unknown command
@@ -2079,6 +2180,11 @@ manual_label = ttk.Label(root, text="MANUAL", font=("Helvetica", 90, "bold"),
 # manual_label.pack(pady=2)
 # manual_label.pack_forget()
 
+# Mix Mode Indicator Label (shown in top-left corner when in mix mode)
+mode_indicator_label = ttk.Label(root, text="MIX", font=("Helvetica", 48, "bold"),
+                                 foreground="cyan", background="black")
+# mode_indicator_label initially hidden, shown via place() when in mix mode
+
 # Thumbs up animated GIF support
 thumbs_up_frames = []
 thumbs_up_frame_index = [0]  # Use list for mutable reference
@@ -2086,44 +2192,51 @@ thumbs_up_label = None
 thumbs_up_animation_id = None
 
 def load_thumbs_up_gif():
-    """Load animated GIF for thumbs up display"""
+    """Load thumbs up image (PNG or GIF) for display"""
     global thumbs_up_frames, thumbs_up_label
     
+    png_path = "/home/pi/thumbs_up.png"
     gif_path = "/home/pi/thumbs_up.gif"
     
-    # Try to load GIF file if it exists
     try:
         from PIL import Image, ImageTk
-        img = Image.open(gif_path)
+        import os
         
-        # Extract all frames from GIF
-        thumbs_up_frames = []
-        try:
-            while True:
-                # Resize frame to fit nicely on screen (300x300)
-                frame = img.copy()
-                frame = frame.resize((300, 300), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(frame)
-                thumbs_up_frames.append(photo)
-                img.seek(img.tell() + 1)
-        except EOFError:
-            pass  # End of frames
+        # Try PNG first
+        if os.path.exists(png_path):
+            img = Image.open(png_path)
+            # Resize to fit nicely on screen
+            img = img.resize((200, 200), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            thumbs_up_frames = [photo]
+            print(f"Loaded thumbs up from PNG")
+        elif os.path.exists(gif_path):
+            img = Image.open(gif_path)
+            # Extract all frames from GIF
+            thumbs_up_frames = []
+            try:
+                while True:
+                    frame = img.copy()
+                    frame = frame.resize((200, 200), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(frame)
+                    thumbs_up_frames.append(photo)
+                    img.seek(img.tell() + 1)
+            except EOFError:
+                pass
+            print(f"Loaded {len(thumbs_up_frames)} frames from thumbs up GIF")
+        else:
+            thumbs_up_frames = []
         
-        print(f"Loaded {len(thumbs_up_frames)} frames from thumbs up GIF")
-        
-        # Create label for animated GIF
+        # Create label
         if thumbs_up_frames:
             thumbs_up_label = tk.Label(root, image=thumbs_up_frames[0], bg="black")
         else:
-            # Fallback to emoji if GIF has no frames
-            thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 200),
-                                       foreground="yellow", background="black")
+            thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 150, "bold"),
+                                       foreground="green", background="black")
     except Exception as e:
-        print(f"Could not load thumbs up GIF: {e}")
-        # Fallback to emoji
-        thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 200),
-                                   foreground="yellow", background="black")
-
+        print(f"Could not load thumbs up image: {e}")
+        thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 150, "bold"),
+                                   foreground="green", background="black")
 def animate_thumbs_up():
     """Animate the thumbs up GIF"""
     global thumbs_up_animation_id
@@ -2378,6 +2491,20 @@ else:
 # Load totals from files
 load_totals()
 print(f"Loaded totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
+
+# Load mode presets and set initial requested gallons
+load_mode_presets()
+if current_mode == 'fill':
+    requested_gallons = fill_requested_gallons
+else:
+    requested_gallons = mix_requested_gallons
+    # Show mode indicator if starting in mix mode
+    if mode_indicator_label:
+        mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+print(f"Loaded mode - Mode: {current_mode}, Requested: {requested_gallons}, Fill preset: {fill_requested_gallons}, Mix preset: {mix_requested_gallons}")
+
+# Redraw requested gallons with the loaded value
+draw_requested_number(f"{requested_gallons:.0f}", "red")
 
 # Start serial listener in background thread (works without IOL)
 serial_thread = threading.Thread(target=serial_listener, daemon=True)
