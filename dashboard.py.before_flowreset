@@ -731,7 +731,6 @@ def change_colors_to_green(from_button=False):
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                schedule_flow_reset()  # Reset flow meter after delay
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             source = "button press" if from_button else "auto-alert"
@@ -753,7 +752,6 @@ def change_colors_to_green(from_button=False):
             # Show thumbs up but DO NOT change colors to green
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                schedule_flow_reset()  # Reset flow meter after delay
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             with open(button_log, 'a') as f:
@@ -2502,46 +2500,12 @@ def initialize_gpio():
         # Configure GPIO
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(config.PUMP_STOP_RELAY_PIN, GPIO.OUT)
-        GPIO.setup(config.FLOW_RESET_PIN, GPIO.OUT)
-        GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
         GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
-        print(f"GPIO initialized: Pump relay on pin {config.PUMP_STOP_RELAY_PIN}, Flow reset on pin {config.FLOW_RESET_PIN}")
+        print(f"GPIO initialized: Relay on pin {config.PUMP_STOP_RELAY_PIN}")
         return True
     except Exception as e:
         print(f"Failed to initialize GPIO: {e}")
         return False
-
-# Flow meter reset scheduling
-flow_reset_scheduled = False
-
-def pulse_flow_reset():
-    """Pulse the flow meter reset relay to zero the totalizer"""
-    global flow_reset_scheduled
-    if not GPIO_AVAILABLE:
-        print("GPIO not available, cannot reset flow meter")
-        return
-    try:
-        print(f"Pulsing flow reset relay (GPIO {config.FLOW_RESET_PIN}) for {config.FLOW_RESET_DURATION}s")
-        GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
-        time.sleep(config.FLOW_RESET_DURATION)
-        GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
-        print("Flow meter reset complete")
-        flow_reset_scheduled = False
-    except Exception as e:
-        print(f"Flow reset error: {e}")
-        flow_reset_scheduled = False
-
-def schedule_flow_reset():
-    """Schedule flow meter reset after thumbs up"""
-    global flow_reset_scheduled
-    if flow_reset_scheduled:
-        print("Flow reset already scheduled, skipping")
-        return
-    flow_reset_scheduled = True
-    delay_ms = int(config.FLOW_RESET_DELAY * 1000)
-    print(f"Scheduling flow meter reset in {config.FLOW_RESET_DELAY} seconds")
-    root.after(delay_ms, pulse_flow_reset)
-
 
 def initialize_iol():
     """Initialize IO-Link port"""

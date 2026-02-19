@@ -11,13 +11,8 @@ Edit values here to customize behavior without modifying the main code.
 # =============================================================================
 
 # GPIO pin assignments (BCM mode)
-FLOW_RESET_PIN = 0            # GPIO pin for flow meter reset relay (K3)
 PUMP_STOP_RELAY_PIN = 27      # GPIO pin for pump stop/alert relay
 GREEN_BUTTON_PIN = 22         # GPIO pin for green button (active low with pull-up)
-
-# Flow meter reset timing
-FLOW_RESET_DELAY = 30         # Seconds to wait after thumbs up before resetting
-FLOW_RESET_DURATION = 0.2     # Seconds to hold reset relay closed
 
 
 # =============================================================================
