@@ -87,10 +87,6 @@ fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
 mix_requested_gallons = 40  # Preset for mix mode (default 40)
 mode_indicator_label = None  # Label to display "MIX" in corner
 
-# Batch mix data from iPad (cached)
-batch_mix_data = None  # Cached JSON data from iPad
-batch_mix_overlay = None  # Reference to batch mix overlay frame
-
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
     Calculate how many gallons before target to trigger shutoff based on flow rate.
@@ -157,7 +153,7 @@ def save_totals():
 
 def load_mode_presets():
     """Load fill and mix mode gallon presets from file"""
-    global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
+    global fill_requested_gallons, mix_requested_gallons, current_mode
 
     try:
         with open('/home/pi/mode_presets.txt', 'r') as f:
@@ -175,7 +171,7 @@ def load_mode_presets():
 
 def save_mode_presets():
     """Save fill and mix mode gallon presets to file"""
-    global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
+    global fill_requested_gallons, mix_requested_gallons, current_mode
 
     try:
         with open('/home/pi/mode_presets.txt', 'w') as f:
@@ -188,7 +184,7 @@ def save_mode_presets():
 def switch_mode(new_mode):
     """Switch between fill and mix modes"""
     global current_mode, requested_gallons, fill_requested_gallons, mix_requested_gallons
-    global mode_indicator_label, colors_are_green, serial_command_received, batch_mix_layout_active
+    global mode_indicator_label, colors_are_green, serial_command_received
 
     if new_mode == current_mode:
         return  # Already in this mode
@@ -224,340 +220,6 @@ def switch_mode(new_mode):
     draw_requested_number(f"{requested_gallons:.0f}", "red")
 
     print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
-
-    # Show/hide batch mix overlay based on mode
-    update_batch_mix_overlay()
-
-# Track if batch mix layout is active
-batch_mix_layout_active = False
-
-# Cache for preventing flicker - only redraw when values change
-_last_requested_text = None
-_last_requested_color = None
-_last_actual_text = None
-_last_actual_color = None
-
-def update_batch_mix_overlay():
-    """Update the batch mix screen layout based on mode and data"""
-    global batch_mix_layout_active, batch_mix_data
-
-    # Only show batch mix layout in mix mode with data
-    if current_mode == "mix" and batch_mix_data is not None:
-        if not batch_mix_layout_active:
-            activate_batch_mix_layout()
-        else:
-            refresh_batch_mix_products()
-            refresh_batch_mix_totals()
-    else:
-        if batch_mix_layout_active:
-            deactivate_batch_mix_layout()
-
-def show_batchmix_error(error_msg):
-    """Display a BatchMix error message on screen"""
-    canvas.delete("batchmix_error")
-
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
-
-    # Red background box
-    canvas.create_rectangle(width * 0.1, height * 0.3, width * 0.9, height * 0.5,
-                           fill="darkred", outline="red", width=3, tags="batchmix_error")
-
-    # Error title
-    canvas.create_text(width // 2, height * 0.35, text="BATCHMIX ERROR",
-                      font=("Helvetica", 28, "bold"), fill="white", tags="batchmix_error")
-
-    # Error message
-    canvas.create_text(width // 2, height * 0.43, text=error_msg,
-                      font=("Helvetica", 20), fill="yellow", tags="batchmix_error")
-
-    # Auto-clear after 5 seconds
-    canvas.after(5000, lambda: canvas.delete("batchmix_error"))
-
-def activate_batch_mix_layout():
-    """Switch to batch mix screen layout"""
-    global batch_mix_layout_active
-
-    # Clear existing labels and redraw in new positions
-    canvas.delete("labels")
-    canvas.delete("batchmix")
-
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
-
-    # Left 1/3 section - center point
-    left_center_x = width // 6
-
-    # Draw "Requested:" label on left side
-    canvas.create_text(left_center_x, int(height * 0.08), text="Requested:",
-                      font=("Helvetica", 28, "bold"), fill="white", tags="labels")
-
-    # Draw "Actual:" label on left side
-    canvas.create_text(left_center_x, int(height * 0.38), text="Actual:",
-                      font=("Helvetica", 28, "bold"), fill="white", tags="labels")
-
-    # Separator line above totals (bottom 1/4)
-    canvas.create_line(0, int(height * 0.75), width, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
-
-    # Vertical separator between left and right sections
-    canvas.create_line(width // 3, 0, width // 3, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
-
-    # Products section title (right 2/3, top area)
-    products_x = width * 2 // 3
-    canvas.create_text(products_x, int(height * 0.05), text="PRODUCTS",
-                      font=("Helvetica", 32, "bold"), fill="lime", tags="batchmix")
-
-    # Draw products and totals
-    refresh_batch_mix_products()
-    refresh_batch_mix_totals()
-
-    # Redraw the numbers in new positions
-    redraw_numbers_for_batch_mix()
-
-    batch_mix_layout_active = True
-
-def refresh_batch_mix_totals():
-    """Draw/update totals section at bottom of screen"""
-    global batch_mix_data
-
-    canvas.delete("totals")
-
-    if batch_mix_data is None:
-        return
-
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
-
-    # Bottom 1/4 section - totals info
-    bottom_y = int(height * 0.85)
-    label_y = bottom_y + 35
-
-    totals_data = [
-        (width * 0.12, f"{batch_mix_data.get('total_acres', 0):.1f}", "ACRES"),
-        (width * 0.37, f"{batch_mix_data.get('gallons_per_acre', 0):.1f}", "GAL/AC"),
-        (width * 0.62, f"{batch_mix_data.get('total_liquid', 0):.1f}", "TOTAL GAL"),
-        (width * 0.87, f"{batch_mix_data.get('water_needed', 0):.1f}", "WATER"),
-    ]
-
-    for x, value, label in totals_data:
-        # Value - large cyan text
-        canvas.create_text(x, bottom_y, text=value, font=("Helvetica", 44, "bold"),
-                          fill="cyan", tags="totals")
-        # Label below - smaller gray text
-        canvas.create_text(x, label_y, text=label, font=("Helvetica", 16),
-                          fill="gray", tags="totals")
-
-def refresh_batch_mix_products():
-    """Draw/update products list on canvas"""
-    global batch_mix_data
-
-    canvas.delete("products")
-
-    if batch_mix_data is None:
-        return
-
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
-
-    products = batch_mix_data.get("products", [])
-    products_x_start = width // 3 + 20
-    products_x_end = width - 20
-
-    start_y = int(height * 0.14)
-    row_height = int(height * 0.09)  # Height per product row
-
-    for i, prod in enumerate(products[:6]):  # Max 6 products
-        y = start_y + (i * row_height)
-
-        # Product name (left side of products area) - auto-scale to fit
-        name = prod.get("name", "Unknown")
-        max_name_width = (products_x_end - products_x_start) // 2 - 20  # Half the products area
-
-        # Start with larger font, scale down if needed
-        font_size = 28
-        while font_size >= 14:
-            test_id = canvas.create_text(0, 0, text=name,
-                                        font=("Helvetica", font_size, "bold"),
-                                        anchor="w", tags="temp_measure")
-            bbox = canvas.bbox(test_id)
-            text_width = bbox[2] - bbox[0] if bbox else 0
-            canvas.delete(test_id)
-
-            if text_width <= max_name_width:
-                break
-            font_size -= 2
-
-        canvas.create_text(products_x_start + 10, y, text=name,
-                          font=("Helvetica", font_size, "bold"), fill="white",
-                          anchor="w", tags="products")
-
-        # Amount (right side)
-        gallons = prod.get("gallons", 0)
-        jugs = prod.get("jugs", 0)
-        jug_size = prod.get("jug_size", "")
-
-        if jugs > 0 and jug_size:
-            # Parse jug size to get gallons (e.g., "2.5 gal jug" -> 2.5)
-            try:
-                jug_gallons = float(jug_size.split()[0])
-            except:
-                jug_gallons = 2.5  # default
-            oz_per_jug = jug_gallons * 128
-
-            # Short jug size for display (e.g., "(2.5g Jug)")
-            short_size = f"({jug_gallons:.1f}g Jug)"
-
-            whole_jugs = int(jugs)
-            fraction = jugs - whole_jugs
-
-            # Check if close to half (within 0.02)
-            if abs(fraction - 0.5) < 0.02:
-                if whole_jugs == 0:
-                    amount_text = "1/2 jug"
-                else:
-                    amount_text = f"{whole_jugs} 1/2 jugs"
-            elif fraction < 0.02:
-                # Close to whole number
-                if whole_jugs == 1:
-                    amount_text = "1 jug"
-                else:
-                    amount_text = f"{whole_jugs} jugs"
-            else:
-                # Has extra oz
-                extra_oz = fraction * oz_per_jug
-                if whole_jugs == 0:
-                    amount_text = f"{extra_oz:.0f} oz"
-                    short_size = ""  # No jug size for oz-only
-                elif whole_jugs == 1:
-                    amount_text = f"1 jug + {extra_oz:.0f} oz"
-                else:
-                    amount_text = f"{whole_jugs} jugs + {extra_oz:.0f} oz"
-
-            # Draw amount in yellow, jug size in cyan (two separate texts)
-            if short_size:
-                # Draw jug size first at far right
-                jug_text_id = canvas.create_text(products_x_end - 10, y, text=short_size,
-                                  font=("Helvetica", 24, "bold"), fill="cyan",
-                                  anchor="e", tags="products")
-                # Get width of jug size text
-                bbox = canvas.bbox(jug_text_id)
-                jug_width = bbox[2] - bbox[0] if bbox else 150
-                # Draw amount to the left with some padding
-                canvas.create_text(products_x_end - 20 - jug_width, y, text=amount_text,
-                                  font=("Helvetica", 28, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-            else:
-                canvas.create_text(products_x_end - 10, y, text=amount_text,
-                                  font=("Helvetica", 28, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-        else:
-            amount_text = f"{gallons:.1f} gal"
-            canvas.create_text(products_x_end - 10, y, text=amount_text,
-                              font=("Helvetica", 28, "bold"), fill="yellow",
-                              anchor="e", tags="products")
-
-        # Draw subtle separator line under each product (except last)
-        if i < min(len(products), 6) - 1:
-            line_y = y + row_height // 2
-            canvas.create_line(products_x_start + 5, line_y,
-                              products_x_end - 5, line_y,
-                              fill="#333355", width=1, tags="products")
-
-    # Easy Mix indicator at bottom of products
-    if batch_mix_data.get("easy_mix", False):
-        easy_y = start_y + (min(len(products), 6) * row_height) + 10
-        canvas.create_text(width * 2 // 3, easy_y, text="EASY MIX",
-                          font=("Helvetica", 22, "bold"), fill="lime", tags="products")
-
-    # Warning to double check jug sizes
-    warning_y = start_y + (min(len(products), 6) * row_height) + 40
-    canvas.create_text(width * 2 // 3, warning_y, text="Double check jug size!",
-                      font=("Helvetica", 16, "italic"), fill="red", tags="products")
-
-def deactivate_batch_mix_layout():
-    """Switch back to normal screen layout"""
-    global batch_mix_layout_active
-
-    # Clear batch mix elements
-    canvas.delete("batchmix")
-    canvas.delete("products")
-    canvas.delete("totals")
-
-    # Restore normal labels
-    canvas.delete("labels")
-    canvas.update()
-    center_x = canvas.winfo_width() // 2
-    height = canvas.winfo_height()
-
-    canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:",
-                      font=("Helvetica", 36, "bold"), fill="white", tags="labels")
-    canvas.create_text(center_x, int(height * 0.45), text="Actual Gallons:",
-                      font=("Helvetica", 36, "bold"), fill="white", tags="labels")
-
-    # Redraw numbers in normal positions
-    redraw_numbers_normal()
-
-    batch_mix_layout_active = False
-
-# Cache for preventing flicker - only redraw when values change
-_last_requested_text = None
-_last_requested_color = None
-_last_actual_text = None
-_last_actual_color = None
-
-def redraw_numbers_for_batch_mix():
-    """Redraw requested/actual numbers in batch mix positions (left 1/3)"""
-    global requested_gallons, last_totalizer_liters
-
-    # Get current color based on state
-    color = "green" if colors_are_green else "red"
-
-    # Redraw in left 1/3 position
-    canvas.delete("requested")
-    canvas.delete("actual")
-
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
-
-    left_center_x = width // 6
-
-    # Requested number - smaller font for left panel
-    req_y = int(height * 0.22)
-    req_font = ("Helvetica", 90, "bold")
-    req_text = f"{requested_gallons:.0f}"
-
-    for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
-        canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
-                          font=req_font, fill="white", tags="requested")
-    canvas.create_text(left_center_x, req_y, text=req_text,
-                      font=req_font, fill=color, tags="requested")
-
-    # Actual number - smaller font for left panel
-    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
-    act_y = int(height * 0.55)
-    act_font = ("Helvetica", 110, "bold")
-    act_text = f"{actual_gallons:.1f}"
-
-    for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
-        canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
-                          font=act_font, fill="white", tags="actual")
-    canvas.create_text(left_center_x, act_y, text=act_text,
-                      font=act_font, fill=color, tags="actual")
-
-def redraw_numbers_normal():
-    """Redraw requested/actual numbers in normal centered positions"""
-    global requested_gallons, last_totalizer_liters
-
-    color = "green" if colors_are_green else "red"
-    draw_requested_number(f"{requested_gallons:.0f}", color)
-    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
-    draw_actual_number(f"{actual_gallons:.1f}", color)
 
 def add_to_totals(gallons):
     """Add gallons to both daily and season totals"""
@@ -2026,125 +1688,6 @@ def read_flow_meter():
         error_message = str(e)
         return last_totalizer_liters * config.LITERS_TO_GALLONS
 
-
-def socket_command_listener():
-    """Listen for commands from rotorsync BLE server via localhost socket"""
-    global requested_gallons, override_mode, colors_are_green
-    global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
-
-    import socket as sock_module
-    import json
-
-    DASHBOARD_PORT = 9999
-    debug_log = config.SERIAL_DEBUG_LOG
-
-    sock_server = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_STREAM)
-    sock_server.setsockopt(sock_module.SOL_SOCKET, sock_module.SO_REUSEADDR, 1)
-    sock_server.bind(("127.0.0.1", DASHBOARD_PORT))
-    sock_server.listen(1)
-    sock_server.settimeout(1.0)
-
-    print(f"Socket listener started on port {DASHBOARD_PORT}")
-    with open(debug_log, "a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket listener started on port {DASHBOARD_PORT}\n")
-
-    while True:
-        try:
-            try:
-                client, addr = sock_server.accept()
-                client.settimeout(5.0)
-                try:
-                    data = client.recv(4096).decode("utf-8").strip()
-                    if data:
-                        for line in data.split("\n"):
-                            line = line.strip()
-                            if not line:
-                                continue
-
-                            with open(debug_log, "a") as f:
-                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{line}'\n")
-
-                            if line == "STATUS":
-                                actual = last_totalizer_liters * config.LITERS_TO_GALLONS
-                                response = f"REQ:{requested_gallons:.1f}|ACT:{actual:.1f}|MODE:{current_mode}\n"
-                                client.send(response.encode())
-                                continue
-
-                            elif line == "MIX":
-                                root.after(0, lambda: switch_mode("mix"))
-
-                            elif line == "FILL":
-                                root.after(0, lambda: switch_mode("fill"))
-
-                            elif line.startswith("BATCHMIX_ERROR:"):
-                                # Handle BatchMix validation error
-                                error_msg = line[15:]
-                                msg = f"Socket: BatchMix ERROR - {error_msg}"
-                                print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                # Display error on screen
-                                root.after(0, lambda e=error_msg: show_batchmix_error(e))
-
-                            elif line.startswith("BATCHMIX:"):
-                                try:
-                                    json_str = line[9:]
-                                    batch_mix_data = json.loads(json_str)
-                                    msg = f"Socket: BatchMix received - {len(batch_mix_data.get('products', []))} products"
-                                    print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-
-                                    # Set mix mode requested gallons to water_needed amount (don't change regular requested_gallons)
-                                    water_needed = batch_mix_data.get('water_needed', 0)
-                                    if water_needed > 0:
-                                        mix_requested_gallons = water_needed
-                                        # Only update display if in mix mode
-                                        if current_mode == "mix":
-                                            # Show decimal if present, otherwise whole number
-                                            if water_needed == int(water_needed):
-                                                req_str = f"{int(water_needed)}"
-                                            else:
-                                                req_str = f"{water_needed:.1f}"
-                                            root.after(0, lambda s=req_str: draw_requested_number(s, "green" if colors_are_green else "red"))
-
-                                    root.after(0, update_batch_mix_overlay)
-                                except Exception as bme:
-                                    msg = f"Socket: BatchMix parse error: {bme}"
-                                    print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-
-                            elif line == "HISTORY":
-                                try:
-                                    with open("/home/pi/fill_history.log", "r") as hf:
-                                        all_lines = hf.readlines()
-                                        last_5 = all_lines[-5:] if len(all_lines) >= 5 else all_lines
-                                        history_items = []
-                                        for entry in last_5:
-                                            parts = entry.strip().split("|")
-                                            if len(parts) >= 3:
-                                                ts = parts[0].strip()
-                                                req = parts[1].replace("Requested:", "").replace("gal", "").strip()
-                                                act = parts[2].replace("Actual:", "").replace("gal", "").strip()
-                                                history_items.append(f"{ts},{req},{act}")
-                                        history_response = ";".join(history_items)
-                                        client.send(f"HIST:{history_response}\n".encode())
-                                except Exception:
-                                    client.send(b"HIST:\n")
-                                continue
-
-                            client.send(b"OK\n")
-                except sock_module.timeout:
-                    pass
-                finally:
-                    client.close()
-            except sock_module.timeout:
-                pass
-        except Exception as e:
-            print(f"Socket listener error: {e}")
-            time.sleep(1)
-
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
@@ -2557,20 +2100,6 @@ root.update()
 
 def draw_requested_number(text, color="red"):
     """Draw the requested number with white outline on full-screen canvas"""
-    global batch_mix_layout_active, _last_requested_text, _last_requested_color
-
-    # If batch mix layout is active, use different positioning
-    if batch_mix_layout_active:
-        redraw_numbers_for_batch_mix()
-        return
-
-    # Only redraw if value or color changed (prevents flicker)
-    if text == _last_requested_text and color == _last_requested_color:
-        return
-
-    _last_requested_text = text
-    _last_requested_color = color
-
     # Delete old requested number
     canvas.delete("requested")
 
@@ -2602,20 +2131,6 @@ canvas.create_text(center_x, int(height * 0.45), text="Actual Gallons:", font=("
 
 def draw_actual_number(text, color="red"):
     """Draw the actual number with white outline on full-screen canvas"""
-    global batch_mix_layout_active, _last_actual_text, _last_actual_color
-
-    # If batch mix layout is active, use different positioning
-    if batch_mix_layout_active:
-        redraw_numbers_for_batch_mix()
-        return
-
-    # Only redraw if value or color changed (prevents flicker)
-    if text == _last_actual_text and color == _last_actual_color:
-        return
-
-    _last_actual_text = text
-    _last_actual_color = color
-
     # Delete old actual number
     canvas.delete("actual")
 
@@ -2853,11 +2368,10 @@ def update_dashboard():
         canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=" | ".join(status_parts),
                           font=("Helvetica", 20), fill="yellow", tags="status")
 
-    # Draw daily total in bottom left corner (only in fill mode)
+    # Draw daily total in bottom left corner (two lines: "Today:" and gallons)
     canvas.delete("daily_total")
-    if current_mode != "mix":
-        canvas.create_text(10, canvas.winfo_height() - 10, text=f"Today:\n{daily_total:.1f} gal",
-                          font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
+    canvas.create_text(10, canvas.winfo_height() - 10, text=f"Today:\n{daily_total:.1f} gal",
+                      font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
@@ -2995,10 +2509,6 @@ draw_requested_number(f"{requested_gallons:.0f}", "red")
 # Start serial listener in background thread (works without IOL)
 serial_thread = threading.Thread(target=serial_listener, daemon=True)
 serial_thread.start()
-
-# Start socket command listener in background thread (for BLE server communication)
-socket_thread = threading.Thread(target=socket_command_listener, daemon=True)
-socket_thread.start()
 
 # Start green button monitor in background thread
 green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
