@@ -2,6 +2,15 @@
 
 A Raspberry Pi-based spray trailer monitoring system for agricultural helicopter operations.
 
+## ⚠️ Version Compatibility
+
+**This software is designed for BBB HAT v1.1**
+
+A new HAT version (v1.2) is in development with updated GPIO mappings and features.
+Check for v1.2 branch or updated documentation before use with newer hardware.
+
+---
+
 ## Features
 
 - **Real-time flow monitoring** via IO-Link (Picomag flow meter)
