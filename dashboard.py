@@ -17,6 +17,13 @@ VERSION = "v1.9.4"
 # Import configuration
 import config
 
+# Set up rotating loggers
+from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
+main_logger = get_main_logger()
+serial_logger = get_serial_logger()
+button_logger = get_button_logger()
+relay_logger = get_relay_logger()
+
 # Add paths for libraries
 sys.path.insert(0, config.RPI_GPIO_PATH)
 sys.path.insert(0, config.IOL_HAT_PATH)
@@ -125,7 +132,7 @@ def load_totals():
             if len(lines) >= 2:
                 daily_total = float(lines[0].strip())
                 last_reset_date = lines[1].strip()
-    except:
+    except Exception:
         daily_total = 0.0
         last_reset_date = None
 
@@ -133,7 +140,7 @@ def load_totals():
     try:
         with open('/home/pi/season_total.txt', 'r') as f:
             season_total = float(f.read().strip())
-    except:
+    except Exception:
         season_total = 0.0
 
 def save_totals():
@@ -168,7 +175,7 @@ def load_mode_presets():
                 current_mode = lines[2].strip()
                 if current_mode not in ['fill', 'mix']:
                     current_mode = 'fill'
-    except:
+    except Exception:
         fill_requested_gallons = config.REQUESTED_GALLONS
         mix_requested_gallons = 40
         current_mode = 'fill'
@@ -405,7 +412,7 @@ def refresh_batch_mix_products():
             # Parse jug size to get gallons (e.g., "2.5 gal jug" -> 2.5)
             try:
                 jug_gallons = float(jug_size.split()[0])
-            except:
+            except Exception:
                 jug_gallons = 2.5  # default
             oz_per_jug = jug_gallons * 128
 
@@ -685,14 +692,14 @@ def get_ip_address():
         result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
         ip = result.stdout.strip().split()[0] if result.stdout.strip() else "No IP"
         return ip
-    except:
+    except Exception:
         return "No IP"
 
 def get_username():
     """Get the current username"""
     try:
         return os.getenv('USER', 'unknown')
-    except:
+    except Exception:
         return 'unknown'
 
 def change_colors_to_green(from_button=False):
@@ -731,7 +738,7 @@ def change_colors_to_green(from_button=False):
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                schedule_flow_reset()  # Reset flow meter after delay
+                schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             source = "button press" if from_button else "auto-alert"
@@ -753,7 +760,7 @@ def change_colors_to_green(from_button=False):
             # Show thumbs up but DO NOT change colors to green
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                schedule_flow_reset()  # Reset flow meter after delay
+                schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             with open(button_log, 'a') as f:
@@ -771,7 +778,7 @@ def green_button_monitor():
         # Initialize GPIO if not already done
         try:
             GPIO.setmode(GPIO.BCM)
-        except:
+        except Exception:
             pass  # Already initialized
 
         # Set up green button pin as input with pull-up resistor
@@ -1194,7 +1201,7 @@ def run_full_test():
             try:
                 # Quick test - just check if GPIO is initialized
                 root.after(0, lambda: mark_tested('gpio'))
-            except:
+            except Exception:
                 pass
 
         time.sleep(0.2)
@@ -1206,7 +1213,7 @@ def run_full_test():
                 time.sleep(0.3)
                 GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
                 root.after(0, lambda: mark_tested('relay'))
-            except:
+            except Exception:
                 pass
 
         time.sleep(0.2)
@@ -1217,7 +1224,7 @@ def run_full_test():
             ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
             ser.close()
             root.after(0, lambda: mark_tested('serial'))
-        except:
+        except Exception:
             pass
 
         time.sleep(0.2)
@@ -1298,7 +1305,7 @@ def check_wifi_status():
                                              capture_output=True, text=True, timeout=1)
                 if 'wlan0' in signal_result.stdout:
                     return "WiFi: CONNECTED"
-            except:
+            except Exception:
                 pass
             return "WiFi: CONNECTED"
         else:
@@ -2075,6 +2082,9 @@ def socket_command_listener():
                             elif line == "MIX":
                                 root.after(0, lambda: switch_mode("mix"))
 
+                            elif line == "RESET":
+                                root.after(0, pulse_flow_reset)
+
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
 
@@ -2505,42 +2515,44 @@ def initialize_gpio():
         GPIO.setup(config.FLOW_RESET_PIN, GPIO.OUT)
         GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
         GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
-        print(f"GPIO initialized: Pump relay on pin {config.PUMP_STOP_RELAY_PIN}, Flow reset on pin {config.FLOW_RESET_PIN}")
+        print(f"GPIO initialized: Relay on pin {config.PUMP_STOP_RELAY_PIN}")
         return True
     except Exception as e:
         print(f"Failed to initialize GPIO: {e}")
         return False
 
-# Flow meter reset scheduling
+# Flow meter reset
 flow_reset_scheduled = False
 
 def pulse_flow_reset():
-    """Pulse the flow meter reset relay to zero the totalizer"""
     global flow_reset_scheduled
+    dbg = open("/home/pi/reset_debug.log", "a")
+    dbg.write("pulse called\n")
+    dbg.close()
     if not GPIO_AVAILABLE:
-        print("GPIO not available, cannot reset flow meter")
         return
     try:
-        print(f"Pulsing flow reset relay (GPIO {config.FLOW_RESET_PIN}) for {config.FLOW_RESET_DURATION}s")
+        dbg = open("/home/pi/reset_debug.log", "a")
+        dbg.write("pulsing gpio0\n")
+        dbg.close()
         GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
         time.sleep(config.FLOW_RESET_DURATION)
         GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
-        print("Flow meter reset complete")
-        flow_reset_scheduled = False
+        dbg = open("/home/pi/reset_debug.log", "a")
+        dbg.write("done\n")
+        dbg.close()
     except Exception as e:
-        print(f"Flow reset error: {e}")
-        flow_reset_scheduled = False
+        dbg = open("/home/pi/reset_debug.log", "a")
+        dbg.write(str(e) + "\n")
+        dbg.close()
+    flow_reset_scheduled = False
 
 def schedule_flow_reset():
-    """Schedule flow meter reset after thumbs up"""
     global flow_reset_scheduled
     if flow_reset_scheduled:
-        print("Flow reset already scheduled, skipping")
         return
     flow_reset_scheduled = True
-    delay_ms = int(config.FLOW_RESET_DELAY * 1000)
-    print(f"Scheduling flow meter reset in {config.FLOW_RESET_DELAY} seconds")
-    root.after(delay_ms, pulse_flow_reset)
+    root.after(int(config.FLOW_RESET_DELAY * 1000), pulse_flow_reset)
 
 
 def initialize_iol():

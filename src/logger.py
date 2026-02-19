@@ -1,145 +1,124 @@
 #!/usr/bin/env python3
 """
-Centralized logging for IOL Dashboard.
+Enhanced logging module with rotation support.
 
-Provides structured logging with:
-- Console output (INFO and above)
-- File logging with rotation
-- Component-specific loggers
+Provides:
+- Rotating file handler (max 10MB, 5 backups)
+- Consistent log format
+- Thread-safe logging
 """
 
 import logging
-import logging.handlers
 import os
-import sys
-from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
-
-class DashboardFormatter(logging.Formatter):
-    """Custom formatter with timestamp and level."""
-
-    def format(self, record):
-        # Add timestamp in consistent format
-        record.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        return super().format(record)
+# Default log settings
+DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+DEFAULT_BACKUP_COUNT = 5
+DEFAULT_FORMAT = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+DEFAULT_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
-def setup_logging(
-    log_file: str,
+def setup_logger(
+    name: str,
+    log_file: Optional[str] = None,
     level: int = logging.INFO,
-    max_bytes: int = 5 * 1024 * 1024,  # 5MB
-    backup_count: int = 3,
-    console_output: bool = True
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    backup_count: int = DEFAULT_BACKUP_COUNT,
+    console: bool = True
 ) -> logging.Logger:
     """
-    Set up the root logger with file and console handlers.
-
+    Set up a logger with rotation support.
+    
     Args:
-        log_file: Path to the main log file
-        level: Logging level (default INFO)
-        max_bytes: Maximum log file size before rotation
+        name: Logger name
+        log_file: Path to log file (None for console only)
+        level: Logging level
+        max_bytes: Max file size before rotation
         backup_count: Number of backup files to keep
-        console_output: Whether to also log to console
-
+        console: Whether to also log to console
+        
     Returns:
-        The configured root logger
+        Configured logger instance
     """
-    # Get root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
-
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
     # Clear any existing handlers
-    root_logger.handlers.clear()
-
-    # Create formatter
-    formatter = DashboardFormatter(
-        '%(timestamp)s [%(levelname)s] %(name)s: %(message)s'
-    )
-
+    logger.handlers.clear()
+    
+    formatter = logging.Formatter(DEFAULT_FORMAT, DEFAULT_DATE_FORMAT)
+    
+    # Console handler
+    if console:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
     # File handler with rotation
-    try:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
+    if log_file:
+        # Ensure directory exists
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        
+        file_handler = RotatingFileHandler(
             log_file,
             maxBytes=max_bytes,
             backupCount=backup_count
         )
-        file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-    except Exception as e:
-        print(f"Warning: Could not set up file logging: {e}", file=sys.stderr)
-
-    # Console handler
-    if console_output:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
-
-    return root_logger
+        logger.addHandler(file_handler)
+    
+    return logger
 
 
 def get_logger(name: str) -> logging.Logger:
-    """
-    Get a logger for a specific component.
-
-    Args:
-        name: Component name (e.g., 'flow_meter', 'serial', 'gpio')
-
-    Returns:
-        Logger instance for the component
-    """
-    return logging.getLogger(f"iol_dashboard.{name}")
+    """Get an existing logger by name."""
+    return logging.getLogger(name)
 
 
-class FileLogger:
-    """
-    Simple file logger for component-specific logs (e.g., relay, button).
+# Pre-configured loggers for common use cases
+def get_main_logger() -> logging.Logger:
+    """Get the main dashboard logger with rotation."""
+    return setup_logger(
+        'dashboard',
+        log_file='/home/pi/iol_dashboard.log',
+        level=logging.INFO,
+        max_bytes=10 * 1024 * 1024,  # 10MB
+        backup_count=3
+    )
 
-    Provides append-only logging to a dedicated file.
-    """
 
-    def __init__(self, log_file: str):
-        """
-        Initialize file logger.
+def get_serial_logger() -> logging.Logger:
+    """Get serial debug logger with rotation."""
+    return setup_logger(
+        'serial',
+        log_file='/home/pi/serial_debug.log',
+        level=logging.DEBUG,
+        max_bytes=5 * 1024 * 1024,  # 5MB
+        backup_count=2
+    )
 
-        Args:
-            log_file: Path to the log file
-        """
-        self.log_file = log_file
 
-    def log(self, message: str, prefix: str = "") -> None:
-        """
-        Write a log message to the file.
+def get_relay_logger() -> logging.Logger:
+    """Get relay test logger with rotation."""
+    return setup_logger(
+        'relay',
+        log_file='/home/pi/relay_test.log',
+        level=logging.DEBUG,
+        max_bytes=5 * 1024 * 1024,  # 5MB
+        backup_count=2
+    )
 
-        Args:
-            message: Message to log
-            prefix: Optional prefix (e.g., 'SUCCESS', 'ERROR')
-        """
-        try:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            with open(self.log_file, 'a') as f:
-                if prefix:
-                    f.write(f"{timestamp} [{prefix}] {message}\n")
-                else:
-                    f.write(f"{timestamp} {message}\n")
-        except Exception:
-            pass  # Silently ignore logging errors
 
-    def separator(self) -> None:
-        """Write a separator line to the log."""
-        try:
-            with open(self.log_file, 'a') as f:
-                f.write(f"\n{'='*60}\n")
-        except Exception:
-            pass
-
-    def write_raw(self, text: str) -> None:
-        """Write raw text to the log file."""
-        try:
-            with open(self.log_file, 'a') as f:
-                f.write(text)
-        except Exception:
-            pass
+def get_button_logger() -> logging.Logger:
+    """Get button debug logger with rotation."""
+    return setup_logger(
+        'button',
+        log_file='/home/pi/button_debug.log',
+        level=logging.DEBUG,
+        max_bytes=5 * 1024 * 1024,  # 5MB
+        backup_count=2
+    )
