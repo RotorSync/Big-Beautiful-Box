@@ -23,44 +23,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest pyserial pillow
     
-    - name: Create mock modules
+    - name: Set up mock modules
       run: |
         mkdir -p RPi
-        echo '# Mock RPi package' > RPi/__init__.py
-        python3 -c "
-        code = '''
-        BCM = 11
-        BOARD = 10
-        IN = 1
-        OUT = 0
-        HIGH = 1
-        LOW = 0
-        PUD_UP = 22
-        PUD_DOWN = 21
-        _mode = None
-        _pins = {}
-        _warnings = True
-        def setmode(mode): global _mode; _mode = mode
-        def setwarnings(flag): global _warnings; _warnings = flag
-        def setup(pin, direction, initial=0, pull_up_down=None): _pins[pin] = {'direction': direction, 'value': initial}
-        def output(pin, value): _pins[pin]['value'] = value if pin in _pins else None
-        def input(pin): return _pins.get(pin, {}).get('value', 0)
-        def cleanup(pin=None): global _pins; _pins = {} if pin is None else {k:v for k,v in _pins.items() if k != pin}
-        '''
-        print(code)
-        " > RPi/GPIO.py
-        python3 -c "
-        code = '''
-        import struct
-        def power(port, status): pass
-        def pd(port, offset, length, data):
-            totalizer = 100.0
-            flow_rate = 0.5
-            result = b"\\x00" * 4 + struct.pack(">f", totalizer) + struct.pack(">f", flow_rate) + b"\\x00" * 3
-            return result
-        '''
-        print(code)
-        " > iolhat.py
+        cp mocks/RPi_GPIO.py RPi/GPIO.py
+        echo '# Mock RPi' > RPi/__init__.py
+        cp mocks/iolhat.py iolhat.py
     
     - name: Run basic tests
       run: python run_tests.py
