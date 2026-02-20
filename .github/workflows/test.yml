@@ -23,72 +23,44 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest pyserial pillow
     
-    - name: Create mock RPi.GPIO
+    - name: Create mock modules
       run: |
-        # Create mock for RPi.GPIO since we're not on a Pi
         mkdir -p RPi
-        cat > RPi/__init__.py << 'MOCK'
-# Mock RPi package for testing
-MOCK
-        cat > RPi/GPIO.py << 'MOCK'
-# Mock RPi.GPIO for testing on non-Pi systems
-BCM = 11
-BOARD = 10
-IN = 1
-OUT = 0
-HIGH = 1
-LOW = 0
-PUD_UP = 22
-PUD_DOWN = 21
-
-_mode = None
-_pins = {}
-_warnings = True
-
-def setmode(mode):
-    global _mode
-    _mode = mode
-
-def setwarnings(flag):
-    global _warnings
-    _warnings = flag
-
-def setup(pin, direction, initial=LOW, pull_up_down=None):
-    _pins[pin] = {'direction': direction, 'value': initial}
-
-def output(pin, value):
-    if pin in _pins:
-        _pins[pin]['value'] = value
-
-def input(pin):
-    return _pins.get(pin, {}).get('value', LOW)
-
-def cleanup(pin=None):
-    global _pins
-    if pin is None:
+        echo '# Mock RPi package' > RPi/__init__.py
+        python3 -c "
+        code = '''
+        BCM = 11
+        BOARD = 10
+        IN = 1
+        OUT = 0
+        HIGH = 1
+        LOW = 0
+        PUD_UP = 22
+        PUD_DOWN = 21
+        _mode = None
         _pins = {}
-    elif pin in _pins:
-        del _pins[pin]
-MOCK
-    
-    - name: Create mock iolhat
-      run: |
-        cat > iolhat.py << 'MOCK'
-# Mock iolhat for testing
-def power(port, status):
-    pass
-
-def pd(port, offset, length, data):
-    # Return mock flow meter data
-    import struct
-    totalizer = 100.0  # liters
-    flow_rate = 0.5    # L/s
-    data = b'\x00' * 4
-    data += struct.pack('>f', totalizer)
-    data += struct.pack('>f', flow_rate)
-    data += b'\x00' * 3
-    return data
-MOCK
+        _warnings = True
+        def setmode(mode): global _mode; _mode = mode
+        def setwarnings(flag): global _warnings; _warnings = flag
+        def setup(pin, direction, initial=0, pull_up_down=None): _pins[pin] = {'direction': direction, 'value': initial}
+        def output(pin, value): _pins[pin]['value'] = value if pin in _pins else None
+        def input(pin): return _pins.get(pin, {}).get('value', 0)
+        def cleanup(pin=None): global _pins; _pins = {} if pin is None else {k:v for k,v in _pins.items() if k != pin}
+        '''
+        print(code)
+        " > RPi/GPIO.py
+        python3 -c "
+        code = '''
+        import struct
+        def power(port, status): pass
+        def pd(port, offset, length, data):
+            totalizer = 100.0
+            flow_rate = 0.5
+            result = b"\\x00" * 4 + struct.pack(">f", totalizer) + struct.pack(">f", flow_rate) + b"\\x00" * 3
+            return result
+        '''
+        print(code)
+        " > iolhat.py
     
     - name: Run basic tests
       run: python run_tests.py
