@@ -1,0 +1,97 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pyserial pillow
+    
+    - name: Create mock RPi.GPIO
+      run: |
+        # Create mock for RPi.GPIO since we're not on a Pi
+        mkdir -p RPi
+        cat > RPi/__init__.py << 'MOCK'
+# Mock RPi package for testing
+MOCK
+        cat > RPi/GPIO.py << 'MOCK'
+# Mock RPi.GPIO for testing on non-Pi systems
+BCM = 11
+BOARD = 10
+IN = 1
+OUT = 0
+HIGH = 1
+LOW = 0
+PUD_UP = 22
+PUD_DOWN = 21
+
+_mode = None
+_pins = {}
+_warnings = True
+
+def setmode(mode):
+    global _mode
+    _mode = mode
+
+def setwarnings(flag):
+    global _warnings
+    _warnings = flag
+
+def setup(pin, direction, initial=LOW, pull_up_down=None):
+    _pins[pin] = {'direction': direction, 'value': initial}
+
+def output(pin, value):
+    if pin in _pins:
+        _pins[pin]['value'] = value
+
+def input(pin):
+    return _pins.get(pin, {}).get('value', LOW)
+
+def cleanup(pin=None):
+    global _pins
+    if pin is None:
+        _pins = {}
+    elif pin in _pins:
+        del _pins[pin]
+MOCK
+    
+    - name: Create mock iolhat
+      run: |
+        cat > iolhat.py << 'MOCK'
+# Mock iolhat for testing
+def power(port, status):
+    pass
+
+def pd(port, offset, length, data):
+    # Return mock flow meter data
+    import struct
+    totalizer = 100.0  # liters
+    flow_rate = 0.5    # L/s
+    data = b'\x00' * 4
+    data += struct.pack('>f', totalizer)
+    data += struct.pack('>f', flow_rate)
+    data += b'\x00' * 3
+    return data
+MOCK
+    
+    - name: Run basic tests
+      run: python run_tests.py
+    
+    - name: Run pytest
+      run: pytest tests/ -v --tb=short
