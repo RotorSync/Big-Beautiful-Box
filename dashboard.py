@@ -94,6 +94,13 @@ fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
 mix_requested_gallons = 40  # Preset for mix mode (default 40)
 mode_indicator_label = None  # Label to display "MIX" in corner
 
+# Mopeka tank level display
+mopeka1_gallons = 0
+mopeka2_gallons = 0
+mopeka1_quality = 0
+mopeka2_quality = 0
+
+
 # Batch mix data from iPad (cached)
 batch_mix_data = None  # Cached JSON data from iPad
 batch_mix_overlay = None  # Reference to batch mix overlay frame
@@ -2127,6 +2134,32 @@ def socket_command_listener():
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
+
+                            elif line.startswith("MOPEKA:"):
+                                try:
+                                    parts = line[7:].split("|")
+                                    if len(parts) >= 4:
+                                        mopeka1_gallons_val = float(parts[0])
+                                        mopeka2_gallons_val = float(parts[1])
+                                        mopeka1_quality_val = int(parts[2])
+                                        mopeka2_quality_val = int(parts[3])
+                                        
+                                        # Update globals in main thread
+                                        def update_mopeka(m1g, m2g, m1q, m2q):
+                                            global mopeka1_gallons, mopeka2_gallons
+                                            global mopeka1_quality, mopeka2_quality
+                                            mopeka1_gallons = m1g
+                                            mopeka2_gallons = m2g
+                                            mopeka1_quality = m1q
+                                            mopeka2_quality = m2q
+                                            update_mopeka_display()
+                                        
+                                        root.after(0, lambda: update_mopeka(
+                                            mopeka1_gallons_val, mopeka2_gallons_val,
+                                            mopeka1_quality_val, mopeka2_quality_val))
+                                except Exception as me:
+                                    print(f"Mopeka display error: {me}")
+
                             elif line == "HISTORY":
                                 try:
                                     with open("/home/pi/fill_history.log", "r") as hf:
@@ -2602,6 +2635,38 @@ def draw_fullscreen_stripes():
 # Draw stripes after window is created
 root.update()
 # draw_fullscreen_stripes()  # Disabled - using solid black background
+
+
+def update_mopeka_display():
+    """Draw Mopeka tank levels in small text on the right side of screen"""
+    canvas.delete("mopeka_display")
+    
+    width = canvas.winfo_width()
+    height = canvas.winfo_height()
+    
+    # Position: right side, vertically centered
+    x = width - 20  # 20px from right edge
+    
+    # Quality indicator: 0=no signal, 1=weak, 2=ok, 3=good
+    def quality_color(q):
+        if q >= 3: return "#00ff00"   # green
+        if q >= 2: return "#ffff00"   # yellow
+        if q >= 1: return "#ff8800"   # orange
+        return "#ff0000"              # red (no signal)
+    
+    font = ("Helvetica", 18)
+    
+    # Front tank (mopeka1)
+    color1 = quality_color(mopeka1_quality)
+    label1 = f"Front: {mopeka1_gallons:.0f} gal"
+    canvas.create_text(x, int(height * 0.40), text=label1, font=font,
+                      fill=color1, anchor="e", tags="mopeka_display")
+    
+    # Back tank (mopeka2) 
+    color2 = quality_color(mopeka2_quality)
+    label2 = f"Back: {mopeka2_gallons:.0f} gal"
+    canvas.create_text(x, int(height * 0.46), text=label2, font=font,
+                      fill=color2, anchor="e", tags="mopeka_display")
 
 def draw_requested_number(text, color="red"):
     """Draw the requested number with white outline on full-screen canvas"""

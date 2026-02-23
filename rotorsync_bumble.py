@@ -393,6 +393,12 @@ async def read_sensors(sensor_adapter):
             
             if mopeka_found:
                 mopeka_failures = 0
+                # Send tank levels to dashboard
+                m1_gal = sensor_data["mopeka1"].get("gallons", 0)
+                m2_gal = sensor_data["mopeka2"].get("gallons", 0)
+                m1_q = sensor_data["mopeka1"].get("quality", 0)
+                m2_q = sensor_data["mopeka2"].get("quality", 0)
+                send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
             else:
                 mopeka_failures += 1
                 if mopeka_failures > 1:
