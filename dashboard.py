@@ -99,6 +99,7 @@ mopeka1_gallons = 0
 mopeka2_gallons = 0
 mopeka1_quality = 0
 mopeka2_quality = 0
+mopeka_connected = False
 
 
 # Batch mix data from iPad (cached)
@@ -2135,6 +2136,9 @@ def socket_command_listener():
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
 
+                            elif line == "MOPEKA_OFFLINE":
+                                root.after(0, _mopeka_offline)
+
                             elif line.startswith("MOPEKA:"):
                                 try:
                                     parts = line[7:].split("|")
@@ -2626,24 +2630,36 @@ root.update()
 
 def _apply_mopeka(m1g, m2g, m1q, m2q):
     """Apply mopeka values and update display (called from main thread via root.after)"""
-    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality, mopeka_connected
     mopeka1_gallons = m1g
     mopeka2_gallons = m2g
     mopeka1_quality = m1q
     mopeka2_quality = m2q
+    mopeka_connected = True
     print(f"Mopeka applied: front={m1g:.0f} back={m2g:.0f} q={m1q}/{m2q}", flush=True)
     update_mopeka_display()
 
 
+def _mopeka_offline():
+    """Mark mopeka sensors as offline and update display"""
+    global mopeka_connected
+    mopeka_connected = False
+    print("Mopeka offline", flush=True)
+    update_mopeka_display()
+
+
 def update_mopeka_display():
-    """Draw Mopeka tank levels in small text on the right side of screen"""
+    """Draw Mopeka tank levels in top-right corner of screen"""
     canvas.delete("mopeka_display")
     
     width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    x = width - 20  # 20px from right edge
+    font = ("Helvetica", 54)
     
-    # Position: right side, vertically centered
-    x = width - 40  # 40px from right edge
+    if not mopeka_connected:
+        canvas.create_text(x, 40, text="Tanks: No Signal", font=font,
+                          fill="#ff0000", anchor="ne", tags="mopeka_display")
+        return
     
     # Quality indicator: 0=no signal, 1=weak, 2=ok, 3=good
     def quality_color(q):
@@ -2652,19 +2668,17 @@ def update_mopeka_display():
         if q >= 1: return "#ff8800"   # orange
         return "#ff0000"              # red (no signal)
     
-    font = ("Helvetica", 54)
-    
-    # Front tank (mopeka1)
+    # Front tank - top right
     color1 = quality_color(mopeka1_quality)
     label1 = f"Front: {mopeka1_gallons:.0f} gal"
-    canvas.create_text(x, int(height * 0.35), text=label1, font=font,
-                      fill=color1, anchor="e", tags="mopeka_display")
+    canvas.create_text(x, 40, text=label1, font=font,
+                      fill=color1, anchor="ne", tags="mopeka_display")
     
-    # Back tank (mopeka2) 
+    # Back tank - below front
     color2 = quality_color(mopeka2_quality)
     label2 = f"Back: {mopeka2_gallons:.0f} gal"
-    canvas.create_text(x, int(height * 0.45), text=label2, font=font,
-                      fill=color2, anchor="e", tags="mopeka_display")
+    canvas.create_text(x, 110, text=label2, font=font,
+                      fill=color2, anchor="ne", tags="mopeka_display")
 
 def draw_requested_number(text, color="red"):
     """Draw the requested number with white outline on full-screen canvas"""
@@ -2744,6 +2758,9 @@ def draw_actual_number(text, color="red"):
 
 # Draw initial value
 draw_actual_number("0.0", "red")
+
+# Draw initial mopeka state (no signal)
+root.after(1000, update_mopeka_display)
 
 # Status Label (for connection errors)
 status_label = ttk.Label(root, text="", font=("Helvetica", 24),

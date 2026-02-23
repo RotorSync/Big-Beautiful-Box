@@ -403,6 +403,7 @@ async def read_sensors(sensor_adapter):
                 mopeka_failures += 1
                 if mopeka_failures > 1:
                     print(f'Mopeka not found ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES})', flush=True)
+                    send_dashboard_command('MOPEKA_OFFLINE')
                     
         except Exception as e:
             mopeka_failures += 1
