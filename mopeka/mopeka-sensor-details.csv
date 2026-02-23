@@ -1,0 +1,29 @@
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+Man,Trailer,Tank,Center Sump?,Height Offset,Mopeka Name in app,Mopeka ID,MQTT Topic for app,Added to app
+Milan,1,Front,,-0.38,TR1-Mopeka Front Tank,3A:28:34,trailer/trailer1/mopeka/front,Yes
+,1,Back,,,TR1-Mopeka Back Tank,---------------,trailer/trailer1/mopeka/back,No
+Vern,2,Front,,0.15,TR2-Mopeka Front Tank,79:27:D8,trailer/trailer2/mopeka/front,Yes
+,2,Back,,0.63,TR2-Mopeka Back Tank,96:BB:5D,trailer/trailer2/mopeka/back,Yes
+Bret,3,Front,,-0.6,TR3-Mopeka Front Tank,89:75:2B,trailer/trailer3/mopeka/front,Yes
+,3,Back,,0.65,TR3-Mopeka Back Tank,9E:F6:5A,trailer/trailer3/mopeka/back,Yes
+Austin S,4,Front,,0.245,TR4-Mopeka Front Tank,3D:46:2A,trailer/trailer4/mopeka/front,Yes
+,4,Back,,-0.75,TR4-Mopeka Back Tank,ED:11:33,trailer/trailer4/mopeka/back,Yes                                                                                                                                                  
+Dawson,5,Front,,-0.4,TR5-Mopeka Front Tank,52:7C:6B,trailer/trailer5/mopeka/front,Yes
+,5,Back,,0.2,TR5-Mopeka Back Tank,3C:E8:11,trailer/trailer5/mopeka/back,Yes
+Stan,6,Front,,0.115,TR6-Mopeka Front Tank,C3:93:D3,trailer/trailer6/mopeka/front,Yes
+,6,Back,,-0.225,TR6-Mopeka Back Tank,EB:A8:F2,trailer/trailer6/mopeka/back,Yes
+Eric,7,Front,,0.4,TR7-Mopeka Front Tank,2C:25:CE,trailer/trailer7/mopeka/front,Yes
+,7,Back,,-0.38,TR7-Mopeka Back Tank,EC:C6:E6,trailer/trailer7/mopeka/back,Yes
+Eugene,8,Front,,0,TR8-Mopeka Front Tank,FB:30:71,trailer/trailer8/mopeka/front,Yes
+,8,Back,,,TR8-Mopeka Back Tank,A9:B8:9A,trailer/trailer8/mopeka/back,Yes
+Jake,9,Front,,0.45,TR9-Mopeka Front Tank,35:6C:81,trailer/trailer9/mopeka/front,Yes
+,9,Back,,-0.05,TR9-Mopeka Back Tank,B1:09:B1,trailer/trailer9/mopeka/back,Yes
+Levi,10,Front,,0,TR10-Mopeka Front Tank,03:7D:C2,trailer/trailer10/mopeka/front,Yes
+,10,Back,,0.4,TR10-Mopeka Back Tank,E0:B1:F7,trailer/trailer10/mopeka/back,Yes
+Ryan,11,Front,,0.2,TR11-Mopeka Front Tank,27:C2:80,trailer/trailer11/mopeka/front,Yes
+,11,Back,,-0.5,TR11-Mopeka Back Tank,E5:93:30,trailer/trailer11/mopeka/back,Yes
+Brian,12,Front,no,0,TR12-Mopeka Front Tank,79:91:B9,trailer/trailer12/mopeka/front,Yes
+,12,Back,,-0.3,TR12-Mopeka Back Tank,22:2C:77,trailer/trailer12/mopeka/back,Yes
