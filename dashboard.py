@@ -87,9 +87,9 @@ pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
-consecutive_identical_reads = 0  # Track stale data
-last_read_totalizer = None  # Previous totalizer value for stale detection
-STALE_DATA_THRESHOLD = 30  # Seconds of identical non-zero reads before warning
+consecutive_identical_raw = 0  # Track byte-for-byte identical reads
+last_raw_data = None  # Previous raw bytes for stale detection
+STALE_RAW_THRESHOLD = 25  # Identical raw reads before flagging (25 * 200ms = 5 seconds)
 override_enabled_time = 0  # Timestamp when override mode was last enabled
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
@@ -2013,7 +2013,7 @@ def show_menu():
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
-    global consecutive_identical_reads, last_read_totalizer
+    global consecutive_identical_raw, last_raw_data
 
     try:
         # Read process data from IO-Link device
@@ -2024,24 +2024,30 @@ def read_flow_meter():
             if raw_data == b'\x00' * len(raw_data):
                 connection_error = True
                 error_message = "Device not responding (all-zero data)"
+                last_raw_data = None
+                consecutive_identical_raw = 0
                 return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+            # Check for stale data (byte-for-byte identical reads = meter disconnected)
+            # A connected meter always has micro-fluctuations in the raw bytes
+            if raw_data == last_raw_data:
+                consecutive_identical_raw += 1
+                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
+                    connection_error = True
+                    stale_secs = consecutive_identical_raw * (config.UPDATE_INTERVAL / 1000.0)
+                    error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
+                    if consecutive_identical_raw == STALE_RAW_THRESHOLD:
+                        print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
+                    return last_totalizer_liters * config.LITERS_TO_GALLONS
+            else:
+                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
+                    print(f"Flow meter data flowing again", flush=True)
+                consecutive_identical_raw = 0
+            last_raw_data = raw_data
 
             # Decode the data according to Picomag format
             totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
             flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
-
-            # Check for stale data (same totalizer value repeated = possible disconnect)
-            if last_read_totalizer is not None and totalizer_liters == last_read_totalizer and flow_rate_l_per_s == 0:
-                consecutive_identical_reads += 1
-                stale_seconds = consecutive_identical_reads * (config.UPDATE_INTERVAL / 1000.0)
-                if stale_seconds > STALE_DATA_THRESHOLD:
-                    connection_error = True
-                    error_message = f"Stale data ({stale_seconds:.0f}s)"
-                    # Don't update last_successful_read_time for stale data
-                    return totalizer_liters * config.LITERS_TO_GALLONS
-            else:
-                consecutive_identical_reads = 0
-            last_read_totalizer = totalizer_liters
 
             last_totalizer_liters = totalizer_liters
             last_flow_rate = flow_rate_l_per_s
