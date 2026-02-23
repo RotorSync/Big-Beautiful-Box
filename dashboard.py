@@ -87,6 +87,10 @@ pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
+iol_device_valid = True  # Track if IOL device is responding with valid PD
+last_iol_status_check = 0  # Timestamp of last IOL status check
+IOL_STATUS_CHECK_INTERVAL = 3  # Seconds between IOL status checks
+iol_reconnect_attempts = 0  # Count reconnection attempts
 override_enabled_time = 0  # Timestamp when override mode was last enabled
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
@@ -2007,9 +2011,71 @@ def show_menu():
     # Apply initial highlight
     update_menu_highlight()
 
+def check_iol_device_status():
+    """Periodically check if the IOL device is actually connected via readStatus"""
+    global iol_device_valid, last_iol_status_check, iol_reconnect_attempts, connection_error, error_message
+
+    now = time.time()
+    if now - last_iol_status_check < IOL_STATUS_CHECK_INTERVAL:
+        return  # Not time to check yet
+
+    last_iol_status_check = now
+
+    try:
+        status = iolhat.readStatus(config.IOL_PORT)
+        if status.pd_in_valid == 1:
+            if not iol_device_valid:
+                print(f"Flow meter reconnected (pd_in_valid=1)", flush=True)
+                iol_reconnect_attempts = 0
+            iol_device_valid = True
+        else:
+            if iol_device_valid:
+                print(f"Flow meter lost (pd_in_valid=0)", flush=True)
+            iol_device_valid = False
+            connection_error = True
+            error_message = "Flow meter disconnected (pd_in_valid=0)"
+
+            # Try to reconnect
+            iol_reconnect_attempts += 1
+            if iol_reconnect_attempts <= 3:
+                print(f"Attempting IOL reconnect ({iol_reconnect_attempts}/3)...", flush=True)
+                try:
+                    iolhat.power(config.IOL_PORT, 0)
+                    time.sleep(0.5)
+                    iolhat.power(config.IOL_PORT, 1)
+                    iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+                    time.sleep(1.0)
+                    # Re-check
+                    status2 = iolhat.readStatus(config.IOL_PORT)
+                    if status2.pd_in_valid == 1:
+                        print("IOL reconnect successful!", flush=True)
+                        iol_device_valid = True
+                        connection_error = False
+                        error_message = ""
+                        iol_reconnect_attempts = 0
+                    else:
+                        print(f"IOL reconnect failed (pd_in_valid={status2.pd_in_valid})", flush=True)
+                except Exception as re:
+                    print(f"IOL reconnect error: {re}", flush=True)
+    except Exception as e:
+        # readStatus itself failed - IOL hat might be down
+        if iol_device_valid:
+            print(f"IOL status check failed: {e}", flush=True)
+        iol_device_valid = False
+        connection_error = True
+        error_message = f"IOL status check failed: {e}"
+
+
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
+
+    # Check IOL device status periodically
+    check_iol_device_status()
+
+    # If device is known to be disconnected, don't try to read (avoids stale data)
+    if not iol_device_valid:
+        return last_totalizer_liters * config.LITERS_TO_GALLONS
 
     try:
         # Read process data from IO-Link device
