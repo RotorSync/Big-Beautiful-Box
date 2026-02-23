@@ -2139,26 +2139,13 @@ def socket_command_listener():
                                 try:
                                     parts = line[7:].split("|")
                                     if len(parts) >= 4:
-                                        mopeka1_gallons_val = float(parts[0])
-                                        mopeka2_gallons_val = float(parts[1])
-                                        mopeka1_quality_val = int(parts[2])
-                                        mopeka2_quality_val = int(parts[3])
-                                        
-                                        # Update globals in main thread
-                                        def update_mopeka(m1g, m2g, m1q, m2q):
-                                            global mopeka1_gallons, mopeka2_gallons
-                                            global mopeka1_quality, mopeka2_quality
-                                            mopeka1_gallons = m1g
-                                            mopeka2_gallons = m2g
-                                            mopeka1_quality = m1q
-                                            mopeka2_quality = m2q
-                                            update_mopeka_display()
-                                        
-                                        root.after(0, lambda: update_mopeka(
-                                            mopeka1_gallons_val, mopeka2_gallons_val,
-                                            mopeka1_quality_val, mopeka2_quality_val))
+                                        _m1g = float(parts[0])
+                                        _m2g = float(parts[1])
+                                        _m1q = int(parts[2])
+                                        _m2q = int(parts[3])
+                                        root.after(0, _apply_mopeka, _m1g, _m2g, _m1q, _m2q)
                                 except Exception as me:
-                                    print(f"Mopeka display error: {me}")
+                                    print(f"Mopeka parse error: {me}", flush=True)
 
                             elif line == "HISTORY":
                                 try:
@@ -2637,6 +2624,17 @@ root.update()
 # draw_fullscreen_stripes()  # Disabled - using solid black background
 
 
+def _apply_mopeka(m1g, m2g, m1q, m2q):
+    """Apply mopeka values and update display (called from main thread via root.after)"""
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality
+    mopeka1_gallons = m1g
+    mopeka2_gallons = m2g
+    mopeka1_quality = m1q
+    mopeka2_quality = m2q
+    print(f"Mopeka applied: front={m1g:.0f} back={m2g:.0f} q={m1q}/{m2q}", flush=True)
+    update_mopeka_display()
+
+
 def update_mopeka_display():
     """Draw Mopeka tank levels in small text on the right side of screen"""
     canvas.delete("mopeka_display")
@@ -2645,7 +2643,7 @@ def update_mopeka_display():
     height = canvas.winfo_height()
     
     # Position: right side, vertically centered
-    x = width - 20  # 20px from right edge
+    x = width - 40  # 40px from right edge
     
     # Quality indicator: 0=no signal, 1=weak, 2=ok, 3=good
     def quality_color(q):
@@ -2654,18 +2652,18 @@ def update_mopeka_display():
         if q >= 1: return "#ff8800"   # orange
         return "#ff0000"              # red (no signal)
     
-    font = ("Helvetica", 18)
+    font = ("Helvetica", 54)
     
     # Front tank (mopeka1)
     color1 = quality_color(mopeka1_quality)
     label1 = f"Front: {mopeka1_gallons:.0f} gal"
-    canvas.create_text(x, int(height * 0.40), text=label1, font=font,
+    canvas.create_text(x, int(height * 0.35), text=label1, font=font,
                       fill=color1, anchor="e", tags="mopeka_display")
     
     # Back tank (mopeka2) 
     color2 = quality_color(mopeka2_quality)
     label2 = f"Back: {mopeka2_gallons:.0f} gal"
-    canvas.create_text(x, int(height * 0.46), text=label2, font=font,
+    canvas.create_text(x, int(height * 0.45), text=label2, font=font,
                       fill=color2, anchor="e", tags="mopeka_display")
 
 def draw_requested_number(text, color="red"):
