@@ -20,6 +20,8 @@ from bumble.host import Host
 from bumble.transport.hci_socket import open_hci_socket_transport
 from bumble.gatt import Service, Characteristic, CharacteristicValue
 from bumble.core import UUID, AdvertisingData
+# Mopeka gallon conversion
+from src.mopeka_converter import mm_to_gallons, init as mopeka_init
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = '00:01:95:9C:C7:F5'  # CSR/Sena for GATT - phones connect here
@@ -375,10 +377,16 @@ async def read_sensors(sensor_adapter):
                     decoded = decode_mopeka(data)
                     decoded['last_update'] = current_time
                     if MOPEKA1_MAC_SUFFIX in addr.upper():
+                        # Convert mm to gallons
+                        conversion = mm_to_gallons(decoded["level_mm"], MOPEKA1_MAC_SUFFIX)
+                        decoded.update(conversion)
                         sensor_data['mopeka1'] = decoded
                         print(f'Mopeka1: {decoded}', flush=True)
                         mopeka_found = True
                     elif MOPEKA2_MAC_SUFFIX in addr.upper():
+                        # Convert mm to gallons
+                        conversion = mm_to_gallons(decoded["level_mm"], MOPEKA2_MAC_SUFFIX)
+                        decoded.update(conversion)
                         sensor_data['mopeka2'] = decoded
                         print(f'Mopeka2: {decoded}', flush=True)
                         mopeka_found = True
@@ -422,6 +430,8 @@ async def read_sensors(sensor_adapter):
 
 async def main():
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
+    # Initialize Mopeka gallon converter
+    mopeka_init()
     
     # Find adapters by MAC address
     gatt_adapter = find_adapter_by_mac(GATT_ADAPTER_MAC)
