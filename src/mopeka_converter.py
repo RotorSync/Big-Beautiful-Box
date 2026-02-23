@@ -23,6 +23,10 @@ _calibration_table = []
 # Sensor offsets: dict of mopeka_mac_suffix -> height_offset_inches
 _sensor_offsets = {}
 
+# BLE MAC to sensor ID mapping (set by the caller for this specific Pi/trailer)
+# Maps the actual BLE MAC suffix seen by the scanner to the Mopeka app ID in the CSV
+_ble_mac_to_sensor_id = {}
+
 
 def load_calibration(calibration_csv_path):
     """Load the calibration lookup table from CSV.
@@ -64,7 +68,17 @@ def load_sensor_offsets(sensor_csv_path):
     _sensor_offsets = {}
     
     with open(sensor_csv_path, 'r') as f:
-        reader = csv.DictReader(f)
+        # Skip blank rows at top of file
+        lines = f.readlines()
+        # Find the header row (first row with 'Mopeka ID' in it)
+        header_idx = 0
+        for i, line in enumerate(lines):
+            if 'Mopeka ID' in line:
+                header_idx = i
+                break
+        
+        import io
+        reader = csv.DictReader(io.StringIO(''.join(lines[header_idx:])))
         for row in reader:
             try:
                 mac_suffix = row.get('Mopeka ID', '').strip()
@@ -128,7 +142,13 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
     # Apply height offset if available
     offset_in = 0.0
     if sensor_mac_suffix:
-        offset_in = _sensor_offsets.get(sensor_mac_suffix.upper(), 0.0)
+        mac = sensor_mac_suffix.upper()
+        # Try direct lookup first, then check BLE MAC mapping
+        if mac in _sensor_offsets:
+            offset_in = _sensor_offsets[mac]
+        elif mac in _ble_mac_to_sensor_id:
+            mapped_id = _ble_mac_to_sensor_id[mac]
+            offset_in = _sensor_offsets.get(mapped_id, 0.0)
     
     compensated_in = level_in + offset_in
     
@@ -149,18 +169,33 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
     }
 
 
-def init(data_dir=None):
+def set_ble_mac_mapping(mapping):
+    """Set BLE MAC suffix to Mopeka sensor ID mapping.
+    
+    Args:
+        mapping: dict of BLE_MAC_SUFFIX -> MOPEKA_APP_ID
+                 e.g. {'0F:37:A5': '3A:28:34', 'F7:D0:22': '96:BB:5D'}
+    """
+    global _ble_mac_to_sensor_id
+    _ble_mac_to_sensor_id = {k.upper(): v.upper() for k, v in mapping.items()}
+    print(f'Set {len(_ble_mac_to_sensor_id)} BLE MAC -> sensor ID mappings', flush=True)
+
+
+def init(data_dir=None, ble_mac_mapping=None):
     """Initialize the converter by loading calibration data.
     
     Args:
         data_dir: Directory containing the CSV files. 
                   Defaults to 'mopeka/' relative to the BBB root.
+        ble_mac_mapping: Optional dict mapping BLE MAC suffixes to Mopeka app IDs.
+                         If None, tries to load from mopeka_config.json in data_dir.
     """
     if data_dir is None:
         data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'mopeka')
     
     cal_path = os.path.join(data_dir, 'calibration-points-1070gal-tank.csv')
     sensor_path = os.path.join(data_dir, 'mopeka-sensor-details.csv')
+    config_path = os.path.join(data_dir, 'mopeka_config.json')
     
     if os.path.exists(cal_path):
         load_calibration(cal_path)
@@ -171,3 +206,17 @@ def init(data_dir=None):
         load_sensor_offsets(sensor_path)
     else:
         print(f'WARNING: Sensor details file not found: {sensor_path}', flush=True)
+    
+    # Load BLE MAC mapping from parameter or config file
+    if ble_mac_mapping:
+        set_ble_mac_mapping(ble_mac_mapping)
+    elif os.path.exists(config_path):
+        import json
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            if 'ble_mac_mapping' in config:
+                set_ble_mac_mapping(config['ble_mac_mapping'])
+            print(f'Loaded mopeka config: trailer {config.get("trailer", "?")}', flush=True)
+        except Exception as e:
+            print(f'WARNING: Failed to load mopeka config: {e}', flush=True)

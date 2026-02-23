@@ -1,0 +1,8 @@
+{
+    "trailer": "UNKNOWN",
+    "notes": "Set trailer number and map BLE MAC suffixes to Mopeka app IDs from the sensor details CSV",
+    "ble_mac_mapping": {
+        "0F:37:A5": "MOPEKA_APP_ID_FOR_FRONT_TANK",
+        "F7:D0:22": "MOPEKA_APP_ID_FOR_BACK_TANK"
+    }
+}

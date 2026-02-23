@@ -25,7 +25,7 @@ from src.mopeka_converter import mm_to_gallons, init as mopeka_init
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = '00:01:95:9C:C7:F5'  # CSR/Sena for GATT - phones connect here
-SENSOR_ADAPTER_MAC = '08:BE:AC:44:C5:58'  # Realtek for sensors
+SENSOR_ADAPTER_MAC = 'BC:FC:E7:2D:86:7B'  # Realtek for sensors
 
 # Socket connection to dashboard
 DASHBOARD_HOST = '127.0.0.1'
