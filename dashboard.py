@@ -2024,9 +2024,17 @@ def read_flow_meter():
             if raw_data == b'\x00' * len(raw_data):
                 connection_error = True
                 error_message = "Device not responding (all-zero data)"
+                try:
+                    iolhat.led(config.IOL_PORT, iolhat.LED_RED)
+                except:
+                    pass
                 last_raw_data = None
                 consecutive_identical_raw = 0
                 return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+            # If we were in error state and now getting valid non-stale data, log recovery
+            if connection_error and raw_data != last_raw_data:
+                print(f"Flow meter reconnected - valid data received", flush=True)
 
             # Check for stale data (byte-for-byte identical reads = meter disconnected)
             # A connected meter always has micro-fluctuations in the raw bytes
@@ -2038,6 +2046,10 @@ def read_flow_meter():
                     error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
                     if consecutive_identical_raw == STALE_RAW_THRESHOLD:
                         print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
+                        try:
+                            iolhat.led(config.IOL_PORT, iolhat.LED_RED)
+                        except:
+                            pass
                     return last_totalizer_liters * config.LITERS_TO_GALLONS
             else:
                 if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
@@ -2051,6 +2063,12 @@ def read_flow_meter():
 
             last_totalizer_liters = totalizer_liters
             last_flow_rate = flow_rate_l_per_s
+            # Clear error state - set LED green on reconnect
+            if connection_error:
+                try:
+                    iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+                except:
+                    pass
             connection_error = False
             error_message = ""
             last_successful_read_time = time.time()
