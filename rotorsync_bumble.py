@@ -5,6 +5,7 @@ With live sensor reading via BlueZ (separate adapter)
 Sends commands to dashboard via localhost socket
 Auto-recovery for sensor connections
 Exposes requested/actual gallons from dashboard
+
 """
 import asyncio
 import json
@@ -31,6 +32,7 @@ SENSOR_ADAPTER_MAC = 'BC:FC:E7:2D:86:7B'  # Realtek for sensors
 DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 9999
 
+# Need to make so we can edit this from the dashboard as well as upload a file with the a list of mac addresses and devices.
 BMS_MAC = 'A5:C2:37:2B:32:91'
 MOPEKA1_MAC_SUFFIX = '0F:37:A5'
 MOPEKA2_MAC_SUFFIX = 'F7:D0:22'
