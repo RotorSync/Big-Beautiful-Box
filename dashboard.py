@@ -90,6 +90,8 @@ heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
 last_raw_data = None  # Previous raw bytes for stale detection
 STALE_RAW_THRESHOLD = 25  # Identical raw reads before flagging (25 * 200ms = 5 seconds)
+last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
+iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
 override_enabled_time = 0  # Timestamp when override mode was last enabled
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
@@ -2010,6 +2012,69 @@ def show_menu():
     # Apply initial highlight
     update_menu_highlight()
 
+def iol_power_cycle():
+    """Power-cycle the IOL port in a background thread to trigger re-negotiation.
+
+    Called when the flow meter is detected as disconnected (all-zero or stale data).
+    The IOL master firmware does not auto-negotiate when a device is reconnected,
+    so the port must be powered off and back on to restart the IO-Link handshake.
+    """
+    global iol_power_cycle_in_progress, last_power_cycle_time
+
+    try:
+        print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle attempt", flush=True)
+
+        # Step 1: Power off
+        try:
+            iolhat.power(config.IOL_PORT, 0)
+            print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
+        except Exception as e:
+            print(f"IOL power-cycle: Failed to power off port {config.IOL_PORT}: {e}", flush=True)
+            return
+
+        # Step 2: Wait for port to fully power down
+        time.sleep(0.5)
+
+        # Step 3: Power on
+        try:
+            iolhat.power(config.IOL_PORT, 1)
+            print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
+        except Exception as e:
+            print(f"IOL power-cycle: Failed to power on port {config.IOL_PORT}: {e}", flush=True)
+            return
+
+        # Step 4: Wait for IO-Link handshake to complete
+        time.sleep(1.5)
+
+        # Step 5: Set LED back to green (optimistic - will go red again if still disconnected)
+        try:
+            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+        except:
+            pass
+
+        print(f"IOL power-cycle: Complete. Waiting for IO-Link handshake.", flush=True)
+
+    except Exception as e:
+        print(f"IOL power-cycle: Unexpected error: {e}", flush=True)
+    finally:
+        last_power_cycle_time = time.time()
+        iol_power_cycle_in_progress = False
+
+
+def _try_iol_power_cycle():
+    """Check rate-limiting and spawn power-cycle thread if appropriate."""
+    global iol_power_cycle_in_progress
+
+    if iol_power_cycle_in_progress:
+        return
+
+    if (time.time() - last_power_cycle_time) < config.IOL_RECONNECT_INTERVAL:
+        return
+
+    iol_power_cycle_in_progress = True
+    cycle_thread = threading.Thread(target=iol_power_cycle, daemon=True)
+    cycle_thread.start()
+
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
@@ -2030,6 +2095,7 @@ def read_flow_meter():
                     pass
                 last_raw_data = None
                 consecutive_identical_raw = 0
+                _try_iol_power_cycle()
                 return last_totalizer_liters * config.LITERS_TO_GALLONS
 
             # If we were in error state and now getting valid non-stale data, log recovery
@@ -2050,6 +2116,7 @@ def read_flow_meter():
                             iolhat.led(config.IOL_PORT, iolhat.LED_RED)
                         except:
                             pass
+                    _try_iol_power_cycle()
                     return last_totalizer_liters * config.LITERS_TO_GALLONS
             else:
                 if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
@@ -2082,6 +2149,7 @@ def read_flow_meter():
     except Exception as e:
         connection_error = True
         error_message = str(e)
+        _try_iol_power_cycle()
         return last_totalizer_liters * config.LITERS_TO_GALLONS
 
 

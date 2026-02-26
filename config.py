@@ -49,6 +49,7 @@ DATA_LENGTH = 15              # Expected data length from flow meter
 # Flow meter monitoring thresholds
 FLOW_STOPPED_THRESHOLD = 0.001    # L/s - flow is considered stopped below this
 FLOW_METER_TIMEOUT = 5            # seconds - flow meter considered disconnected after this
+IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port power-cycle attempts
 
 
 # =============================================================================
