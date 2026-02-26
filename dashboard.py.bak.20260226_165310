@@ -2211,32 +2211,6 @@ def socket_command_listener():
                                     client.send(b"HIST:\n")
                                 continue
 
-                            elif line in ['+1', '-1', '+10', '-10']:
-                                try:
-                                    adjustment = int(line)
-                                    requested_gallons += adjustment
-                                    if requested_gallons < 0:
-                                        requested_gallons = 0
-                                    colors_are_green = False
-                                    if current_mode == 'fill':
-                                        fill_requested_gallons = requested_gallons
-                                    else:
-                                        mix_requested_gallons = requested_gallons
-                                    save_mode_presets()
-                                    msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
-                                    print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                except ValueError:
-                                    pass
-
-                            elif line == 'PS':
-                                msg = "Socket: Pump Stop command received"
-                                print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                root.after(0, pump_stop_relay)
-
                             client.send(b"OK\n")
                 except sock_module.timeout:
                     pass

@@ -27,16 +27,19 @@ _sensor_offsets = {}
 # Maps the actual BLE MAC suffix seen by the scanner to the Mopeka app ID in the CSV
 _ble_mac_to_sensor_id = {}
 
+# Data directory path (set by init(), used by reload())
+_data_dir = None
+
 
 def load_calibration(calibration_csv_path):
     """Load the calibration lookup table from CSV.
-    
+
     CSV format: Tank Level (in), Gallons, Tank Size (gal)
     Where 'Tank Level (in)' is distance from TOP of tank.
     """
     global _calibration_table, MAX_TANK_HEIGHT_IN
     _calibration_table = []
-    
+
     with open(calibration_csv_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -46,27 +49,27 @@ def load_calibration(calibration_csv_path):
                 _calibration_table.append((inches_from_top, gallons))
             except (ValueError, KeyError):
                 continue
-    
+
     # Sort by inches_from_top descending (empty tank first)
     _calibration_table.sort(key=lambda x: x[0], reverse=True)
-    
+
     if _calibration_table:
         MAX_TANK_HEIGHT_IN = _calibration_table[0][0]
-    
+
     print(f'Loaded {len(_calibration_table)} calibration points, max height: {MAX_TANK_HEIGHT_IN:.2f} in', flush=True)
 
 
 def load_sensor_offsets(sensor_csv_path):
     """Load per-sensor height offsets from CSV.
-    
-    CSV has columns: Man, Trailer, Tank, Center Sump?, Height Offset, 
+
+    CSV has columns: Man, Trailer, Tank, Center Sump?, Height Offset,
                      Mopeka Name in app, Mopeka ID, MQTT Topic for app, Added to app
-    
+
     We key by the last 3 octets of the Mopeka BLE MAC (the ID column).
     """
     global _sensor_offsets
     _sensor_offsets = {}
-    
+
     with open(sensor_csv_path, 'r') as f:
         # Skip blank rows at top of file
         lines = f.readlines()
@@ -76,7 +79,7 @@ def load_sensor_offsets(sensor_csv_path):
             if 'Mopeka ID' in line:
                 header_idx = i
                 break
-        
+
         import io
         reader = csv.DictReader(io.StringIO(''.join(lines[header_idx:])))
         for row in reader:
@@ -87,48 +90,48 @@ def load_sensor_offsets(sensor_csv_path):
                     _sensor_offsets[mac_suffix.upper()] = float(offset_str)
             except (ValueError, KeyError):
                 continue
-    
+
     print(f'Loaded {len(_sensor_offsets)} sensor offsets', flush=True)
 
 
 def _interpolate_gallons(inches_from_top):
     """Interpolate gallons from the calibration table given inches from top.
-    
+
     Returns gallons (clamped to 0 - max tank size).
     """
     if not _calibration_table:
         return 0.0
-    
+
     # Off the top end (above empty mark) = 0 gallons
     if inches_from_top >= _calibration_table[0][0]:
         return 0.0
-    
+
     # Off the bottom end (below full mark) = max gallons
     if inches_from_top <= _calibration_table[-1][0]:
         return _calibration_table[-1][1]
-    
+
     # Find the two bracketing points and interpolate
     for i in range(len(_calibration_table) - 1):
         top_in, top_gal = _calibration_table[i]
         bot_in, bot_gal = _calibration_table[i + 1]
-        
+
         if bot_in <= inches_from_top <= top_in:
             # Linear interpolation
             if top_in == bot_in:
                 return top_gal
             ratio = (top_in - inches_from_top) / (top_in - bot_in)
             return top_gal + ratio * (bot_gal - top_gal)
-    
+
     return 0.0
 
 
 def mm_to_gallons(level_mm, sensor_mac_suffix=None):
     """Convert a Mopeka reading (mm from bottom) to gallons.
-    
+
     Args:
         level_mm: Raw level reading in mm (height of liquid from bottom)
         sensor_mac_suffix: Last 3 octets of BLE MAC for offset lookup (e.g. '0F:37:A5')
-    
+
     Returns:
         dict with:
             - gallons: float, estimated gallons in tank
@@ -138,7 +141,7 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
     """
     # Convert mm to inches
     level_in = level_mm / 25.4
-    
+
     # Apply height offset if available
     offset_in = 0.0
     if sensor_mac_suffix:
@@ -149,18 +152,18 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
         elif mac in _ble_mac_to_sensor_id:
             mapped_id = _ble_mac_to_sensor_id[mac]
             offset_in = _sensor_offsets.get(mapped_id, 0.0)
-    
+
     compensated_in = level_in + offset_in
-    
+
     # Convert from "inches from bottom" to "inches from top"
     inches_from_top = MAX_TANK_HEIGHT_IN - compensated_in
-    
+
     # Clamp - can't be negative (sensor reading above tank)
     inches_from_top = max(0.0, inches_from_top)
-    
+
     # Lookup gallons
     gallons = _interpolate_gallons(inches_from_top)
-    
+
     return {
         'gallons': round(gallons, 1),
         'level_in': round(compensated_in, 2),
@@ -171,7 +174,7 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
 
 def set_ble_mac_mapping(mapping):
     """Set BLE MAC suffix to Mopeka sensor ID mapping.
-    
+
     Args:
         mapping: dict of BLE_MAC_SUFFIX -> MOPEKA_APP_ID
                  e.g. {'0F:37:A5': '3A:28:34', 'F7:D0:22': '96:BB:5D'}
@@ -183,30 +186,34 @@ def set_ble_mac_mapping(mapping):
 
 def init(data_dir=None, ble_mac_mapping=None):
     """Initialize the converter by loading calibration data.
-    
+
     Args:
-        data_dir: Directory containing the CSV files. 
+        data_dir: Directory containing the CSV files.
                   Defaults to 'mopeka/' relative to the BBB root.
         ble_mac_mapping: Optional dict mapping BLE MAC suffixes to Mopeka app IDs.
                          If None, tries to load from mopeka_config.json in data_dir.
     """
+    global _data_dir
+
     if data_dir is None:
         data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'mopeka')
-    
+
+    _data_dir = data_dir
+
     cal_path = os.path.join(data_dir, 'calibration-points-1070gal-tank.csv')
     sensor_path = os.path.join(data_dir, 'mopeka-sensor-details.csv')
     config_path = os.path.join(data_dir, 'mopeka_config.json')
-    
+
     if os.path.exists(cal_path):
         load_calibration(cal_path)
     else:
         print(f'WARNING: Calibration file not found: {cal_path}', flush=True)
-    
+
     if os.path.exists(sensor_path):
         load_sensor_offsets(sensor_path)
     else:
         print(f'WARNING: Sensor details file not found: {sensor_path}', flush=True)
-    
+
     # Load BLE MAC mapping from parameter or config file
     if ble_mac_mapping:
         set_ble_mac_mapping(ble_mac_mapping)
@@ -220,3 +227,18 @@ def init(data_dir=None, ble_mac_mapping=None):
             print(f'Loaded mopeka config: trailer {config.get("trailer", "?")}', flush=True)
         except Exception as e:
             print(f'WARNING: Failed to load mopeka config: {e}', flush=True)
+
+
+def reload():
+    """Reload calibration data and sensor offsets from CSV files.
+    Called by rotorsync_bumble.py after any CSV mutation or trailer change."""
+    if _data_dir is None:
+        init()
+    else:
+        cal_path = os.path.join(_data_dir, 'calibration-points-1070gal-tank.csv')
+        sensor_path = os.path.join(_data_dir, 'mopeka-sensor-details.csv')
+        if os.path.exists(cal_path):
+            load_calibration(cal_path)
+        if os.path.exists(sensor_path):
+            load_sensor_offsets(sensor_path)
+    print('mopeka_converter: reloaded', flush=True)
