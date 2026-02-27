@@ -184,6 +184,17 @@ The install script configures:
 3. Water target automatically set from formula
 4. Ground crew follows mix sequence
 
+
+## Known Issues
+
+### Flow Meter Disconnect Recovery ([#2](https://github.com/RotorSync/Big-Beautiful-Box/issues/2))
+
+The Picomag flow meter occasionally loses its IO-Link connection. The dashboard detects this via stale data (identical raw bytes for 5+ seconds) or all-zero responses, and displays skull icons + "FLOW METER DISCONNECTED" warning.
+
+**Current status:** The IOL master daemon's retry loop (COMLOST → RETRY) runs continuously after a disconnect but fails to re-establish communication. Power-cycling the port via `iolhat.power()` does not help — the daemon's internal state is stuck. A full service restart (`sudo systemctl restart iol_dashboard`) is currently the only reliable fix.
+
+**Diagnostics in place:** On disconnect, the dashboard reads the MAX14819 ChanStat error register via `iolhat.readStatus2()` (CMD_STATUS2, ID 8) and logs `IOL DISCONNECT [reason]: pdInValid=X, txRate=0xXX, error=0xXX, power=X` to `~/iol_dashboard.log`. The `error` byte (lower 3 bits of ChanStat) should identify the hardware-level failure mode. Waiting to capture this during the next disconnect event.
+
 ## Related Repositories
 
 - [Switch-Box-For-BBB](https://github.com/austins05/Switch-Box-For-BBB) — Pico switch box firmware

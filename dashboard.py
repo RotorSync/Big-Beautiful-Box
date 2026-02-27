@@ -2018,48 +2018,66 @@ def iol_power_cycle():
     Called when the flow meter is detected as disconnected (all-zero or stale data).
     The IOL master firmware does not auto-negotiate when a device is reconnected,
     so the port must be powered off and back on to restart the IO-Link handshake.
+    Uses readStatus2() to check hardware error state before and after the cycle.
     """
     global iol_power_cycle_in_progress, last_power_cycle_time
 
     try:
-        print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle attempt", flush=True)
+        # Check port status before power cycle
+        try:
+            pre_status = iolhat.readStatus2(config.IOL_PORT)
+            print(f"IOL power-cycle: Pre-cycle status - pdInValid={pre_status.pd_in_valid}, "
+                  f"txRate=0x{pre_status.transmission_rate:02X}, "
+                  f"error=0x{pre_status.error:02X}, power={pre_status.power}", flush=True)
+        except Exception as e:
+            print(f"IOL power-cycle: Pre-cycle status check failed: {e}", flush=True)
+
+        print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle", flush=True)
 
         # Step 1: Power off
         try:
             iolhat.power(config.IOL_PORT, 0)
             print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
         except Exception as e:
-            print(f"IOL power-cycle: Failed to power off port {config.IOL_PORT}: {e}", flush=True)
+            print(f"IOL power-cycle: Failed to power off: {e}", flush=True)
             return
 
-        # Step 2: Wait for port to fully power down
-        time.sleep(0.5)
+        time.sleep(1.0)
 
-        # Step 3: Power on
+        # Step 2: Power on
         try:
             iolhat.power(config.IOL_PORT, 1)
             print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
         except Exception as e:
-            print(f"IOL power-cycle: Failed to power on port {config.IOL_PORT}: {e}", flush=True)
+            print(f"IOL power-cycle: Failed to power on: {e}", flush=True)
             return
 
-        # Step 4: Wait for IO-Link handshake to complete
-        time.sleep(1.5)
+        # Step 3: Wait for IO-Link handshake (up to 5 seconds, polling status)
+        for attempt in range(5):
+            time.sleep(1.0)
+            try:
+                post_status = iolhat.readStatus2(config.IOL_PORT)
+                print(f"IOL power-cycle: Post-cycle check {attempt+1}/5 - "
+                      f"pdInValid={post_status.pd_in_valid}, "
+                      f"txRate=0x{post_status.transmission_rate:02X}, "
+                      f"error=0x{post_status.error:02X}", flush=True)
+                if post_status.pd_in_valid == 1 and post_status.transmission_rate != 0:
+                    print(f"IOL power-cycle: Device reconnected successfully", flush=True)
+                    try:
+                        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+                    except:
+                        pass
+                    return
+            except Exception as e:
+                print(f"IOL power-cycle: Post-cycle status check failed: {e}", flush=True)
 
-        # Step 5: Set LED back to green (optimistic - will go red again if still disconnected)
-        try:
-            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
-        except:
-            pass
-
-        print(f"IOL power-cycle: Complete. Waiting for IO-Link handshake.", flush=True)
+        print(f"IOL power-cycle: Device did not reconnect after power cycle", flush=True)
 
     except Exception as e:
         print(f"IOL power-cycle: Unexpected error: {e}", flush=True)
     finally:
         last_power_cycle_time = time.time()
         iol_power_cycle_in_progress = False
-
 
 def _try_iol_power_cycle():
     """Check rate-limiting and spawn power-cycle thread if appropriate."""
@@ -2075,6 +2093,18 @@ def _try_iol_power_cycle():
     cycle_thread = threading.Thread(target=iol_power_cycle, daemon=True)
     cycle_thread.start()
 
+
+def _log_iol_disconnect_status(reason):
+    """Read STATUS2 and log the hardware error byte when a disconnect is first detected."""
+    try:
+        st = iolhat.readStatus2(config.IOL_PORT)
+        print(f"IOL DISCONNECT [{reason}]: pdInValid={st.pd_in_valid}, "
+              f"txRate=0x{st.transmission_rate:02X}, "
+              f"cycleTime=0x{st.master_cycle_time:02X}, "
+              f"error=0x{st.error:02X}, power={st.power}", flush=True)
+    except Exception as e:
+        print(f"IOL DISCONNECT [{reason}]: STATUS2 read failed: {e}", flush=True)
+
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
@@ -2085,8 +2115,9 @@ def read_flow_meter():
         raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
 
         if len(raw_data) >= 15:
-            # Check if data is all zeros (indicates IO-Link timeout/no response)
             if raw_data == b'\x00' * len(raw_data):
+                if not connection_error:
+                    _log_iol_disconnect_status("all-zero data")
                 connection_error = True
                 error_message = "Device not responding (all-zero data)"
                 try:
@@ -2112,6 +2143,7 @@ def read_flow_meter():
                     error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
                     if consecutive_identical_raw == STALE_RAW_THRESHOLD:
                         print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
+                        _log_iol_disconnect_status("stale data")
                         try:
                             iolhat.led(config.IOL_PORT, iolhat.LED_RED)
                         except:

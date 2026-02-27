@@ -334,7 +334,7 @@ def write (port, index, subindex, length, writeData):
 # Class for the IOL status
 
 class IolStatus:
-	def __init__(self, pd_in_valid=0, pd_out_valid=0, transmission_rate=0, master_cycle_time=0, pd_in_length=0, pd_out_length=0, vendor_id=0, device_id=0, power=0):
+	def __init__(self, pd_in_valid=0, pd_out_valid=0, transmission_rate=0, master_cycle_time=0, pd_in_length=0, pd_out_length=0, vendor_id=0, device_id=0, power=0, error=0):
 		"""
 		Initializes the IolStatus object with default values.
 
@@ -358,6 +358,7 @@ class IolStatus:
 		self.vendor_id = vendor_id
 		self.device_id = device_id
 		self.power = power
+		self.error = error
 
 	@classmethod
 	def from_buffer(cls, buffer):
@@ -382,8 +383,9 @@ class IolStatus:
 		vendor_id = int.from_bytes(buffer[6:8], byteorder='little')
 		device_id = int.from_bytes(buffer[8:12], byteorder='little')
 		power = buffer[12]
+		error = buffer[13] if len(buffer) >= 14 else 0
 
-		return cls(pd_in_valid, pd_out_valid, transmission_rate, master_cycle_time, pd_in_length, pd_out_length, vendor_id, device_id, power)
+		return cls(pd_in_valid, pd_out_valid, transmission_rate, master_cycle_time, pd_in_length, pd_out_length, vendor_id, device_id, power, error)
 
 	def print_status(self):
 		"""
@@ -398,6 +400,7 @@ class IolStatus:
 		print(f"vendor_id: {self.vendor_id}")
 		print(f"device_id: {self.device_id}")
 		print(f"power: {self.power}")
+		print(f"error: {self.error}")
 
 	def __repr__(self):
 		"""
@@ -406,7 +409,7 @@ class IolStatus:
 		return (f"IolStatus(pd_in_valid={self.pd_in_valid}, pd_out_valid={self.pd_out_valid}, "
 				f"transmission_rate={self.transmission_rate}, master_cycle_time={self.master_cycle_time}, "
 				f"pd_in_length={self.pd_in_length}, pd_out_length={self.pd_out_length}, "
-				f"vendor_id={self.vendor_id}, device_id={self.device_id}, power={self.power})")
+				f"vendor_id={self.vendor_id}, device_id={self.device_id}, power={self.power}, error={self.error})")
 
 
 def readStatus(port):
@@ -466,6 +469,61 @@ def readStatus(port):
 	## Give some time to prevent overload
 	time.sleep(4/1000)
 
+
+
+def readStatus2(port):
+	"""Read port status including error byte (CMD_STATUS2 = 8)"""
+	print ("*** CMD STATUS2, port=",port)
+
+	if (port not in [0,1,2,3]):
+		raise ValueError("STATUS2: Port out of range")
+
+	if (port < 2):
+		tcp_port = TCP_PORT1
+	else:
+		tcp_port = TCP_PORT2
+		port=port-2
+
+	#CMD STATUS2 = 8
+	message = struct.pack("!BB",8, port);
+	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+	try:
+		s.connect((TCP_IP, tcp_port))
+
+		s.send(message)
+		data = s.recv(BUFFER_SIZE)
+
+		data_len=len(data)
+		if (verbose):
+			print ("received data:", data, ", len=", data_len)
+
+		#ERROR (TCP message)
+		if (data_len == 2):
+			s.close()
+			raw_data = struct.unpack("!BB", data)
+			print (f"STATUS2: TCP message error ", getErrorMessage (int (raw_data[1])))
+			raise Exception("STATUS2: TCP message error ", getErrorMessage (int (raw_data[1])))
+
+		#ERROR (length error)
+		elif (data_len != 16):
+			s.close()
+			print (f"STATUS2: TCP command returned wrong length, expected 16, got ", data_len)
+			raise Exception("STATUS2: TCP command returned wrong length")
+
+		else:
+			return_data = data[2:]
+			iol_status = IolStatus.from_buffer(return_data)
+			return iol_status
+
+	except Exception as e:
+		s.close()
+		print (f"STATUS2: exception:", e)
+		raise Exception({e})
+
+	s.close()
+	## Give some time to prevent overload
+	time.sleep(4/1000)
 
 def getErrorMessage(error_code):
 	"""
