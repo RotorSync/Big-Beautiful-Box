@@ -1368,7 +1368,7 @@ def run_system_update():
             status_text.insert(tk.END, "=== Step 1: Checking for updates ===\n")
             status_text.update()
 
-            result = subprocess.run(['git', '-C', '/home/pi/iol-dashboard', 'fetch', 'origin'],
+            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'fetch', 'origin'],
                                   capture_output=True, text=True, timeout=60)
             if result.stderr:
                 status_text.insert(tk.END, result.stderr + "\n")
@@ -1380,7 +1380,7 @@ def run_system_update():
                 return
 
             # Get the version we're updating to
-            result = subprocess.run(['git', '-C', '/home/pi/iol-dashboard', 'log', 'origin/master', '-1', '--format=%s'],
+            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/main', '-1', '--format=%s'],
                                   capture_output=True, text=True, timeout=10)
             new_version_msg = result.stdout.strip()
             status_text.insert(tk.END, f"\nNew Version Available:\n{new_version_msg}\n\n")
@@ -1390,7 +1390,7 @@ def run_system_update():
             status_text.insert(tk.END, "=== Step 2: Installing update ===\n")
             status_text.update()
 
-            result = subprocess.run(['git', '-C', '/home/pi/iol-dashboard', 'reset', '--hard', 'origin/master'],
+            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/main'],
                                   capture_output=True, text=True, timeout=30)
             status_text.insert(tk.END, "Updated repository\n")
             status_text.update()
@@ -1400,33 +1400,15 @@ def run_system_update():
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 return
 
-            # Step 3: Copy updated files to active location
-            status_text.insert(tk.END, "\n=== Step 3: Installing files ===\n")
-            status_text.update()
-
-            result = subprocess.run(['cp', '/home/pi/iol-dashboard/dashboard.py', '/home/pi/dashboard.py'],
-                                  capture_output=True, text=True, timeout=10)
-            status_text.insert(tk.END, "Copied dashboard.py\n")
-
-            result = subprocess.run(['cp', '/home/pi/iol-dashboard/config.py', '/home/pi/config.py'],
-                                  capture_output=True, text=True, timeout=10)
-            status_text.insert(tk.END, "Copied config.py\n")
-
-            result = subprocess.run(['cp', '-r', '/home/pi/iol-dashboard/RPi', '/home/pi/RPi'],
-                                  capture_output=True, text=True, timeout=10)
-            status_text.insert(tk.END, "Copied RPi module\n\n")
-            status_text.update()
-
-            status_text.insert(tk.END, "=== UPDATE COMPLETE ===\n\n")
-            status_text.insert(tk.END, "Restarting dashboard to apply changes...\n\n")
+            status_text.insert(tk.END, "\n=== UPDATE COMPLETE ===\n\n")
+            status_text.insert(tk.END, "Restarting service to apply changes...\n\n")
             status_text.update()
 
             # Wait 2 seconds so user can see the message
             time.sleep(2)
 
-            # Restart the dashboard by executing the new version
-            import os
-            os.execv('/usr/bin/python3', ['/usr/bin/python3', '/home/pi/dashboard.py'])
+            # Restart via systemd so both IOL master and dashboard restart cleanly
+            subprocess.run(['sudo', 'systemctl', 'restart', 'iol_dashboard'], timeout=30)
 
         except subprocess.TimeoutExpired:
             status_text.insert(tk.END, "\n\nERROR: Command timed out\n")
