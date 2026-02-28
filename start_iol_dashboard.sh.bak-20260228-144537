@@ -40,8 +40,7 @@ if [ -d "$HOME/iol-hat/src-master-application" ]; then
     cd "$HOME/iol-hat/src-master-application"
 
     if [ -f "./bin/debug/iol-master-appl" ]; then
-        # Pin IO-Link master to core 3 (Ubuntu-safe, no RT privileges required)
-        taskset -c 3 ./bin/debug/iol-master-appl -m0 0 -m1 0 -i 34 >> "$LOG_FILE" 2>&1 &
+        ./bin/debug/iol-master-appl -m0 0 -m1 0 -i 34 >> "$LOG_FILE" 2>&1 &
         IOL_MASTER_PID=$!
         echo "$(date): IOL Master PID: $IOL_MASTER_PID" >> "$LOG_FILE"
 

@@ -37,7 +37,6 @@ DASHBOARD_PORT = 9999
 BMS_MAC = 'A5:C2:37:2B:32:91'
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
 MOPEKA2_MAC_SUFFIX = ''
-
 # Timing configuration
 SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
