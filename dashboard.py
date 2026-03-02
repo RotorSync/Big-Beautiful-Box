@@ -9,6 +9,8 @@ import serial
 import threading
 import subprocess
 import os
+import json
+import shlex
 from PIL import Image, ImageTk
 
 # Version
@@ -2167,13 +2169,104 @@ def read_flow_meter():
         return last_totalizer_liters * config.LITERS_TO_GALLONS
 
 
+
+def _wifi_status_snapshot():
+    """Return current WiFi status (excluding secrets)."""
+    try:
+        active_ssid = ''
+        ip_addr = ''
+
+        r = subprocess.run(
+            ['nmcli', '-t', '-f', 'ACTIVE,SSID,DEVICE', 'dev', 'wifi'],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split(':')
+                if len(parts) >= 3 and parts[0] == 'yes':
+                    active_ssid = parts[1]
+                    break
+
+        r2 = subprocess.run(
+            ['nmcli', '-t', '-f', 'IP4.ADDRESS', 'dev', 'show', 'wlan0'],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        if r2.returncode == 0:
+            for line in r2.stdout.splitlines():
+                if line.startswith('IP4.ADDRESS'):
+                    ip_addr = line.split(':', 1)[1].split('/')[0].strip()
+                    break
+
+        return {
+            'ok': bool(active_ssid),
+            'connected': bool(active_ssid),
+            'ssid': active_ssid,
+            'ip': ip_addr,
+        }
+    except Exception as e:
+        return {'ok': False, 'connected': False, 'error': str(e)}
+
+
+def _wifi_connect(ssid, password, hidden=False):
+    """Connect to WiFi using nmcli without logging secrets."""
+    ssid = str(ssid or '').strip()
+    password = str(password or '')
+
+    if not ssid:
+        return {'ok': False, 'code': 'INVALID_SSID', 'message': 'Missing ssid'}
+    if len(ssid) > 64:
+        return {'ok': False, 'code': 'INVALID_SSID', 'message': 'SSID too long'}
+    if len(password) > 128:
+        return {'ok': False, 'code': 'INVALID_PASSWORD', 'message': 'Password too long'}
+
+    try:
+        # Remove stale connection profile for this SSID to ensure fresh credentials.
+        subprocess.run(
+            ['nmcli', 'connection', 'delete', ssid],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+
+        cmd = ['nmcli', '--wait', '20', 'dev', 'wifi', 'connect', ssid]
+        if password:
+            cmd += ['password', password]
+        if hidden:
+            cmd += ['hidden', 'yes']
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        out = (r.stdout or '') + '\n' + (r.stderr or '')
+
+        if r.returncode != 0:
+            low = out.lower()
+            if 'secrets were required' in low or 'wrong password' in low or '802-11-wireless-security.key-mgmt' in low:
+                return {'ok': False, 'code': 'AUTH_FAILED', 'message': 'Authentication failed'}
+            if 'no network with ssid' in low or 'not found' in low:
+                return {'ok': False, 'code': 'NO_AP_FOUND', 'message': 'SSID not found'}
+            if 'timeout' in low:
+                return {'ok': False, 'code': 'TIMEOUT', 'message': 'Connection timeout'}
+            return {'ok': False, 'code': 'NMCLI_ERROR', 'message': out.strip()[:160]}
+
+        status = _wifi_status_snapshot()
+        status.update({'ok': True, 'code': 'OK'})
+        return status
+
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'code': 'TIMEOUT', 'message': 'Connection timeout'}
+    except Exception as e:
+        return {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
+
+
 def socket_command_listener():
     """Listen for commands from rotorsync BLE server via localhost socket"""
     global requested_gallons, override_mode, colors_are_green
     global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
 
     import socket as sock_module
-    import json
 
     DASHBOARD_PORT = 9999
     debug_log = config.SERIAL_DEBUG_LOG
@@ -2201,8 +2294,19 @@ def socket_command_listener():
                             if not line:
                                 continue
 
+                            safe_line = line
+                            if line.startswith('WIFI_SET:'):
+                                try:
+                                    payload = line[9:]
+                                    req = json.loads(payload)
+                                    if isinstance(req, dict) and 'password' in req:
+                                        req['password'] = '***'
+                                    safe_line = f"WIFI_SET:{json.dumps(req, separators=(',', ':'))}"
+                                except Exception:
+                                    safe_line = 'WIFI_SET:{...}'
+
                             with open(debug_log, "a") as f:
-                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{line}'\n")
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{safe_line}'\n")
 
                             if line == "STATUS":
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -2218,6 +2322,40 @@ def socket_command_listener():
 
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
+
+                            elif line.startswith("WIFI_SET:"):
+                                try:
+                                    payload = line[9:]
+                                    req = json.loads(payload)
+                                    ssid = req.get('ssid', '')
+                                    password = req.get('password', '')
+                                    hidden = bool(req.get('hidden', False))
+
+                                    # Log without secrets
+                                    msg = f"Socket: WIFI_SET requested for SSID '{ssid}' (hidden={hidden})"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+
+                                    result = _wifi_connect(ssid, password, hidden)
+                                    if result.get('ok'):
+                                        client.send(f"WIFI_OK:{json.dumps(result, separators=(',', ':'))}\n".encode())
+                                    else:
+                                        err_payload = {
+                                            'code': result.get('code', 'NMCLI_ERROR'),
+                                            'message': result.get('message', ''),
+                                        }
+                                        client.send(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
+                                    continue
+                                except Exception as we:
+                                    err_payload = {'code': 'NMCLI_ERROR', 'message': str(we)}
+                                    client.send(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
+                                    continue
+
+                            elif line == "WIFI_STATUS":
+                                status = _wifi_status_snapshot()
+                                client.send(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
+                                continue
 
                             elif line.startswith("BATCHMIX_ERROR:"):
                                 # Handle BatchMix validation error

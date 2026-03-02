@@ -94,6 +94,20 @@ config_response_pages = []  # Pre-computed pages for paginated responses
 config_cmd_chunks = {}
 config_cmd_chunk_timeout = 30
 
+def _redact_dashboard_command(cmd):
+    """Redact sensitive fields (like WiFi password) from command logs."""
+    try:
+        if cmd.startswith('WIFI_SET:'):
+            payload = cmd.split(':', 1)[1]
+            data = json.loads(payload)
+            if isinstance(data, dict) and 'password' in data:
+                data['password'] = '***'
+            return f"WIFI_SET:{json.dumps(data, separators=(',', ':'))}"
+    except Exception:
+        pass
+    return cmd
+
+
 def send_dashboard_command(cmd):
     """Send command to dashboard via socket"""
     try:
@@ -101,8 +115,8 @@ def send_dashboard_command(cmd):
             s.settimeout(2.0)
             s.connect((DASHBOARD_HOST, DASHBOARD_PORT))
             s.send(f'{cmd}\n'.encode())
-            response = s.recv(1024).decode().strip()
-            print(f'Dashboard command: {cmd} -> {response}', flush=True)
+            response = s.recv(4096).decode().strip()
+            print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
             return response
     except Exception as e:
         print(f'Dashboard command error: {e}', flush=True)
@@ -544,6 +558,85 @@ def paginate_response(items, page_size_bytes=450):
 # Command Processor
 # =============================================================================
 
+
+
+def _wifi_code_from_response(resp):
+    if not resp:
+        return 'NO_RESPONSE'
+    if resp.startswith('WIFI_OK:'):
+        return 'OK'
+    if resp.startswith('WIFI_ERR:'):
+        try:
+            payload = resp.split(':', 1)[1]
+            data = json.loads(payload)
+            return data.get('code', 'UNKNOWN')
+        except Exception:
+            return 'UNKNOWN'
+    return 'BAD_RESPONSE'
+
+
+def _wifi_set_from_ble(cmd):
+    """Handle WIFI_SET operation from config command channel and forward to dashboard."""
+    global config_response, config_response_pages
+
+    ssid = str(cmd.get('ssid', '')).strip()
+    password = str(cmd.get('password', ''))
+    hidden = bool(cmd.get('hidden', False))
+
+    if not ssid:
+        config_response = json.dumps({'ok': False, 'error': 'Missing ssid'})
+        config_response_pages = []
+        return
+
+    if len(ssid) > 64:
+        config_response = json.dumps({'ok': False, 'error': 'SSID too long'})
+        config_response_pages = []
+        return
+
+    if len(password) > 128:
+        config_response = json.dumps({'ok': False, 'error': 'Password too long'})
+        config_response_pages = []
+        return
+
+    payload = {
+        'ssid': ssid,
+        'password': password,
+        'hidden': hidden,
+    }
+
+    resp = send_dashboard_command(f"WIFI_SET:{json.dumps(payload, separators=(',', ':'))}")
+    code = _wifi_code_from_response(resp)
+
+    if resp and resp.startswith('WIFI_OK:'):
+        try:
+            data = json.loads(resp.split(':', 1)[1])
+        except Exception:
+            data = {'ssid': ssid}
+        data['ok'] = True
+        config_response = json.dumps(data, separators=(',', ':'))
+    else:
+        config_response = json.dumps({'ok': False, 'error': code}, separators=(',', ':'))
+
+    config_response_pages = []
+
+
+def _wifi_status_from_ble():
+    """Query current WiFi status from dashboard."""
+    global config_response, config_response_pages
+
+    resp = send_dashboard_command('WIFI_STATUS')
+    if resp and resp.startswith('WIFI_STATUS:'):
+        payload = resp.split(':', 1)[1]
+        try:
+            data = json.loads(payload)
+        except Exception:
+            data = {'ok': False, 'error': 'PARSE_ERROR'}
+        config_response = json.dumps(data, separators=(',', ':'))
+    else:
+        config_response = json.dumps({'ok': False, 'error': 'NO_RESPONSE'}, separators=(',', ':'))
+    config_response_pages = []
+
+
 def process_config_command(cmd_str):
     """Parse JSON command, dispatch by op field. Sets config_response."""
     global config_response, config_response_pages
@@ -559,7 +652,11 @@ def process_config_command(cmd_str):
     print(f'Config command: {op}', flush=True)
 
     try:
-        if op == 'LIST_TRAILERS':
+        if op == 'WIFI_SET':
+            _wifi_set_from_ble(cmd)
+        elif op == 'WIFI_STATUS':
+            _wifi_status_from_ble()
+        elif op == 'LIST_TRAILERS':
             _cmd_list_trailers()
         elif op == 'LIST_SENSORS':
             _cmd_list_sensors(cmd)
