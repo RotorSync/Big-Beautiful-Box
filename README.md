@@ -187,13 +187,26 @@ The install script configures:
 
 ## Known Issues
 
-### Flow Meter Disconnect Recovery ([#2](https://github.com/RotorSync/Big-Beautiful-Box/issues/2))
+### Flow Meter Disconnect Recovery ([#2](https://github.com/RotorSync/Big-Beautiful-Box/issues/2)) — FIXED
 
-The Picomag flow meter occasionally loses its IO-Link connection. The dashboard detects this via stale data (identical raw bytes for 5+ seconds) or all-zero responses, and displays skull icons + "FLOW METER DISCONNECTED" warning.
+The Picomag flow meter would silently lose its IO-Link connection. The dashboard detected this via stale data (identical raw bytes for 5+ seconds) and triggered power-cycles, but the IOL master daemon could not recover without a full service restart.
 
-**Current status:** The IOL master daemon's retry loop (COMLOST → RETRY) runs continuously after a disconnect but fails to re-establish communication. Power-cycling the port via `iolhat.power()` does not help — the daemon's internal state is stuck. A full service restart (`sudo systemctl restart iol_dashboard`) is currently the only reliable fix.
+**Root cause:** Three bugs in the i-link DL (Data Link) layer in `iol-hat/src-master-application/ilink/iolink_dl.c`:
 
-**Diagnostics in place:** On disconnect, the dashboard reads the MAX14819 ChanStat error register via `iolhat.readStatus2()` (CMD_STATUS2, ID 8) and logs `IOL DISCONNECT [reason]: pdInValid=X, txRate=0xXX, error=0xXX, power=X` to `~/iol_dashboard.log`. The `error` byte (lower 3 bits of ChanStat) should identify the hardware-level failure mode. Waiting to capture this during the next disconnect event.
+1. **No watchdog timer in steady-state OPERATE.** The `TInitcyc` software timer is one-shot and only fires once when entering OPERATE. The `timer_tcyc` timer infrastructure existed in skeleton form but was never wired up (never started, no event handler in `dl_main`, `timer_tcyc_elapsed` never set). Once the initial cycle begins, timing is entirely hardware-driven with no software fallback. If the MAX14819 stops generating `RXRDY` interrupts for any reason, the DL thread blocks forever in `os_event_wait()`.
+
+2. **`timer_elapsed` not handled in `AW_REPLY_16`.** Even if a timer did fire, the `AW_REPLY_16` state handler had no check for `timer_elapsed` — it fell through to "unknown event triggered" which did nothing useful.
+
+3. **`get_data` failure caused silent hang.** When `iolink_pl_get_data()` returned `false` (e.g., due to a FIFO level mismatch between `TxRxDataA` and `RxFIFOLvl` register reads), the DL main loop skipped calling `iolink_dl_message_h_sm()` entirely. No next TX was sent, so no response would ever come, causing a permanent hang.
+
+**Fixes applied** (all in `iol-hat/src-master-application/ilink/iolink_dl.c`):
+
+- **100ms watchdog timer** started after every TX message (in `get_od14`, the `AW_REPLY_16` success path, and the retry path). If no `RXRDY` arrives within 100ms, the timer fires and triggers COMLOST recovery, which re-establishes the connection automatically.
+- **`timer_elapsed` handler in `AW_REPLY_16`** — when the watchdog fires, the state machine now detects it and calls `iolink_dl_mh_handle_com_lost()` to recover.
+- **`get_data` failure signals `rxerror`** — when `get_data` returns false on an `RXRDY` event, the DL main loop now sets `rxerror=true` and calls `iolink_dl_message_h_sm()` so the state machine can handle it (retry or COMLOST) instead of silently hanging.
+- **Retries before COMLOST** — transient RX timeouts and errors in `AW_REPLY_16` are retried up to 3 times with `PL_Resend()` before triggering a full COMLOST recovery, reducing unnecessary reconnection cycles.
+
+Also fixed: **Port 2 cross-channel interference** — Port 2 (unused) was set to IOL mode (`-m1 0`) which caused cross-channel interference with Port 1. Changed to OFF (`-m1 3`) in `start_iol_dashboard.sh`.
 
 ## Related Repositories
 
