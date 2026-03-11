@@ -19,7 +19,7 @@ Check for v1.2 branch or updated documentation before use with newer hardware.
 - **Sensor monitoring** — battery (BMS) and tank levels (Mopeka)
 - **BatchMix support** — receive mix formulas from iPad app
 - **Serial control** via Switch Box (Pico-based remote)
-- **7" touchscreen dashboard** with fullscreen Tkinter GUI
+- **7" screen dashboard** with fullscreen Tkinter GUI
 
 ## System Architecture
 
@@ -114,6 +114,9 @@ CHUNK:1/3:{"product_count":2,"products":[...
 CHUNK:2/3:...],"water_needed":45.5,...
 CHUNK:3/3:...}
 ```
+### Bluetooth Hardware
+
+For the Dongle that connects to the ipad StaerTech AV53C1-USB-Bluetooth is used.
 
 ### Sensor Monitoring
 
