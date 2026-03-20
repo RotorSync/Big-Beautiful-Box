@@ -34,7 +34,7 @@ SENSOR_ADAPTER_MAC = 'BC:FC:E7:2D:86:7B'  # USB adapter reserved for BMS/Mopeka 
 DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 9999
 
-BMS_MAC = 'A5:C2:37:2B:32:91'
+BMS_MAC = 'A5:C2:37:31:77:C0'
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
 MOPEKA2_MAC_SUFFIX = ''
 # Timing configuration
@@ -47,6 +47,7 @@ STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
 # Recovery settings
 MAX_CONSECUTIVE_FAILURES = 5
 ADAPTER_RESET_COOLDOWN = 30
+GATT_ADAPTER_CHECK_INTERVAL = 5
 
 # UUIDs
 SERVICE_UUID = UUID('12345678-1234-5678-1234-56789abcdef0')
@@ -176,6 +177,32 @@ def reset_adapter(adapter):
     except Exception as e:
         print(f'Adapter reset error: {e}', flush=True)
         return False
+
+def adapter_exists(adapter):
+    """Return True if the named HCI adapter still exists."""
+    result = subprocess.run(['hciconfig', adapter], capture_output=True, text=True)
+    return result.returncode == 0
+
+async def monitor_gatt_adapter(expected_adapter):
+    """Exit so systemd can restart if the GATT adapter is re-enumerated."""
+    while True:
+        await asyncio.sleep(GATT_ADAPTER_CHECK_INTERVAL)
+        current_adapter = find_adapter_by_mac(GATT_ADAPTER_MAC)
+
+        if not current_adapter:
+            print(f'GATT adapter {GATT_ADAPTER_MAC} disappeared; exiting for restart', flush=True)
+            os._exit(1)
+
+        if current_adapter != expected_adapter:
+            print(
+                f'GATT adapter moved from {expected_adapter} to {current_adapter}; exiting for restart',
+                flush=True
+            )
+            os._exit(1)
+
+        if not adapter_exists(expected_adapter):
+            print(f'GATT adapter {expected_adapter} no longer exists; exiting for restart', flush=True)
+            os._exit(1)
 
 def make_read_handler(data_key):
     def read_value(connection):
@@ -1058,10 +1085,12 @@ def config_data_read_handler(connection):
 
 
 def decode_mopeka(data):
-    temp_c = (data[2] & 0x7F) - 40
+    temp_raw = data[2] & 0x7F
     tank_raw = data[3] | ((data[4] & 0x3F) << 8)
     quality = (data[4] >> 6) & 0x03
-    level_mm = tank_raw * (0.573045 - 0.002822 * temp_c - 0.00000535 * temp_c * temp_c)
+    # Use the air coefficients from the reference parser so empty spray tanks
+    # decode to the physical tank height instead of propane-liquid depth.
+    level_mm = tank_raw * (0.153096 + 0.000327 * temp_raw - 0.000000294 * temp_raw * temp_raw)
     return {'level_mm': round(level_mm, 1), 'quality': quality}
 
 def jbd_cmd(func):
@@ -1227,12 +1256,13 @@ async def main():
     if sensor_adapter:
         sensor_task = asyncio.create_task(read_sensors(sensor_adapter))
     status_task = asyncio.create_task(poll_dashboard_status())
+    gatt_monitor_task = asyncio.create_task(monitor_gatt_adapter(gatt_adapter))
 
     print(f'Opening HCI socket for {gatt_adapter}...', flush=True)
     hci_transport = await open_hci_socket_transport(gatt_adapter_index)
 
     host = Host(hci_transport.source, hci_transport.sink)
-    device = Device(name='Rotorsync', host=host)
+    device = Device(name='TrailerSync-TR2', host=host)
 
     # Create characteristics - READ for sensors
     bms_char = Characteristic(BMS_CHAR_UUID, Characteristic.Properties.READ,
@@ -1285,11 +1315,17 @@ async def main():
     print(f'Device address: {device.public_address}', flush=True)
 
     adv_data = AdvertisingData([
-        (AdvertisingData.COMPLETE_LOCAL_NAME, b'Rotorsync'),
         (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes(SERVICE_UUID)),
     ])
+    scan_response = AdvertisingData([
+        (AdvertisingData.COMPLETE_LOCAL_NAME, b'TrailerSync-TR2'),
+    ])
 
-    await device.start_advertising(advertising_data=bytes(adv_data), auto_restart=True)
+    await device.start_advertising(
+        advertising_data=bytes(adv_data),
+        scan_response_data=bytes(scan_response),
+        auto_restart=True,
+    )
     print('=== Rotorsync GATT Server Running ===', flush=True)
     print('Characteristics:', flush=True)
     print('  def1: BMS (read)        - {"voltage": x, "soc": y}', flush=True)
