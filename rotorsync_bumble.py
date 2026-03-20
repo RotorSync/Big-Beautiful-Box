@@ -70,6 +70,7 @@ MOPEKA_DIR = os.path.join(SCRIPT_DIR, 'mopeka')
 SENSOR_CSV_PATH = os.path.join(MOPEKA_DIR, 'mopeka-sensor-details.csv')
 CALIBRATION_CSV_PATH = os.path.join(MOPEKA_DIR, 'calibration-points-1070gal-tank.csv')
 MOPEKA_CONFIG_PATH = os.path.join(MOPEKA_DIR, 'mopeka_config.json')
+WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 
 # Sensor data with timestamps
 sensor_data = {
@@ -183,6 +184,28 @@ def adapter_exists(adapter):
     result = subprocess.run(['hciconfig', adapter], capture_output=True, text=True)
     return result.returncode == 0
 
+def log_watchdog_event(reason):
+    """Log watchdog-triggered restarts in one dedicated file."""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    count = 1
+
+    try:
+        with open(WATCHDOG_LOG_PATH, 'r', encoding='utf-8') as f:
+            count += sum(1 for _ in f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'Watchdog log read error: {e}', flush=True)
+
+    line = f'{timestamp} - event {count}: {reason}'
+    print(line, flush=True)
+
+    try:
+        with open(WATCHDOG_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        print(f'Watchdog log write error: {e}', flush=True)
+
 async def monitor_gatt_adapter(expected_adapter):
     """Exit so systemd can restart if the GATT adapter is re-enumerated."""
     while True:
@@ -190,18 +213,21 @@ async def monitor_gatt_adapter(expected_adapter):
         current_adapter = find_adapter_by_mac(GATT_ADAPTER_MAC)
 
         if not current_adapter:
-            print(f'GATT adapter {GATT_ADAPTER_MAC} disappeared; exiting for restart', flush=True)
+            log_watchdog_event(
+                f'GATT adapter {GATT_ADAPTER_MAC} disappeared; exiting for restart'
+            )
             os._exit(1)
 
         if current_adapter != expected_adapter:
-            print(
-                f'GATT adapter moved from {expected_adapter} to {current_adapter}; exiting for restart',
-                flush=True
+            log_watchdog_event(
+                f'GATT adapter moved from {expected_adapter} to {current_adapter}; exiting for restart'
             )
             os._exit(1)
 
         if not adapter_exists(expected_adapter):
-            print(f'GATT adapter {expected_adapter} no longer exists; exiting for restart', flush=True)
+            log_watchdog_event(
+                f'GATT adapter {expected_adapter} no longer exists; exiting for restart'
+            )
             os._exit(1)
 
 def make_read_handler(data_key):
