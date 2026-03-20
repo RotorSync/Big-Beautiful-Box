@@ -1,12 +1,12 @@
 """
 Mopeka sensor reading converter: mm -> gallons
 
-Converts raw Mopeka ultrasonic distance readings (mm) into gallons
-using per-sensor height offsets and a calibration lookup table.
+Converts raw Mopeka ultrasonic readings (mm) into gallons using per-sensor
+height offsets and a calibration lookup table.
 
-The Mopeka sensor reads the height of liquid from the bottom of the tank (in mm).
-The calibration table maps "inches from top of tank" to gallons.
-So we convert: mm -> inches from bottom -> inches from top -> interpolate gallons.
+The calibration table's "Tank Level (in)" column is used directly for the
+lookup axis, so the compensated sensor height is interpolated against that
+table without inverting it against the tank maximum height.
 """
 
 import csv
@@ -126,7 +126,7 @@ def _interpolate_gallons(inches_from_top):
 
 
 def mm_to_gallons(level_mm, sensor_mac_suffix=None):
-    """Convert a Mopeka reading (mm from bottom) to gallons.
+    """Convert a Mopeka reading (mm) to gallons.
 
     Args:
         level_mm: Raw level reading in mm (height of liquid from bottom)
@@ -135,8 +135,8 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
     Returns:
         dict with:
             - gallons: float, estimated gallons in tank
-            - level_in: float, compensated level in inches from bottom
-            - level_from_top_in: float, distance from top in inches (for calibration lookup)
+            - level_in: float, compensated level in inches used for lookup
+            - level_from_top_in: float, retained for compatibility with existing logs/consumers
             - offset_in: float, height offset applied
     """
     # Convert mm to inches
@@ -155,19 +155,17 @@ def mm_to_gallons(level_mm, sensor_mac_suffix=None):
 
     compensated_in = level_in + offset_in
 
-    # Convert from "inches from bottom" to "inches from top"
-    inches_from_top = MAX_TANK_HEIGHT_IN - compensated_in
-
-    # Clamp - can't be negative (sensor reading above tank)
-    inches_from_top = max(0.0, inches_from_top)
+    # The calibration table uses the same height axis as the compensated sensor
+    # reading, so use the height directly for interpolation.
+    lookup_height_in = max(0.0, compensated_in)
 
     # Lookup gallons
-    gallons = _interpolate_gallons(inches_from_top)
+    gallons = _interpolate_gallons(lookup_height_in)
 
     return {
         'gallons': round(gallons, 1),
         'level_in': round(compensated_in, 2),
-        'level_from_top_in': round(inches_from_top, 2),
+        'level_from_top_in': round(lookup_height_in, 2),
         'offset_in': offset_in,
     }
 

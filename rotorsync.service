@@ -5,7 +5,7 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/bash -c 'HCI=$(hciconfig -a | grep -B1 "00:01:95:9C:C7:F5" | head -1 | cut -d: -f1); [ -n "$HCI" ] && hciconfig $HCI down || true'
+ExecStartPre=/bin/bash -c 'HCI=$(hciconfig -a | grep -B1 "E8:EA:6A:BD:E7:4F" | head -1 | cut -d: -f1); [ -n "$HCI" ] && hciconfig $HCI down || true'
 ExecStart=/usr/bin/python3 /opt/rotorsync_bumble.py
 Restart=always
 RestartSec=5

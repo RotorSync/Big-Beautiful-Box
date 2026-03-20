@@ -27,8 +27,8 @@ from bumble.core import UUID, AdvertisingData
 from src.mopeka_converter import mm_to_gallons, init as mopeka_init, reload as mopeka_reload
 
 # Configuration - Use MAC addresses to find adapters dynamically
-GATT_ADAPTER_MAC = '00:01:95:9C:C7:F5'  # CSR/Sena for GATT - phones connect here
-SENSOR_ADAPTER_MAC = 'BC:FC:E7:2D:86:7B'  # Realtek for sensors
+GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
+SENSOR_ADAPTER_MAC = 'BC:FC:E7:2D:86:7B'  # USB adapter reserved for BMS/Mopeka sensor scanning
 
 # Socket connection to dashboard
 DASHBOARD_HOST = '127.0.0.1'

@@ -26,6 +26,15 @@ serial_logger = get_serial_logger()
 button_logger = get_button_logger()
 relay_logger = get_relay_logger()
 
+
+def log_serial_debug(message):
+    """Append a timestamped message to the serial debug log."""
+    try:
+        with open(config.SERIAL_DEBUG_LOG, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+    except Exception:
+        pass
+
 # Add paths for libraries
 sys.path.insert(0, config.RPI_GPIO_PATH)
 sys.path.insert(0, config.IOL_HAT_PATH)
@@ -84,6 +93,7 @@ reset_season_cancel_handler = None  # Function to call on cancel
 daily_total = 0.0  # Total gallons pumped today
 season_total = 0.0  # Total gallons pumped this season (until manually reset)
 last_reset_date = None  # Track last daily reset date
+last_load_gallons = 0.0  # Most recent recorded load size
 pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up confirmation
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
@@ -177,6 +187,25 @@ def save_totals():
     except Exception as e:
         print(f"Error saving season total: {e}")
 
+
+def load_last_load():
+    """Load the most recent recorded actual gallons from fill history."""
+    global last_load_gallons
+
+    try:
+        with open('/home/pi/fill_history.log', 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        if lines:
+            last_line = lines[-1]
+            marker = "Actual: "
+            start = last_line.index(marker) + len(marker)
+            end = last_line.index(" gal", start)
+            last_load_gallons = float(last_line[start:end])
+        else:
+            last_load_gallons = 0.0
+    except Exception:
+        last_load_gallons = 0.0
+
 def load_mode_presets():
     """Load fill and mix mode gallon presets from file"""
     global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
@@ -211,6 +240,7 @@ def switch_mode(new_mode):
     """Switch between fill and mix modes"""
     global current_mode, requested_gallons, fill_requested_gallons, mix_requested_gallons
     global mode_indicator_label, colors_are_green, serial_command_received, batch_mix_layout_active
+    global thumbs_up_label, thumbs_up_animation_id
 
     if new_mode == current_mode:
         return  # Already in this mode
@@ -232,6 +262,13 @@ def switch_mode(new_mode):
     colors_are_green = False
     serial_command_received = False
 
+    if current_mode == 'mix':
+        if thumbs_up_animation_id:
+            root.after_cancel(thumbs_up_animation_id)
+            thumbs_up_animation_id = None
+        if thumbs_up_label:
+            thumbs_up_label.place_forget()
+
     # Update mode indicator
     if mode_indicator_label:
         if current_mode == 'mix':
@@ -244,6 +281,8 @@ def switch_mode(new_mode):
 
     # Update the display
     draw_requested_number(f"{requested_gallons:.0f}", "red")
+    update_mopeka_display()
+    update_last_load_display()
 
     print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
 
@@ -620,9 +659,25 @@ def update_totals_display():
         menu_daily_label.config(text=f"Daily: {daily_total:.1f} gal")
         menu_season_label.config(text=f"Season: {season_total:.1f} gal")
 
+
+def update_last_load_display():
+    """Draw the most recent load size in the top-left corner."""
+    canvas.delete("last_load")
+    if current_mode == "mix":
+        return
+    canvas.create_text(
+        20,
+        20,
+        text=f"Last Load:\n{last_load_gallons:.1f} gal",
+        font=("Helvetica", 72, "bold"),
+        fill="cyan",
+        anchor="nw",
+        tags="last_load",
+    )
+
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
-    global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type, thumbs_up_label
+    global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type, thumbs_up_label, last_load_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
@@ -634,6 +689,8 @@ def record_pending_fill():
 
         # Add to daily and season totals
         add_to_totals(pending_fill_gallons)
+        last_load_gallons = pending_fill_gallons
+        update_last_load_display()
         print(f"Fill recorded - Actual: {pending_fill_gallons:.3f} gal")
         print(f"Updated totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
 
@@ -2482,22 +2539,19 @@ def serial_listener():
         serial_connected = True
         msg = f"Serial listener started on {config.SERIAL_PORT} at {config.SERIAL_BAUD} baud"
         print(msg)
-        with open(debug_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        log_serial_debug(msg)
 
         while True:
             try:
                 if ser.in_waiting > 0:
                     # Read all available bytes
                     raw_bytes = ser.read(ser.in_waiting)
-                    with open(debug_log, 'a') as f:
-                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Raw bytes: {raw_bytes} (hex: {raw_bytes.hex()})\n")
+                    log_serial_debug(f"Raw bytes: {raw_bytes} (hex: {raw_bytes.hex()})")
 
                     # Decode and add to buffer
                     chunk = raw_bytes.decode('utf-8', errors='ignore')
                     buffer += chunk
-                    with open(debug_log, 'a') as f:
-                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Decoded: '{chunk}' | Buffer now: '{buffer}'\n")
+                    log_serial_debug(f"Decoded: '{chunk}' | Buffer now: '{buffer}'")
 
                     # Process complete lines (ending with \n or \r)
                     while '\n' in buffer or '\r' in buffer:
@@ -2508,15 +2562,13 @@ def serial_listener():
                             line, buffer = buffer.split('\r', 1)
 
                         line = line.strip()
-                        with open(debug_log, 'a') as f:
-                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Complete line: '{line}'\n")
+                        log_serial_debug(f"Complete line: '{line}'")
 
                         if line:
                             # Update heartbeat if we receive OK message
                             if line == 'OK':
                                 last_heartbeat_time = time.time()
-                                with open(debug_log, 'a') as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Heartbeat received (OK)\n")
+                                log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
 
                             # Handle exit confirmation dialog
@@ -2731,13 +2783,22 @@ def serial_listener():
                                         else:
                                             mix_requested_gallons = requested_gallons
                                         save_mode_presets()
-                                        msg = f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
+                                        heartbeat_age = time.time() - last_heartbeat_time if last_heartbeat_time else -1
+                                        msg = (
+                                            f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons} "
+                                            f"(heartbeat_age={heartbeat_age:.1f}s, mode={current_mode})"
+                                        )
                                         print(msg)
-                                        with open(debug_log, 'a') as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        log_serial_debug(msg)
+                                        root.after(
+                                            0,
+                                            lambda value=requested_gallons, is_green=colors_are_green: (
+                                                draw_requested_number(f"{value:.0f}", "green" if is_green else "red"),
+                                                update_batch_mix_overlay(),
+                                            ),
+                                        )
                                     except ValueError as ve:
-                                        with open(debug_log, 'a') as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - ValueError parsing adjustment: {ve}\n")
+                                        log_serial_debug(f"ValueError parsing adjustment: {ve}")
 
                                 # Handle special commands
                                 elif line == 'PS':
@@ -2800,16 +2861,14 @@ def serial_listener():
             except Exception as e:
                 msg = f"Serial read error: {e}"
                 print(msg)
-                with open(debug_log, 'a') as f:
-                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                log_serial_debug(msg)
                 time.sleep(0.1)
 
     except Exception as e:
         serial_connected = False
         msg = f"Serial listener error: {e}"
         print(msg)
-        with open(debug_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        log_serial_debug(msg)
 
 def initialize_gpio():
     """Initialize GPIO for relay control"""
@@ -2938,6 +2997,9 @@ def _mopeka_offline():
 def update_mopeka_display():
     """Draw Mopeka tank levels in top-right corner of screen"""
     canvas.delete("mopeka_display")
+
+    if current_mode == "mix":
+        return
     
     width = canvas.winfo_width()
     x = width - 20  # 20px from right edge
@@ -2988,8 +3050,8 @@ def draw_requested_number(text, color="red"):
 
     # Position: centered horizontally, 20% from top
     x = canvas.winfo_width() // 2
-    y = int(canvas.winfo_height() * 0.28)
-    font = ("Helvetica", 180, "bold")
+    y = int(canvas.winfo_height() * 0.28) + 24
+    font = ("Helvetica", 220, "bold")
 
     # Draw white outline (8 positions around the text)
     for dx, dy in [(-5,-5), (-5,0), (-5,5), (0,-5), (0,5), (5,-5), (5,0), (5,5)]:
@@ -3034,7 +3096,7 @@ def draw_actual_number(text, color="red"):
     # Position: centered horizontally, 65% from top
     x = canvas.winfo_width() // 2
     y = int(canvas.winfo_height() * 0.65)
-    font = ("Helvetica", 240, "bold")
+    font = ("Helvetica", 280, "bold")
 
     # Draw white outline (8 positions around the text)
     for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
@@ -3106,7 +3168,7 @@ def load_thumbs_up_gif():
         if os.path.exists(png_path):
             img = Image.open(png_path)
             # Resize to fit nicely on screen
-            img = img.resize((200, 200), Image.Resampling.LANCZOS)
+            img = img.resize((533, 533), Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             thumbs_up_frames = [photo]
             print(f"Loaded thumbs up from PNG")
@@ -3117,7 +3179,7 @@ def load_thumbs_up_gif():
             try:
                 while True:
                     frame = img.copy()
-                    frame = frame.resize((200, 200), Image.Resampling.LANCZOS)
+                    frame = frame.resize((533, 533), Image.Resampling.LANCZOS)
                     photo = ImageTk.PhotoImage(frame)
                     thumbs_up_frames.append(photo)
                     img.seek(img.tell() + 1)
@@ -3131,11 +3193,11 @@ def load_thumbs_up_gif():
         if thumbs_up_frames:
             thumbs_up_label = tk.Label(root, image=thumbs_up_frames[0], bg="black")
         else:
-            thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 150, "bold"),
+            thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 400, "bold"),
                                        foreground="green", background="black")
     except Exception as e:
         print(f"Could not load thumbs up image: {e}")
-        thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 150, "bold"),
+        thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 400, "bold"),
                                    foreground="green", background="black")
 def animate_thumbs_up():
     """Animate the thumbs up GIF"""
@@ -3176,10 +3238,14 @@ def update_dashboard():
     heartbeat_timeout = (time.time() - last_heartbeat_time) > 11
     if heartbeat_timeout and not heartbeat_disconnected:
         heartbeat_disconnected = True
-        print("Heartbeat timeout - Switch box disconnected")
+        msg = "Heartbeat timeout - Switch box disconnected"
+        print(msg)
+        log_serial_debug(msg)
     elif not heartbeat_timeout and heartbeat_disconnected:
         heartbeat_disconnected = False
-        print("Heartbeat restored - Switch box reconnected")
+        msg = "Heartbeat restored - Switch box reconnected"
+        print(msg)
+        log_serial_debug(msg)
 
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
@@ -3391,7 +3457,13 @@ else:
 
 # Load totals from files
 load_totals()
+load_last_load()
+today_str = time.strftime('%Y-%m-%d')
+if last_reset_date != today_str:
+    print(f"Date changed since last reset ({last_reset_date} -> {today_str}) - resetting daily total on startup")
+    reset_daily_total()
 print(f"Loaded totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
+print(f"Loaded last load - {last_load_gallons:.2f} gal")
 
 # Load mode presets and set initial requested gallons
 load_mode_presets()
@@ -3406,6 +3478,7 @@ print(f"Loaded mode - Mode: {current_mode}, Requested: {requested_gallons}, Fill
 
 # Redraw requested gallons with the loaded value
 draw_requested_number(f"{requested_gallons:.0f}", "red")
+update_last_load_display()
 
 # Start serial listener in background thread (works without IOL)
 serial_thread = threading.Thread(target=serial_listener, daemon=True)
