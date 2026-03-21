@@ -702,6 +702,25 @@ def record_pending_fill():
     else:
         print("No pending fill to record")
 
+def handle_thumbs_up_press(source):
+    """Accept thumbs up only after flow has stopped."""
+    button_log = "/home/pi/button_debug.log"
+    is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+
+    if is_flowing:
+        msg = (
+            f"Thumbs up ignored from {source}: flow still active "
+            f"({last_flow_rate:.3f} L/s)"
+        )
+        print(msg)
+        log_serial_debug(msg)
+        with open(button_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] {msg}\n")
+        return
+
+    change_colors_to_green(from_button=True)
+    record_pending_fill()
+
 def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
     relay_log = config.RELAY_TEST_LOG
@@ -881,10 +900,7 @@ def green_button_monitor():
                         root.after(0, lambda: full_test_window.mark_tested('button'))
                         print("Full test: Button test marked as passed")
                 else:
-                    # Call color change function in main thread with from_button=True
-                    root.after(0, lambda: change_colors_to_green(from_button=True))
-                    # Record the fill if there's pending data
-                    root.after(0, record_pending_fill)
+                    root.after(0, lambda: handle_thumbs_up_press("GPIO button"))
                 # Debounce delay
                 time.sleep(0.3)
 
@@ -2835,8 +2851,7 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, lambda: change_colors_to_green(from_button=True))
-                                    root.after(0, record_pending_fill)
+                                    root.after(0, lambda: handle_thumbs_up_press("serial TU"))
 
                                 elif line == 'MIX':
                                     msg = "Serial: Mix mode command received"
