@@ -1,7 +1,6 @@
 [Unit]
 Description=Rotorsync BLE GATT Server (Bumble)
 After=network.target
-Wants=bluetooth.target
 
 [Service]
 Type=simple

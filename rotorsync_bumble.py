@@ -12,13 +12,15 @@ import csv
 import json
 import logging
 import os
+from pathlib import Path
 import subprocess
 import socket
 import time
 
 logging.basicConfig(level=logging.INFO)
 
-from bumble.device import Device
+from bumble import hci
+from bumble.device import Device, Peer
 from bumble.host import Host
 from bumble.transport.hci_socket import open_hci_socket_transport
 from bumble.gatt import Service, Characteristic, CharacteristicValue
@@ -35,6 +37,8 @@ DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 9999
 
 BMS_MAC = 'A5:C2:37:31:77:C0'
+BMS_NOTIFY_UUID = UUID('0000ff01-0000-1000-8000-00805f9b34fb')
+BMS_WRITE_UUID = UUID('0000ff02-0000-1000-8000-00805f9b34fb')
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
 MOPEKA2_MAC_SUFFIX = ''
 # Timing configuration
@@ -156,13 +160,41 @@ def query_dashboard_status():
 
 def find_adapter_by_mac(mac):
     """Find hci index by MAC address"""
+    mac = mac.upper()
     result = subprocess.run(['hciconfig', '-a'], capture_output=True, text=True)
     current_hci = None
     for line in result.stdout.split('\n'):
         if line.startswith('hci'):
             current_hci = line.split(':')[0]
-        if mac.upper() in line.upper():
+        if mac in line.upper():
             return current_hci
+
+    return None
+
+
+def get_adapter_device_path(adapter):
+    """Return the resolved sysfs device path for an adapter."""
+    try:
+        return Path('/sys/class/bluetooth', adapter, 'device').resolve()
+    except FileNotFoundError:
+        return None
+
+
+def find_adapter_by_device_path(expected_device_path):
+    """Find the current hci index for a physical Bluetooth USB interface."""
+    if not expected_device_path:
+        return None
+
+    bluetooth_root = Path('/sys/class/bluetooth')
+    for adapter_path in sorted(bluetooth_root.glob('hci*')):
+        try:
+            if (adapter_path / 'device').resolve() == expected_device_path:
+                return adapter_path.name
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
     return None
 
 def reset_adapter(adapter):
@@ -181,8 +213,7 @@ def reset_adapter(adapter):
 
 def adapter_exists(adapter):
     """Return True if the named HCI adapter still exists."""
-    result = subprocess.run(['hciconfig', adapter], capture_output=True, text=True)
-    return result.returncode == 0
+    return Path('/sys/class/bluetooth', adapter).exists()
 
 def log_watchdog_event(reason):
     """Log watchdog-triggered restarts in one dedicated file."""
@@ -206,15 +237,15 @@ def log_watchdog_event(reason):
     except Exception as e:
         print(f'Watchdog log write error: {e}', flush=True)
 
-async def monitor_gatt_adapter(expected_adapter):
+async def monitor_gatt_adapter(expected_adapter, expected_device_path):
     """Exit so systemd can restart if the GATT adapter is re-enumerated."""
     while True:
         await asyncio.sleep(GATT_ADAPTER_CHECK_INTERVAL)
-        current_adapter = find_adapter_by_mac(GATT_ADAPTER_MAC)
+        current_adapter = find_adapter_by_device_path(expected_device_path)
 
         if not current_adapter:
             log_watchdog_event(
-                f'GATT adapter {GATT_ADAPTER_MAC} disappeared; exiting for restart'
+                f'GATT adapter path {expected_device_path} disappeared; exiting for restart'
             )
             os._exit(1)
 
@@ -1119,6 +1150,107 @@ def decode_mopeka(data):
     level_mm = tank_raw * (0.153096 + 0.000327 * temp_raw - 0.000000294 * temp_raw * temp_raw)
     return {'level_mm': round(level_mm, 1), 'quality': quality}
 
+async def scan_mopeka(sensor_device, current_time):
+    mopeka_found = False
+
+    def on_advertisement(advertisement):
+        nonlocal mopeka_found
+
+        try:
+            addr = str(advertisement.address).upper()
+            manufacturer_data = advertisement.data.get_all(
+                AdvertisingData.MANUFACTURER_SPECIFIC_DATA
+            )
+
+            for company_id, data in manufacturer_data:
+                if company_id != 89:
+                    continue
+
+                decoded = decode_mopeka(data)
+                decoded['last_update'] = current_time
+
+                if MOPEKA1_MAC_SUFFIX and MOPEKA1_MAC_SUFFIX in addr:
+                    conversion = mm_to_gallons(decoded["level_mm"], MOPEKA1_MAC_SUFFIX)
+                    decoded.update(conversion)
+                    sensor_data['mopeka1'] = decoded
+                    print(f'Mopeka1: {decoded}', flush=True)
+                    mopeka_found = True
+                elif MOPEKA2_MAC_SUFFIX and MOPEKA2_MAC_SUFFIX in addr:
+                    conversion = mm_to_gallons(decoded["level_mm"], MOPEKA2_MAC_SUFFIX)
+                    decoded.update(conversion)
+                    sensor_data['mopeka2'] = decoded
+                    print(f'Mopeka2: {decoded}', flush=True)
+                    mopeka_found = True
+        except Exception as e:
+            print(f'Mopeka advertisement parse error: {e}', flush=True)
+
+    sensor_device.on('advertisement', on_advertisement)
+    try:
+        await sensor_device.start_scanning(active=False)
+        await asyncio.sleep(SCAN_TIMEOUT)
+        await sensor_device.stop_scanning()
+    finally:
+        sensor_device.remove_listener('advertisement', on_advertisement)
+
+    return mopeka_found
+
+async def read_bms(sensor_device, current_time):
+    response = bytearray()
+    notification_received = asyncio.Event()
+    connection = None
+    peer = None
+    notify_char = None
+    subscriber = None
+
+    try:
+        connection = await sensor_device.connect(
+            BMS_MAC,
+            own_address_type=hci.OwnAddressType.PUBLIC,
+            timeout=BMS_TIMEOUT,
+        )
+        peer = Peer(connection)
+        await peer.discover_services()
+        notify_chars = await peer.discover_characteristics(uuids=[BMS_NOTIFY_UUID])
+        write_chars = await peer.discover_characteristics(uuids=[BMS_WRITE_UUID])
+
+        if not notify_chars or not write_chars:
+            raise RuntimeError('BMS characteristics not found')
+
+        notify_char = notify_chars[0]
+        write_char = write_chars[0]
+
+        def on_bms_notification(value):
+            response.extend(value)
+            notification_received.set()
+
+        subscriber = on_bms_notification
+        await peer.subscribe(notify_char, subscriber)
+        await peer.write_value(write_char, jbd_cmd(0x03), with_response=False)
+        await asyncio.wait_for(notification_received.wait(), timeout=1.5)
+
+        if len(response) <= 20:
+            raise RuntimeError(f'BMS response too short ({len(response)} bytes)')
+
+        d = response[4:]
+        sensor_data['bms'] = {
+            'voltage': round(int.from_bytes(d[0:2], 'big') * 0.01, 2),
+            'soc': d[19],
+            'last_update': current_time
+        }
+        print(f'BMS: {sensor_data["bms"]}', flush=True)
+        return True
+    finally:
+        if peer and notify_char and subscriber:
+            try:
+                await peer.unsubscribe(notify_char, subscriber)
+            except Exception:
+                pass
+        if connection:
+            try:
+                await connection.disconnect()
+            except Exception:
+                pass
+
 def jbd_cmd(func):
     frame = [0xDD, 0xA5, func, 0x00]
     crc = sum([-b for b in frame[2:4]]) & 0xFFFF
@@ -1139,13 +1271,8 @@ async def poll_dashboard_status():
             print(f'Status poll error: {e}', flush=True)
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
-async def read_sensors(sensor_adapter):
+async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data
-    try:
-        from bleak import BleakScanner, BleakClient
-    except ImportError:
-        print("bleak not available for sensor reading")
-        return
 
     print(f"Sensor reader started on {sensor_adapter}", flush=True)
     print(f"Scan interval: {SCAN_INTERVAL}s, BMS every {BMS_READ_INTERVAL} cycles", flush=True)
@@ -1160,52 +1287,16 @@ async def read_sensors(sensor_adapter):
         cycle_count += 1
         current_time = time.time()
 
-        # Check if adapter needs reset
         if (mopeka_failures >= MAX_CONSECUTIVE_FAILURES or bms_failures >= MAX_CONSECUTIVE_FAILURES):
             if current_time - last_adapter_reset > ADAPTER_RESET_COOLDOWN:
-                print(f'Too many failures, resetting adapter...', flush=True)
-                new_adapter = find_adapter_by_mac(SENSOR_ADAPTER_MAC)
-                if new_adapter and new_adapter != sensor_adapter:
-                    print(f'Adapter changed from {sensor_adapter} to {new_adapter}', flush=True)
-                    sensor_adapter = new_adapter
-                reset_adapter(sensor_adapter)
-                mopeka_failures = 0
-                bms_failures = 0
-                last_adapter_reset = current_time
-                await asyncio.sleep(5)
-                continue
+                print('Too many sensor failures, exiting for service restart', flush=True)
+                os._exit(1)
 
-        # Scan for Mopeka sensors
-        mopeka_found = False
         try:
-            devices = await BleakScanner.discover(
-                timeout=SCAN_TIMEOUT,
-                adapter=sensor_adapter,
-                return_adv=True
-            )
-            for addr, (dev, adv) in devices.items():
-                if adv.manufacturer_data and 89 in adv.manufacturer_data:
-                    data = adv.manufacturer_data[89]
-                    decoded = decode_mopeka(data)
-                    decoded['last_update'] = current_time
-                    if MOPEKA1_MAC_SUFFIX in addr.upper():
-                        # Convert mm to gallons
-                        conversion = mm_to_gallons(decoded["level_mm"], MOPEKA1_MAC_SUFFIX)
-                        decoded.update(conversion)
-                        sensor_data['mopeka1'] = decoded
-                        print(f'Mopeka1: {decoded}', flush=True)
-                        mopeka_found = True
-                    elif MOPEKA2_MAC_SUFFIX in addr.upper():
-                        # Convert mm to gallons
-                        conversion = mm_to_gallons(decoded["level_mm"], MOPEKA2_MAC_SUFFIX)
-                        decoded.update(conversion)
-                        sensor_data['mopeka2'] = decoded
-                        print(f'Mopeka2: {decoded}', flush=True)
-                        mopeka_found = True
+            mopeka_found = await scan_mopeka(sensor_device, current_time)
 
             if mopeka_found:
                 mopeka_failures = 0
-                # Send tank levels to dashboard
                 m1_gal = sensor_data["mopeka1"].get("gallons", 0)
                 m2_gal = sensor_data["mopeka2"].get("gallons", 0)
                 m1_q = sensor_data["mopeka1"].get("quality", 0)
@@ -1221,26 +1312,10 @@ async def read_sensors(sensor_adapter):
             mopeka_failures += 1
             print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
 
-        # Read BMS less frequently
         if cycle_count % BMS_READ_INTERVAL == 0:
             try:
-                response = bytearray()
-                def handler(s, d): response.extend(d)
-                async with BleakClient(BMS_MAC, adapter=sensor_adapter, timeout=BMS_TIMEOUT) as client:
-                    await client.start_notify('0000ff01-0000-1000-8000-00805f9b34fb', handler)
-                    await client.write_gatt_char('0000ff02-0000-1000-8000-00805f9b34fb', jbd_cmd(0x03))
-                    await asyncio.sleep(1.5)
-                    if len(response) > 20:
-                        d = response[4:]
-                        sensor_data['bms'] = {
-                            'voltage': round(int.from_bytes(d[0:2], 'big') * 0.01, 2),
-                            'soc': d[19],
-                            'last_update': current_time
-                        }
-                        print(f'BMS: {sensor_data["bms"]}', flush=True)
-                        bms_failures = 0
-                    else:
-                        bms_failures += 1
+                if await read_bms(sensor_device, current_time):
+                    bms_failures = 0
             except Exception as e:
                 bms_failures += 1
                 print(f'BMS error ({bms_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
@@ -1266,23 +1341,33 @@ async def main():
         print(f'WARNING: Sensor adapter {SENSOR_ADAPTER_MAC} not found - sensors disabled', flush=True)
 
     gatt_adapter_index = int(gatt_adapter.replace('hci', ''))
+    sensor_adapter_index = int(sensor_adapter.replace('hci', '')) if sensor_adapter else None
+    gatt_device_path = get_adapter_device_path(gatt_adapter)
     print(f'GATT adapter: {gatt_adapter} ({GATT_ADAPTER_MAC})', flush=True)
     if sensor_adapter:
         print(f'Sensor adapter: {sensor_adapter} ({SENSOR_ADAPTER_MAC})', flush=True)
 
     subprocess.run(['hciconfig', gatt_adapter, 'down'], capture_output=True)
     await asyncio.sleep(0.5)
-
-    subprocess.run(['systemctl', 'start', 'bluetooth'], capture_output=True)
-    await asyncio.sleep(1)
+    subprocess.run(['systemctl', 'stop', 'bluetooth.service'], capture_output=True)
     if sensor_adapter:
-        subprocess.run(['hciconfig', sensor_adapter, 'up'], capture_output=True)
+        subprocess.run(['hciconfig', sensor_adapter, 'down'], capture_output=True)
+    await asyncio.sleep(0.5)
 
-    # Start background tasks
+    sensor_device = None
+    if sensor_adapter and sensor_adapter_index is not None:
+        print(f'Opening HCI socket for {sensor_adapter}...', flush=True)
+        sensor_transport = await open_hci_socket_transport(sensor_adapter_index)
+        sensor_host = Host(sensor_transport.source, sensor_transport.sink)
+        sensor_device = Device(name='TrailerSync-Sensors', host=sensor_host)
+        await sensor_device.power_on()
+
     if sensor_adapter:
-        sensor_task = asyncio.create_task(read_sensors(sensor_adapter))
+        sensor_task = asyncio.create_task(read_sensors(sensor_device, sensor_adapter))
     status_task = asyncio.create_task(poll_dashboard_status())
-    gatt_monitor_task = asyncio.create_task(monitor_gatt_adapter(gatt_adapter))
+    gatt_monitor_task = asyncio.create_task(
+        monitor_gatt_adapter(gatt_adapter, gatt_device_path)
+    )
 
     print(f'Opening HCI socket for {gatt_adapter}...', flush=True)
     hci_transport = await open_hci_socket_transport(gatt_adapter_index)

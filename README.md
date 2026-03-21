@@ -121,8 +121,16 @@ For the Dongle that connects to the ipad StaerTech AV53C1-USB-Bluetooth is used.
 ### Sensor Monitoring
 
 The BLE server also reads nearby sensors via a second Bluetooth adapter:
-- **JBD BMS** (A5:C2:37:2B:32:91) — Battery voltage and state of charge
+- **JBD BMS** (A5:C2:37:31:77:C0) — Battery voltage and state of charge
 - **Mopeka Pro** sensors — Ultrasonic tank level monitors
+
+### BLE Architecture Notes
+
+- `rotorsync_bumble.py` owns both Bluetooth adapters through Bumble HCI socket transports.
+- The GATT/iPad adapter is selected by `GATT_ADAPTER_MAC`.
+- The sensor adapter is selected by `SENSOR_ADAPTER_MAC`.
+- BlueZ is intentionally stopped for the Rotorsync runtime path. The sensor side no longer uses `bleak`.
+- Adapter MAC lookup is only used at startup. After startup, the GATT watchdog tracks the adapter by its resolved sysfs USB device path so it does not touch the live controller.
 
 ## Software
 
@@ -186,6 +194,73 @@ The install script configures:
 2. Dashboard displays product list overlay
 3. Water target automatically set from formula
 4. Ground crew follows mix sequence
+
+## BLE Stability Investigation (March 21, 2026)
+
+### Symptom
+
+The external StarTech GATT dongle would repeatedly fail with:
+
+- `Bluetooth: hciN: command tx timeout`
+- `Bluetooth: hciN: Resetting usb device`
+- Bumble `BrokenPipeError: [Errno 32] Broken pipe`
+
+When this happened, the same physical adapter kept re-enumerating as new HCI indices (`hci0`, `hci2`, `hci10`, etc.), and `rotorsync.service` would restart repeatedly.
+
+### What Was Ruled Out
+
+- Not a dashboard bug.
+- Not a Mopeka sensor issue.
+- Not just a stale USB state; reboot did not fix it.
+- Not only BlueZ; removing BlueZ helped but did not fully stop the resets.
+- Not just Realtek firmware loading; a firmware swap changed the loaded firmware version but did not stop the resets.
+- Not just basic Bumble advertising; a minimal Bumble advertiser on the StarTech dongle was stable.
+
+### Root Cause
+
+There were two separate userspace conflicts:
+
+1. BlueZ and Bumble were both touching the same GATT adapter.
+2. After BlueZ was removed from the runtime path, the Rotorsync GATT watchdog was still polling the Bumble-owned adapter every 5 seconds with `hciconfig`.
+
+That watchdog polling was enough to reproduce the failure. A minimal Bumble GATT service stayed stable until the same `hciconfig -a` / `hciconfig hciN` polling loop was added. As soon as that loop ran, the HCI socket broke and the controller reset.
+
+### Final Fix
+
+The final stable design is:
+
+- Sensor scanning moved off BlueZ/`bleak` and onto Bumble on the dedicated sensor adapter.
+- `rotorsync.service` no longer declares `Wants=bluetooth.target`.
+- Rotorsync no longer starts `bluetooth.service`.
+- The runtime watchdog no longer polls the live GATT adapter with `hciconfig`.
+- Startup still resolves the GATT adapter by MAC.
+- After startup, the watchdog tracks the same physical USB interface by its sysfs device path and only exits if that path disappears or rebinds to a different `hciN`.
+
+### Verification
+
+After the watchdog change:
+
+- `rotorsync.service` remained active.
+- No new watchdog events were added.
+- No new Bumble `BrokenPipeError` entries appeared.
+- A 15 minute soak test completed with no new kernel resets:
+
+```text
+command tx timeout: 57 -> 57
+Resetting usb device: 58 -> 58
+```
+
+That was the first stable run after the GATT watchdog stopped touching the Bumble-owned adapter.
+
+### Design Rule Going Forward
+
+Once Bumble has opened the GATT adapter:
+
+- do not poll that adapter with `hciconfig`
+- do not have BlueZ manage that same controller
+- do not mix `bleak`/BlueZ calls against the Bumble-owned adapter
+
+If adapter presence must be checked at runtime, use sysfs path tracking instead of controller management commands.
 
 
 ## Known Issues
