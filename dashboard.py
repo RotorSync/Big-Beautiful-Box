@@ -2909,32 +2909,48 @@ def initialize_gpio():
 # Flow meter reset
 flow_reset_scheduled = False
 
+def flow_is_active():
+    """Return True when flow is currently active."""
+    return last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+
 def pulse_flow_reset():
     global flow_reset_scheduled
-    dbg = open("/home/pi/reset_debug.log", "a")
-    dbg.write("pulse called\n")
-    dbg.close()
+    with open("/home/pi/reset_debug.log", "a") as dbg:
+        dbg.write("pulse called\n")
     if not GPIO_AVAILABLE:
+        flow_reset_scheduled = False
+        return
+    if flow_is_active():
+        msg = f"Flow reset blocked: flow still active ({last_flow_rate:.3f} L/s)"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
+        flow_reset_scheduled = False
         return
     try:
-        dbg = open("/home/pi/reset_debug.log", "a")
-        dbg.write("pulsing gpio0\n")
-        dbg.close()
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write("pulsing gpio0\n")
         GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
         time.sleep(config.FLOW_RESET_DURATION)
         GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
-        dbg = open("/home/pi/reset_debug.log", "a")
-        dbg.write("done\n")
-        dbg.close()
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write("done\n")
     except Exception as e:
-        dbg = open("/home/pi/reset_debug.log", "a")
-        dbg.write(str(e) + "\n")
-        dbg.close()
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(str(e) + "\n")
     flow_reset_scheduled = False
 
 def schedule_flow_reset():
     global flow_reset_scheduled
     if flow_reset_scheduled:
+        return
+    if flow_is_active():
+        msg = f"Flow reset not scheduled: flow still active ({last_flow_rate:.3f} L/s)"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
         return
     flow_reset_scheduled = True
     root.after(int(config.FLOW_RESET_DELAY * 1000), pulse_flow_reset)
