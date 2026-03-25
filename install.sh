@@ -82,19 +82,17 @@ sudo usermod -a -G dialout $INSTALL_USER
 python3 -m pip install --break-system-packages --upgrade pip
 python3 -m pip install --break-system-packages bleak bumble
 
-# Step 3: Clone/update IOL-HAT
+# Step 3: Install vendored IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."
-if [ ! -d "$INSTALL_HOME/iol-hat" ]; then
-    cd "$INSTALL_HOME"
-    git clone https://github.com/Pinetek-Networks/iol-hat.git
+if [ ! -d "$SCRIPT_DIR/iol-hat" ]; then
+    log_error "Vendored iol-hat directory is missing from this repo."
+    exit 1
 fi
 
-# Apply Pi 5 fix
-if [ -f "$INSTALL_HOME/iol-hat/src-master-application/iol_osal/osal_irq.c" ]; then
-    sed -i 's|gpiod_chip_open("/dev/gpiochip4")|gpiod_chip_open("/dev/gpiochip0")|g' \
-        "$INSTALL_HOME/iol-hat/src-master-application/iol_osal/osal_irq.c"
-    log_info "Applied Pi 5 GPIO fix"
-fi
+rm -rf "$INSTALL_HOME/iol-hat"
+mkdir -p "$INSTALL_HOME/iol-hat"
+cp -r "$SCRIPT_DIR/iol-hat/"* "$INSTALL_HOME/iol-hat/"
+log_info "Installed vendored iol-hat snapshot from BBB repo"
 
 # Build IOL-HAT
 if [ -d "$INSTALL_HOME/iol-hat/src-master-application" ]; then
