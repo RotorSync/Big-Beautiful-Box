@@ -26,6 +26,12 @@ INSTALL_USER=$(whoami)
 INSTALL_HOME=$HOME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
+OPT_DIR="/opt"
+
+if [ "$INSTALL_USER" != "pi" ]; then
+    log_error "This installer currently expects to run as the pi user."
+    exit 1
+fi
 
 echo ""
 log_info "=========================================="
@@ -64,9 +70,17 @@ sudo apt install -y \
     cmake \
     libgpiod-dev \
     gpiod \
-    netcat-openbsd
+    netcat-openbsd \
+    python3-pip \
+    python3-yaml \
+    bluez \
+    bluez-tools
 
 sudo usermod -a -G dialout $INSTALL_USER
+
+# Install Python packages used by the BLE/Rotorsync stack
+python3 -m pip install --break-system-packages --upgrade pip
+python3 -m pip install --break-system-packages bleak bumble
 
 # Step 3: Clone/update IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."
@@ -103,19 +117,32 @@ if ! grep -q "dtparam=uart0=on" /boot/firmware/config.txt 2>/dev/null; then
     echo -e "\ndtparam=uart0=on\nenable_uart=1" | sudo tee -a /boot/firmware/config.txt > /dev/null
 fi
 
-# Step 5: Install dashboard files
+# Step 5: Install dashboard and Rotorsync files
 log_step "5/7: Installing dashboard files..."
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/src"
 mkdir -p "$INSTALL_DIR/RPi"
+mkdir -p "$INSTALL_DIR/mopeka"
+sudo mkdir -p "$OPT_DIR/src"
+sudo mkdir -p "$OPT_DIR/mopeka"
 
-# Copy files
+# Copy dashboard/runtime files
 cp "$SCRIPT_DIR/dashboard.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/config.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/iolhat.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/start_iol_dashboard.sh" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/src/"* "$INSTALL_DIR/src/"
 cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
+cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
+
+# Copy Rotorsync runtime files to /opt to match service paths
+sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
+sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
+sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
+sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
+sudo cp -r "$SCRIPT_DIR/mopeka/"* "$OPT_DIR/mopeka/"
+sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 # Copy optional files
 [ -f "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" ] && cp "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" "$INSTALL_DIR/"
@@ -125,12 +152,16 @@ cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
 
-# Step 6: Install systemd service
+# Step 6: Install systemd services
 log_step "6/7: Installing systemd service..."
 
 sudo cp "$SCRIPT_DIR/iol_dashboard.service" /etc/systemd/system/
+sudo cp "$SCRIPT_DIR/rotorsync.service" /etc/systemd/system/
+sudo cp "$SCRIPT_DIR/rotorsync_watchdog.service" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable iol_dashboard.service
+sudo systemctl enable rotorsync.service
+sudo systemctl enable rotorsync_watchdog.service
 
 # Step 7: Configure auto-login and screen
 log_step "7/7: Configuring display settings..."
@@ -153,12 +184,14 @@ log_info "Installation Complete!"
 log_info "=========================================="
 echo ""
 log_info "Dashboard installed to: $INSTALL_DIR"
-log_info "Service enabled: iol_dashboard.service"
+log_info "Rotorsync installed to: $OPT_DIR"
+log_info "Services enabled: iol_dashboard.service, rotorsync.service, rotorsync_watchdog.service"
 echo ""
 log_info "Next steps:"
 log_info "  1. Reboot: sudo reboot"
 log_info "  2. Check status: systemctl status iol_dashboard.service"
-log_info "  3. View logs: tail -f ~/iol_dashboard.log"
+log_info "  3. Check BLE status: systemctl status rotorsync.service"
+log_info "  4. View logs: tail -f ~/iol_dashboard.log"
 echo ""
 
 read -p "Reboot now? (y/n) " -n 1 -r
