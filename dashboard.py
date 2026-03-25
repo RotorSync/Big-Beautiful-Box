@@ -23,7 +23,7 @@ def _read_local_version():
     try:
         return VERSION_FILE.read_text().strip()
     except Exception:
-        return "v1.9.4"
+        return "V1.9.40"
 
 
 def _read_git_ref_version(git_ref):
