@@ -106,15 +106,15 @@ fi
 # Step 4: Configure hardware
 log_step "4/7: Configuring hardware..."
 
-# SPI
-if ! grep -q "dtoverlay=spi0-1cs" /boot/firmware/config.txt 2>/dev/null; then
-    sudo sed -i 's/^dtparam=spi=on$/dtoverlay=spi0-1cs/' /boot/firmware/config.txt 2>/dev/null || true
-    echo "dtoverlay=spi0-1cs" | sudo tee -a /boot/firmware/config.txt > /dev/null
-fi
-
-# UART
-if ! grep -q "dtparam=uart0=on" /boot/firmware/config.txt 2>/dev/null; then
-    echo -e "\ndtparam=uart0=on\nenable_uart=1" | sudo tee -a /boot/firmware/config.txt > /dev/null
+# Apply tracked BBB boot/display settings
+BBB_BOOT_CFG="/boot/firmware/config.txt"
+BBB_BOOT_SNIPPET="$SCRIPT_DIR/deploy/boot-firmware-bbb.conf"
+if [ -f "$BBB_BOOT_SNIPPET" ]; then
+    sudo cp "$BBB_BOOT_CFG" "${BBB_BOOT_CFG}.bbb.bak" 2>/dev/null || true
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        grep -Fqx "$line" "$BBB_BOOT_CFG" || echo "$line" | sudo tee -a "$BBB_BOOT_CFG" > /dev/null
+    done < "$BBB_BOOT_SNIPPET"
 fi
 
 # Step 5: Install dashboard and Rotorsync files
@@ -124,6 +124,7 @@ mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/src"
 mkdir -p "$INSTALL_DIR/RPi"
 mkdir -p "$INSTALL_DIR/mopeka"
+mkdir -p "$INSTALL_DIR/deploy"
 sudo mkdir -p "$OPT_DIR/src"
 sudo mkdir -p "$OPT_DIR/mopeka"
 
@@ -136,6 +137,7 @@ cp "$SCRIPT_DIR/start_iol_dashboard.sh" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/src/"* "$INSTALL_DIR/src/"
 cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
 cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
+cp -r "$SCRIPT_DIR/deploy/"* "$INSTALL_DIR/deploy/"
 
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
@@ -167,10 +169,10 @@ sudo systemctl enable rotorsync_watchdog.service
 # Step 7: Configure auto-login and screen
 log_step "7/7: Configuring display settings..."
 
-# GDM3 auto-login
-if [ -f /etc/gdm3/custom.conf ]; then
-    sudo sed -i 's/^#AutomaticLoginEnable =.*/AutomaticLoginEnable = true/' /etc/gdm3/custom.conf
-    sudo sed -i 's/^#AutomaticLogin =.*/AutomaticLogin = pi/' /etc/gdm3/custom.conf
+# GDM3 auto-login / X11 display manager settings
+if [ -f /etc/gdm3/custom.conf ] && [ -f "$SCRIPT_DIR/deploy/gdm3-custom.conf" ]; then
+    sudo cp /etc/gdm3/custom.conf /etc/gdm3/custom.conf.bbb.bak 2>/dev/null || true
+    sudo cp "$SCRIPT_DIR/deploy/gdm3-custom.conf" /etc/gdm3/custom.conf
 fi
 
 # Disable idle timeout
