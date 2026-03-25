@@ -94,7 +94,7 @@ reset_season_cancel_handler = None  # Function to call on cancel
 daily_total = 0.0  # Total gallons pumped today
 season_total = 0.0  # Total gallons pumped this season (until manually reset)
 last_reset_date = None  # Track last daily reset date
-last_load_gallons = 0.0  # Most recent recorded load size
+last_loads_gallons = []  # Most recent recorded load sizes (newest first)
 pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up confirmation
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
@@ -211,22 +211,20 @@ def save_totals():
 
 
 def load_last_load():
-    """Load the most recent recorded actual gallons from fill history."""
-    global last_load_gallons
+    """Load the three most recent recorded actual gallons from fill history."""
+    global last_loads_gallons
 
     try:
         with open('/home/pi/fill_history.log', 'r') as f:
             lines = [line.strip() for line in f if line.strip()]
-        if lines:
-            last_line = lines[-1]
+        last_loads_gallons = []
+        for last_line in reversed(lines[-3:]):
             marker = "Actual: "
             start = last_line.index(marker) + len(marker)
             end = last_line.index(" gal", start)
-            last_load_gallons = float(last_line[start:end])
-        else:
-            last_load_gallons = 0.0
+            last_loads_gallons.append(float(last_line[start:end]))
     except Exception:
-        last_load_gallons = 0.0
+        last_loads_gallons = []
 
 def load_mode_presets():
     """Load fill and mix mode gallon presets from file"""
@@ -683,14 +681,18 @@ def update_totals_display():
 
 
 def update_last_load_display():
-    """Draw the most recent load size in the top-left corner."""
+    """Draw the three most recent load sizes in the top-left corner."""
     canvas.delete("last_load")
     if current_mode == "mix":
         return
+    if last_loads_gallons:
+        load_lines = "\n".join(f"{load:.1f} gal" for load in last_loads_gallons[:3])
+    else:
+        load_lines = "--\n--\n--"
     canvas.create_text(
         20,
         20,
-        text=f"Last Load:\n{last_load_gallons:.1f} gal",
+        text=f"Last Loads:\n{load_lines}",
         font=("Helvetica", 72, "bold"),
         fill="cyan",
         anchor="nw",
@@ -716,7 +718,7 @@ def update_flow_rate_display(flow_rate_gpm):
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_load_gallons
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
@@ -740,7 +742,7 @@ def record_pending_fill():
 
         # Add to daily and season totals
         add_to_totals(pending_fill_gallons)
-        last_load_gallons = pending_fill_gallons
+        last_loads_gallons = [pending_fill_gallons] + last_loads_gallons[:2]
         update_last_load_display()
         print(f"Fill recorded - Actual: {pending_fill_gallons:.3f} gal")
         print(f"Updated totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
@@ -3636,7 +3638,7 @@ if last_reset_date != today_str:
     print(f"Date changed since last reset ({last_reset_date} -> {today_str}) - resetting daily total on startup")
     reset_daily_total()
 print(f"Loaded totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
-print(f"Loaded last load - {last_load_gallons:.2f} gal")
+print(f"Loaded last loads - {last_loads_gallons[:3]}")
 
 # Load mode presets and set initial requested gallons
 load_mode_presets()
