@@ -951,6 +951,16 @@ def show_log_viewer():
     """Display log viewer window with button controls"""
     global log_viewer_mode, log_viewer_window, log_viewer_text
 
+    # Submenus should replace the menu, not stack on top of it.
+    if menu_window:
+        close_menu()
+    if log_viewer_window:
+        try:
+            log_viewer_window.destroy()
+        except Exception:
+            pass
+        log_viewer_window = None
+
     log_viewer_mode = True
     log_viewer_window = tk.Toplevel()
     log_viewer_window.title("System Logs")
@@ -1033,10 +1043,21 @@ def close_log_viewer():
         log_viewer_window.destroy()
         log_viewer_window = None
         log_viewer_text = None
+    show_menu()
 
 def show_fill_history():
     """Display fill history viewer window"""
     global fill_history_mode, fill_history_window, fill_history_text
+
+    # Submenus should replace the menu, not stack on top of it.
+    if menu_window:
+        close_menu()
+    if fill_history_window:
+        try:
+            fill_history_window.destroy()
+        except Exception:
+            pass
+        fill_history_window = None
 
     fill_history_mode = True
     fill_history_window = tk.Toplevel()
@@ -1109,6 +1130,7 @@ def close_fill_history():
         fill_history_window.destroy()
         fill_history_window = None
         fill_history_text = None
+    show_menu()
 
 def run_self_test():
     """Run system self-test"""
@@ -1890,6 +1912,28 @@ def show_daily_reminders():
 def show_menu():
     """Display the main menu"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_position_label
+
+    # Defensive cleanup in case any stale submenu window/mode was left behind.
+    global log_viewer_mode, log_viewer_window, log_viewer_text
+    global fill_history_mode, fill_history_window, fill_history_text
+
+    log_viewer_mode = False
+    if log_viewer_window:
+        try:
+            log_viewer_window.destroy()
+        except Exception:
+            pass
+        log_viewer_window = None
+        log_viewer_text = None
+
+    fill_history_mode = False
+    if fill_history_window:
+        try:
+            fill_history_window.destroy()
+        except Exception:
+            pass
+        fill_history_window = None
+        fill_history_text = None
 
     menu_mode = True
     menu_selected_index = 0  # Start at first item
