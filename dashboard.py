@@ -12,10 +12,36 @@ import os
 import json
 import shlex
 from collections import deque
+from pathlib import Path
 from PIL import Image, ImageTk
 
 # Version
-VERSION = "v1.9.4"
+VERSION_FILE = Path(__file__).with_name("VERSION")
+
+
+def _read_local_version():
+    try:
+        return VERSION_FILE.read_text().strip()
+    except Exception:
+        return "v1.9.4"
+
+
+def _read_git_ref_version(git_ref):
+    try:
+        result = subprocess.run(
+            ['git', '-C', '/home/pi/Big-Beautiful-Box', 'show', f'{git_ref}:VERSION'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+VERSION = _read_local_version()
 
 # Import configuration
 import config
@@ -1542,14 +1568,17 @@ def run_system_update():
             result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/master', '-1', '--format=%s'],
                                   capture_output=True, text=True, timeout=10)
             new_version_msg = result.stdout.strip()
+            new_version = _read_git_ref_version('origin/master') or "(version file missing)"
             if updates_available == 0:
                 status_text.insert(tk.END, "\nAlready up to date.\n")
+                status_text.insert(tk.END, f"Latest Version: {new_version}\n")
                 status_text.insert(tk.END, f"Latest commit:\n{new_version_msg}\n\n")
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 status_text.update()
                 return
 
-            status_text.insert(tk.END, f"\nNew Version Available:\n{new_version_msg}\n")
+            status_text.insert(tk.END, f"\nNew Version Available: {new_version}\n")
+            status_text.insert(tk.END, f"Commit:\n{new_version_msg}\n")
             status_text.insert(tk.END, f"Commits to apply: {updates_available}\n\n")
             status_text.update()
 

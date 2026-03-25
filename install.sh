@@ -27,6 +27,7 @@ INSTALL_HOME=$HOME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
 OPT_DIR="/opt"
+SOFTWARE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")"
 
 if [ "$INSTALL_USER" != "pi" ]; then
     log_error "This installer currently expects to run as the pi user."
@@ -40,6 +41,7 @@ log_info "=========================================="
 echo ""
 log_info "User: $INSTALL_USER"
 log_info "Install directory: $INSTALL_DIR"
+log_info "Software version: $SOFTWARE_VERSION"
 echo ""
 
 # Confirm installation
@@ -128,6 +130,7 @@ sudo mkdir -p "$OPT_DIR/mopeka"
 # Copy dashboard/runtime files
 cp "$SCRIPT_DIR/dashboard.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/config.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/iolhat.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/start_iol_dashboard.sh" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/src/"* "$INSTALL_DIR/src/"
