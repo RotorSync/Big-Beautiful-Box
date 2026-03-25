@@ -74,11 +74,16 @@ FLOW_AVERAGING_SAMPLES = 5  # 5 x 200 ms updates = ~1.0 s average
 #   - 80.6 GPM -> 1.98 gal coast
 #   - 84.4 GPM -> 2.09 gal coast
 #   - 85.0 GPM -> 2.12 gal coast
+# High-band trim from the last 3 clean loads after the flow meter setting change:
+#   - 80.3 GPM -> +0.332 gal over
+#   - 81.1 GPM -> +0.249 gal over
+#   - 82.4 GPM -> +0.173 gal over
+# Average bias = +0.251 gal, so bump the high-band threshold by that amount.
 FLOW_CURVE_SPLIT_GPM = 70.0
 FLOW_CURVE_LOW_SLOPE = 0.02526398752
 FLOW_CURVE_LOW_INTERCEPT = -0.04589977072
 FLOW_CURVE_HIGH_SLOPE = 0.03098360656
-FLOW_CURVE_HIGH_INTERCEPT = -0.51996721311
+FLOW_CURVE_HIGH_INTERCEPT = -0.26863387978
 
 
 # =============================================================================
