@@ -3148,7 +3148,7 @@ def update_mopeka_display():
     
     width = canvas.winfo_width()
     x = width - 20  # 20px from right edge
-    font = ("Helvetica", 54)
+    font = ("Helvetica", 72, "bold")
     
     if not mopeka_connected:
         canvas.create_text(x, 40, text="Tanks: No Signal", font=font,
