@@ -697,6 +697,22 @@ def update_last_load_display():
         tags="last_load",
     )
 
+
+def update_flow_rate_display(flow_rate_gpm):
+    """Draw the current flow rate in the bottom-right corner."""
+    canvas.delete("flow_rate")
+    if current_mode == "mix":
+        return
+    canvas.create_text(
+        canvas.winfo_width() - 10,
+        canvas.winfo_height() - 10,
+        text=f"Flow:\n{flow_rate_gpm:.1f} GPM",
+        font=("Helvetica", 72, "bold"),
+        fill="cyan",
+        anchor="se",
+        tags="flow_rate",
+    )
+
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
@@ -3495,6 +3511,7 @@ def update_dashboard():
     if current_mode != "mix":
         canvas.create_text(10, canvas.winfo_height() - 10, text=f"Today:\n{daily_total:.1f} gal",
                           font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
+    update_flow_rate_display(flow_rate_gpm)
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
