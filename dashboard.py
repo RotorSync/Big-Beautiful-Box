@@ -1531,11 +1531,26 @@ def run_system_update():
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 return
 
+            # Check whether anything new exists on origin/main
+            result = subprocess.run(
+                ['git', '-C', '/home/pi/Big-Beautiful-Box', 'rev-list', '--count', 'HEAD..origin/main'],
+                capture_output=True, text=True, timeout=10
+            )
+            updates_available = int(result.stdout.strip() or "0")
+
             # Get the version we're updating to
             result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/main', '-1', '--format=%s'],
                                   capture_output=True, text=True, timeout=10)
             new_version_msg = result.stdout.strip()
-            status_text.insert(tk.END, f"\nNew Version Available:\n{new_version_msg}\n\n")
+            if updates_available == 0:
+                status_text.insert(tk.END, "\nAlready up to date.\n")
+                status_text.insert(tk.END, f"Latest commit:\n{new_version_msg}\n\n")
+                status_text.insert(tk.END, "Press OV to return to menu\n")
+                status_text.update()
+                return
+
+            status_text.insert(tk.END, f"\nNew Version Available:\n{new_version_msg}\n")
+            status_text.insert(tk.END, f"Commits to apply: {updates_available}\n\n")
             status_text.update()
 
             # Step 2: Reset to latest origin/master
@@ -1559,8 +1574,14 @@ def run_system_update():
             # Wait 2 seconds so user can see the message
             time.sleep(2)
 
-            # Restart via systemd so both IOL master and dashboard restart cleanly
-            subprocess.run(['sudo', 'systemctl', 'restart', 'iol_dashboard'], timeout=30)
+            # Restart via systemd so both IOL master and dashboard restart cleanly.
+            # Launch in the background because the current process will be terminated by the restart.
+            restart_cmd = (
+                "sleep 1; "
+                "printf 'raspi\\n' | sudo -S systemctl restart iol_dashboard.service"
+            )
+            subprocess.Popen(['bash', '-lc', restart_cmd])
+            return
 
         except subprocess.TimeoutExpired:
             status_text.insert(tk.END, "\n\nERROR: Command timed out\n")
