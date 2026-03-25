@@ -2989,17 +2989,29 @@ def initialize_gpio():
 
 # Flow meter reset
 flow_reset_scheduled = False
+flow_reset_cycle_id = None
+flow_cycle_counter = 0
 
 def flow_is_active():
     """Return True when flow is currently active."""
     return last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
 
 def pulse_flow_reset():
-    global flow_reset_scheduled
+    global flow_reset_scheduled, flow_reset_cycle_id
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write("pulse called\n")
     if not GPIO_AVAILABLE:
         flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return
+    if flow_reset_cycle_id != flow_cycle_counter:
+        msg = "Flow reset cancelled: new flow started after reset was requested"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
         return
     if flow_is_active():
         msg = f"Flow reset blocked: flow still active ({last_flow_rate:.3f} L/s)"
@@ -3008,6 +3020,7 @@ def pulse_flow_reset():
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write(msg + "\n")
         flow_reset_scheduled = False
+        flow_reset_cycle_id = None
         return
     try:
         with open("/home/pi/reset_debug.log", "a") as dbg:
@@ -3021,9 +3034,10 @@ def pulse_flow_reset():
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write(str(e) + "\n")
     flow_reset_scheduled = False
+    flow_reset_cycle_id = None
 
 def schedule_flow_reset():
-    global flow_reset_scheduled
+    global flow_reset_scheduled, flow_reset_cycle_id
     if flow_reset_scheduled:
         return
     if flow_is_active():
@@ -3034,6 +3048,7 @@ def schedule_flow_reset():
             dbg.write(msg + "\n")
         return
     flow_reset_scheduled = True
+    flow_reset_cycle_id = flow_cycle_counter
     root.after(int(config.FLOW_RESET_DELAY * 1000), pulse_flow_reset)
 
 
@@ -3329,6 +3344,7 @@ def update_dashboard():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global flow_cycle_counter
 
     actual = read_flow_meter()
 
@@ -3398,6 +3414,7 @@ def update_dashboard():
 
     # Reset colors when new fill cycle starts
     if not was_flowing and is_flowing:
+        flow_cycle_counter += 1
         colors_are_green = False
         # Hide thumbs up when new cycle starts
         if thumbs_up_label:
