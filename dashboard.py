@@ -1531,15 +1531,15 @@ def run_system_update():
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 return
 
-            # Check whether anything new exists on origin/main
+            # Check whether anything new exists on origin/master
             result = subprocess.run(
-                ['git', '-C', '/home/pi/Big-Beautiful-Box', 'rev-list', '--count', 'HEAD..origin/main'],
+                ['git', '-C', '/home/pi/Big-Beautiful-Box', 'rev-list', '--count', 'HEAD..origin/master'],
                 capture_output=True, text=True, timeout=10
             )
             updates_available = int(result.stdout.strip() or "0")
 
             # Get the version we're updating to
-            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/main', '-1', '--format=%s'],
+            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/master', '-1', '--format=%s'],
                                   capture_output=True, text=True, timeout=10)
             new_version_msg = result.stdout.strip()
             if updates_available == 0:
@@ -1557,7 +1557,7 @@ def run_system_update():
             status_text.insert(tk.END, "=== Step 2: Installing update ===\n")
             status_text.update()
 
-            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/main'],
+            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/master'],
                                   capture_output=True, text=True, timeout=30)
             status_text.insert(tk.END, "Updated repository\n")
             status_text.update()
