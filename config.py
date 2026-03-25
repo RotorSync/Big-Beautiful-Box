@@ -60,16 +60,25 @@ IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port powe
 LITERS_TO_GALLONS = 0.264172      # Liters to gallons conversion
 LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 
-# Flow-based shutoff curve coefficients (refit from straight-truck shutoff history)
-# Coast distance (gallons) = FLOW_CURVE_SLOPE * flow_rate_gpm + FLOW_CURVE_INTERCEPT
-# Usable March 2026 shutoff samples:
+# Flow-based shutoff coast calibration
+# Use a short rolling average of flow rather than a single instant sample.
+FLOW_AVERAGING_SAMPLES = 5  # 5 x 200 ms updates = ~1.0 s average
+
+# Piecewise coast model derived from usable March 2026 auto-shutoff samples.
+# Low band samples:
+#   - 42.3 GPM -> 1.02 gal coast
 #   - 48.1 GPM -> 1.18 gal coast
 #   - 59.9 GPM -> 1.45 gal coast
-#   - 68.1 GPM -> 1.68 gal coast
+#   - 65.7 GPM -> 1.62 gal coast
+# High band samples:
 #   - 80.6 GPM -> 1.98 gal coast
+#   - 84.4 GPM -> 2.09 gal coast
 #   - 85.0 GPM -> 2.12 gal coast
-FLOW_CURVE_SLOPE = 0.02535120575      # Slope of coast distance vs flow rate
-FLOW_CURVE_INTERCEPT = -0.05090140095 # Y-intercept of coast distance curve
+FLOW_CURVE_SPLIT_GPM = 70.0
+FLOW_CURVE_LOW_SLOPE = 0.02526398752
+FLOW_CURVE_LOW_INTERCEPT = -0.04589977072
+FLOW_CURVE_HIGH_SLOPE = 0.03098360656
+FLOW_CURVE_HIGH_INTERCEPT = -0.51996721311
 
 
 # =============================================================================

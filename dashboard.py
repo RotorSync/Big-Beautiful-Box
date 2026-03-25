@@ -11,6 +11,7 @@ import subprocess
 import os
 import json
 import shlex
+from collections import deque
 from PIL import Image, ImageTk
 
 # Version
@@ -103,6 +104,7 @@ last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current 
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
 last_trigger_actual = 0.0  # Actual gallons when auto shutoff triggered
+recent_flow_rates_l_per_s = deque(maxlen=config.FLOW_AVERAGING_SAMPLES)
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
@@ -143,14 +145,28 @@ def calculate_trigger_threshold(flow_rate_l_per_s):
     # Convert L/s to GPM
     flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
 
-    # Calculate predicted coast distance using calibration curve
-    # coast_distance = 0.0270833333 * flow_rate_gpm - 0.14583333
-    predicted_coast = config.FLOW_CURVE_SLOPE * flow_rate_gpm + config.FLOW_CURVE_INTERCEPT
+    if flow_rate_gpm <= config.FLOW_CURVE_SPLIT_GPM:
+        predicted_coast = (
+            config.FLOW_CURVE_LOW_SLOPE * flow_rate_gpm
+            + config.FLOW_CURVE_LOW_INTERCEPT
+        )
+    else:
+        predicted_coast = (
+            config.FLOW_CURVE_HIGH_SLOPE * flow_rate_gpm
+            + config.FLOW_CURVE_HIGH_INTERCEPT
+        )
 
     # Ensure we don't have negative threshold (minimum 0.1 gallon before target)
     threshold = max(predicted_coast, 0.1)
 
     return threshold
+
+
+def get_smoothed_flow_rate():
+    """Return a short rolling average of recent flow while flow is active."""
+    if not recent_flow_rates_l_per_s:
+        return last_flow_rate
+    return sum(recent_flow_rates_l_per_s) / len(recent_flow_rates_l_per_s)
 
 def load_totals():
     """Load daily and season totals from files"""
@@ -3305,6 +3321,7 @@ def update_dashboard():
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
     if is_flowing:
+        recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
     # Store fill data when flow stops (don't record yet - wait for thumbs up)
@@ -3316,8 +3333,9 @@ def update_dashboard():
             pending_fill_flow_gpm = last_trigger_flow_gpm
             pending_fill_trigger_threshold = last_trigger_threshold
         else:
-            pending_fill_flow_gpm = last_flowing_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-            pending_fill_trigger_threshold = calculate_trigger_threshold(last_flowing_rate_l_per_s)
+            smoothed_stop_flow_l_per_s = get_smoothed_flow_rate()
+            pending_fill_flow_gpm = smoothed_stop_flow_l_per_s * config.LITERS_PER_SEC_TO_GPM
+            pending_fill_trigger_threshold = calculate_trigger_threshold(smoothed_stop_flow_l_per_s)
 
         # Store pending fill data (will be recorded when thumbs up is pressed)
         pending_fill_gallons = actual
@@ -3349,6 +3367,7 @@ def update_dashboard():
         last_trigger_flow_gpm = 0.0
         last_trigger_threshold = 0.0
         last_trigger_actual = 0.0
+        recent_flow_rates_l_per_s.clear()
         print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
 
     # Update flow state for next cycle
@@ -3368,8 +3387,9 @@ def update_dashboard():
     # If flow meter is disconnected, override stays on indefinitely (no auto-disable)
 
     # Calculate dynamic trigger threshold based on current flow rate
-    flow_rate_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
-    trigger_threshold = calculate_trigger_threshold(last_flow_rate)
+    smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
+    flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
