@@ -97,6 +97,12 @@ last_load_gallons = 0.0  # Most recent recorded load size
 pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up confirmation
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
+pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
+pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
+last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
+last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
+last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
+last_trigger_actual = 0.0  # Actual gallons when auto shutoff triggered
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
@@ -677,15 +683,28 @@ def update_last_load_display():
 
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
-    global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type, thumbs_up_label, last_load_gallons
+    global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_load_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
         fill_log = "/home/pi/fill_history.log"
+        calibration_log = "/home/pi/fill_calibration.log"
 
         # Write to fill history log
         with open(fill_log, 'a') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal | Actual: {pending_fill_gallons:.3f} gal | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal | {pending_fill_shutoff_type}\n")
+
+        # Write detailed calibration record with flow snapshot and threshold in one line
+        with open(calibration_log, 'a') as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
+                f" | Actual: {pending_fill_gallons:.3f} gal"
+                f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
+                f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
+                f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
+                f" | Type: {pending_fill_shutoff_type}\n"
+            )
 
         # Add to daily and season totals
         add_to_totals(pending_fill_gallons)
@@ -698,6 +717,8 @@ def record_pending_fill():
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
+        pending_fill_flow_gpm = 0.0
+        pending_fill_trigger_threshold = 0.0
 
     else:
         print("No pending fill to record")
@@ -3245,6 +3266,9 @@ load_thumbs_up_gif()
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
+    global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
+    global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
 
     actual = read_flow_meter()
 
@@ -3280,19 +3304,31 @@ def update_dashboard():
 
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+    if is_flowing:
+        last_flowing_rate_l_per_s = last_flow_rate
 
     # Store fill data when flow stops (don't record yet - wait for thumbs up)
     if was_flowing and not is_flowing:
-        global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
         # Determine if shutoff was automatic or manual
         shutoff_type = "Auto" if last_alert_triggered else "Manual"
+
+        if shutoff_type == "Auto" and last_trigger_flow_gpm > 0:
+            pending_fill_flow_gpm = last_trigger_flow_gpm
+            pending_fill_trigger_threshold = last_trigger_threshold
+        else:
+            pending_fill_flow_gpm = last_flowing_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+            pending_fill_trigger_threshold = calculate_trigger_threshold(last_flowing_rate_l_per_s)
 
         # Store pending fill data (will be recorded when thumbs up is pressed)
         pending_fill_gallons = actual
         pending_fill_requested = requested_gallons
         pending_fill_shutoff_type = shutoff_type
 
-        print(f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}")
+        print(
+            f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
+            f"Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}, "
+            f"FlowAtStop: {pending_fill_flow_gpm:.1f} GPM, Threshold: {pending_fill_trigger_threshold:.3f}"
+        )
         print(f"Waiting for thumbs up button to record fill...")
 
         # NOTE: Do NOT hide thumbs up when flow stops - keep it visible so user can press it
@@ -3308,6 +3344,11 @@ def update_dashboard():
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
+        pending_fill_flow_gpm = 0.0
+        pending_fill_trigger_threshold = 0.0
+        last_trigger_flow_gpm = 0.0
+        last_trigger_threshold = 0.0
+        last_trigger_actual = 0.0
         print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
 
     # Update flow state for next cycle
@@ -3334,6 +3375,9 @@ def update_dashboard():
     # Only if override mode is OFF and flow meter is connected
     if not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
         last_alert_triggered = True
+        last_trigger_flow_gpm = flow_rate_gpm
+        last_trigger_threshold = trigger_threshold
+        last_trigger_actual = actual
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
         relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
         relay_thread.start()
