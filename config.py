@@ -74,21 +74,17 @@ FLOW_AVERAGING_SAMPLES = 5  # 5 x 200 ms updates = ~1.0 s average
 #   - 80.6 GPM -> 1.98 gal coast
 #   - 84.4 GPM -> 2.09 gal coast
 #   - 85.0 GPM -> 2.12 gal coast
-# High-band trim from the last 3 clean loads after the flow meter setting change:
-#   - 80.3 GPM -> +0.332 gal over
-#   - 81.1 GPM -> +0.249 gal over
-#   - 82.4 GPM -> +0.173 gal over
-# Average bias = +0.251 gal, so bump the high-band threshold by that amount.
-# Recent low-band trim from the last 3 clean loads after the same meter change:
-#   - 34.6 GPM -> -0.324 gal under
-#   - 67.3 GPM -> -0.256 gal under
-#   - 67.3 GPM -> -0.285 gal under
-# Average bias = -0.288 gal, so reduce the low-band threshold by that amount.
+# Refit from the last 11 usable auto loads in fill_calibration.log:
+#   Low band (<= 70 GPM): 29.8, 36.8, 49.0, 59.0, 64.4, 65.0, 68.9
+#   High band (> 70 GPM): 73.2, 75.4, 78.8, 83.1
+# Desired threshold per run is estimated as:
+#   corrected_threshold = logged_threshold + (actual - requested)
+# so underfills reduce the threshold and overfills increase it.
 FLOW_CURVE_SPLIT_GPM = 70.0
-FLOW_CURVE_LOW_SLOPE = 0.02526398752
-FLOW_CURVE_LOW_INTERCEPT = -0.08289977072
-FLOW_CURVE_HIGH_SLOPE = 0.01572778828
-FLOW_CURVE_HIGH_INTERCEPT = 0.93613988658
+FLOW_CURVE_LOW_SLOPE = 0.02543409299521162
+FLOW_CURVE_LOW_INTERCEPT = -0.12819618255920154
+FLOW_CURVE_HIGH_SLOPE = 0.030867814806530995
+FLOW_CURVE_HIGH_INTERCEPT = -0.38336412435696915
 
 
 # =============================================================================
