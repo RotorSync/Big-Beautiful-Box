@@ -165,6 +165,24 @@ Calibration data:
 
 ## Installation
 
+### Deployment Assumptions
+
+These steps assume the target Pi starts from a normal Ubuntu Desktop image with the default desktop/login setup.
+
+- User account is `pi`
+- GDM is the active display manager
+- Network access is available for the initial clone
+- BBB hardware is connected after install as normal
+
+The installer then layers the BBB-specific configuration on top of that default Ubuntu desktop install:
+
+- tracked HDMI and boot settings from `deploy/boot-firmware-bbb.conf`
+- tracked GDM autologin/X11 settings from `deploy/gdm3-custom.conf`
+- vendored `iol-hat` source from this repo
+- dashboard and Rotorsync systemd services
+
+### Install Steps
+
 ```bash
 git clone https://github.com/austins05/Big-Beautiful-Box.git
 cd Big-Beautiful-Box
@@ -172,12 +190,19 @@ chmod +x install.sh
 ./install.sh
 ```
 
+Run the installer as user `pi`, then reboot when it finishes.
+
 The install script configures:
 - Python dependencies
 - HDMI display settings
 - UART on GPIO 14/15
 - Auto-login and screen timeout
 - Systemd services
+
+### Update Branch
+
+Production devices use the on-screen updater to pull from `origin/master`.
+Development can continue on `main`, but anything intended for field updates must also be pushed to `master`.
 
 ## Operational Workflow
 
