@@ -41,6 +41,7 @@ BMS_NOTIFY_UUID = UUID('0000ff01-0000-1000-8000-00805f9b34fb')
 BMS_WRITE_UUID = UUID('0000ff02-0000-1000-8000-00805f9b34fb')
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
 MOPEKA2_MAC_SUFFIX = ''
+BMS_ENABLED = False  # Temporary isolation: disable BMS reads while tracing hci1 failures
 # Timing configuration
 SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
@@ -75,6 +76,7 @@ SENSOR_CSV_PATH = os.path.join(MOPEKA_DIR, 'mopeka-sensor-details.csv')
 CALIBRATION_CSV_PATH = os.path.join(MOPEKA_DIR, 'calibration-points-1070gal-tank.csv')
 MOPEKA_CONFIG_PATH = os.path.join(MOPEKA_DIR, 'mopeka_config.json')
 WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
+GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
 
 # Sensor data with timestamps
 sensor_data = {
@@ -236,6 +238,16 @@ def log_watchdog_event(reason):
             f.write(line + '\n')
     except Exception as e:
         print(f'Watchdog log write error: {e}', flush=True)
+
+
+def persist_gatt_device_path(device_path):
+    """Persist the current GATT adapter sysfs path for the watchdog."""
+    try:
+        path_str = str(device_path) if device_path else ''
+        with open(GATT_DEVICE_PATH_FILE, 'w', encoding='utf-8') as f:
+            f.write(path_str + '\n')
+    except Exception as e:
+        print(f'Failed to persist GATT device path: {e}', flush=True)
 
 async def monitor_gatt_adapter(expected_adapter, expected_device_path):
     """Exit so systemd can restart if the GATT adapter is re-enumerated."""
@@ -1275,7 +1287,10 @@ async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data
 
     print(f"Sensor reader started on {sensor_adapter}", flush=True)
-    print(f"Scan interval: {SCAN_INTERVAL}s, BMS every {BMS_READ_INTERVAL} cycles", flush=True)
+    if BMS_ENABLED:
+        print(f"Scan interval: {SCAN_INTERVAL}s, BMS every {BMS_READ_INTERVAL} cycles", flush=True)
+    else:
+        print(f"Scan interval: {SCAN_INTERVAL}s, BMS polling disabled", flush=True)
     print(f"Auto-recovery after {MAX_CONSECUTIVE_FAILURES} failures", flush=True)
 
     cycle_count = 0
@@ -1312,7 +1327,7 @@ async def read_sensors(sensor_device, sensor_adapter):
             mopeka_failures += 1
             print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
 
-        if cycle_count % BMS_READ_INTERVAL == 0:
+        if BMS_ENABLED and cycle_count % BMS_READ_INTERVAL == 0:
             try:
                 if await read_bms(sensor_device, current_time):
                     bms_failures = 0
@@ -1343,15 +1358,12 @@ async def main():
     gatt_adapter_index = int(gatt_adapter.replace('hci', ''))
     sensor_adapter_index = int(sensor_adapter.replace('hci', '')) if sensor_adapter else None
     gatt_device_path = get_adapter_device_path(gatt_adapter)
+    persist_gatt_device_path(gatt_device_path)
     print(f'GATT adapter: {gatt_adapter} ({GATT_ADAPTER_MAC})', flush=True)
     if sensor_adapter:
         print(f'Sensor adapter: {sensor_adapter} ({SENSOR_ADAPTER_MAC})', flush=True)
 
-    subprocess.run(['hciconfig', gatt_adapter, 'down'], capture_output=True)
-    await asyncio.sleep(0.5)
     subprocess.run(['systemctl', 'stop', 'bluetooth.service'], capture_output=True)
-    if sensor_adapter:
-        subprocess.run(['hciconfig', sensor_adapter, 'down'], capture_output=True)
     await asyncio.sleep(0.5)
 
     sensor_device = None
