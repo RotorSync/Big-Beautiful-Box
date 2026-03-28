@@ -41,7 +41,7 @@ BMS_NOTIFY_UUID = UUID('0000ff01-0000-1000-8000-00805f9b34fb')
 BMS_WRITE_UUID = UUID('0000ff02-0000-1000-8000-00805f9b34fb')
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
 MOPEKA2_MAC_SUFFIX = ''
-BMS_ENABLED = False  # Temporary isolation: disable BMS reads while tracing hci1 failures
+BMS_ENABLED = True
 # Timing configuration
 SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
@@ -1217,7 +1217,7 @@ async def read_bms(sensor_device, current_time):
     try:
         connection = await sensor_device.connect(
             BMS_MAC,
-            own_address_type=hci.OwnAddressType.PUBLIC,
+            own_address_type=hci.OwnAddressType.RANDOM,
             timeout=BMS_TIMEOUT,
         )
         peer = Peer(connection)
@@ -1333,7 +1333,11 @@ async def read_sensors(sensor_device, sensor_adapter):
                     bms_failures = 0
             except Exception as e:
                 bms_failures += 1
-                print(f'BMS error ({bms_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
+                print(
+                    f'BMS error ({bms_failures}/{MAX_CONSECUTIVE_FAILURES}) '
+                    f'{type(e).__name__}: {e!r}',
+                    flush=True,
+                )
 
         await asyncio.sleep(SCAN_INTERVAL)
 
