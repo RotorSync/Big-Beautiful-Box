@@ -34,6 +34,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
 OPT_DIR="/opt"
 SOFTWARE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")"
+REPO_URL="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
+REPO_BRANCH="master"
 
 if [ "$INSTALL_USER" != "pi" ]; then
     log_error "This installer currently expects to run as the pi user."
@@ -146,7 +148,26 @@ fi
 # Step 5: Install dashboard and Rotorsync files
 log_step "5/7: Installing dashboard files..."
 
-mkdir -p "$INSTALL_DIR"
+if [ -n "$REPO_URL" ]; then
+    if git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log_info "Refreshing BBB git checkout in $INSTALL_DIR"
+        git -C "$INSTALL_DIR" fetch origin
+        git -C "$INSTALL_DIR" checkout -f "$REPO_BRANCH"
+        git -C "$INSTALL_DIR" reset --hard "origin/$REPO_BRANCH"
+    else
+        [ -d "$INSTALL_DIR" ] && mv "$INSTALL_DIR" "${INSTALL_DIR}.pre-git-backup.$(date +%Y%m%d-%H%M%S)"
+        log_info "Cloning BBB repo into $INSTALL_DIR"
+        git clone --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    fi
+else
+    log_warn "Installer repo has no origin remote; installing plain files and GitHub updater will not work on this box."
+    mkdir -p "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR/src"
+    mkdir -p "$INSTALL_DIR/RPi"
+    mkdir -p "$INSTALL_DIR/mopeka"
+    mkdir -p "$INSTALL_DIR/deploy"
+fi
+
 mkdir -p "$INSTALL_DIR/src"
 mkdir -p "$INSTALL_DIR/RPi"
 mkdir -p "$INSTALL_DIR/mopeka"
@@ -164,6 +185,7 @@ cp -r "$SCRIPT_DIR/src/"* "$INSTALL_DIR/src/"
 cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
 cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
 cp -r "$SCRIPT_DIR/deploy/"* "$INSTALL_DIR/deploy/"
+cp "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/"
 
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
