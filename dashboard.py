@@ -1759,18 +1759,18 @@ def update_menu_highlight():
     if menu_position_label:
         menu_position_label.config(text=f"Option {menu_selected_index + 1} of 10: {menu_items_names[menu_selected_index]}")
 
-    # Default colors for each button
+    # High-contrast unselected palette for sunlight readability.
     colors = [
-        ("blue", "white"),       # Logs
-        ("purple", "white"),     # Fill History
-        ("cyan", "white"),       # Full Test
-        ("orange", "white"),     # Reset Season
-        ("green", "white"),      # Self Test
-        ("purple", "white"),     # Update
-        ("red", "white"),        # Shutdown
-        ("orange", "white"),     # Reboot
-        ("red4", "white"),       # Exit to Desktop
-        ("gray30", "white")      # Exit Menu
+        ("#d7efff", "#111111"),  # Logs
+        ("#eadcff", "#111111"),  # Fill History
+        ("#d8ffff", "#111111"),  # Full Test
+        ("#ffe3bf", "#111111"),  # Reset Season
+        ("#dff7d9", "#111111"),  # Self Test
+        ("#eadcff", "#111111"),  # Update
+        ("#ffd6d6", "#111111"),  # Shutdown
+        ("#ffe3bf", "#111111"),  # Reboot
+        ("#ffc9c9", "#111111"),  # Exit to Desktop
+        ("#e3e3e3", "#111111"),  # Exit Menu
     ]
 
     for i, (btn, arrow) in enumerate(zip(menu_buttons, menu_arrows)):
@@ -1784,9 +1784,11 @@ def update_menu_highlight():
             arrow.config(text=">>> SELECTED >>>", fg="yellow",
                         font=("Helvetica", 20, "bold"))
         else:
-            # Unselected - Dim it
-            btn.config(bg="gray20", fg="gray50",
-                      font=("Helvetica", 22),
+            # Unselected - Keep it bright enough to read in direct sun.
+            bg, fg = colors[i]
+            btn.config(bg=bg, fg=fg,
+                      activebackground=bg, activeforeground=fg,
+                      font=("Helvetica", 22, "bold"),
                       relief=tk.FLAT, borderwidth=2,
                       width=18, height=1)
             arrow.config(text="", fg="black")
