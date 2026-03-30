@@ -139,6 +139,8 @@ STALE_RAW_THRESHOLD = 25  # Identical raw reads before flagging (25 * 200ms = 5 
 last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
 iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
 override_enabled_time = 0  # Timestamp when override mode was last enabled
+last_ui_serial_command = None  # Last UI/menu command received from switch box
+last_ui_serial_command_time = 0.0
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
 fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
@@ -2003,6 +2005,13 @@ def show_menu():
         fill_history_window = None
         fill_history_text = None
 
+    if menu_window:
+        try:
+            menu_window.destroy()
+        except Exception:
+            pass
+        menu_window = None
+
     menu_mode = True
     menu_selected_index = 0  # Start at first item
     menu_buttons = []
@@ -2217,6 +2226,21 @@ def show_menu():
 
     # Apply initial highlight
     update_menu_highlight()
+
+def should_debounce_ui_serial_command(line):
+    """Ignore repeated switch-box UI pulses that would double-navigate/select."""
+    global last_ui_serial_command, last_ui_serial_command_time
+
+    if line not in {'OV', '+1', '-1', 'PS'}:
+        return False
+
+    now = time.time()
+    if line == last_ui_serial_command and (now - last_ui_serial_command_time) < 0.25:
+        return True
+
+    last_ui_serial_command = line
+    last_ui_serial_command_time = now
+    return False
 
 def iol_power_cycle():
     """Power-cycle the IOL port in a background thread to trigger re-negotiation.
@@ -2735,6 +2759,21 @@ def serial_listener():
                                 last_heartbeat_time = time.time()
                                 log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
+
+                            ui_mode_active = any([
+                                exit_confirm_window,
+                                reset_season_confirm_window,
+                                reminders_mode,
+                                log_viewer_mode,
+                                fill_history_mode,
+                                self_test_mode,
+                                full_test_mode,
+                                update_mode,
+                                menu_mode,
+                            ])
+                            if ui_mode_active and should_debounce_ui_serial_command(line):
+                                log_serial_debug(f"Debounced repeated UI command: '{line}'")
+                                continue
 
                             # Handle exit confirmation dialog
                             if exit_confirm_window:
