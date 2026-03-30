@@ -3351,23 +3351,32 @@ thumbs_up_animation_id = None
 def load_thumbs_up_gif():
     """Load thumbs up image (PNG or GIF) for display"""
     global thumbs_up_frames, thumbs_up_label
-    
-    png_path = "/home/pi/thumbs_up.png"
-    gif_path = "/home/pi/thumbs_up.gif"
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    png_candidates = [
+        os.path.join(script_dir, "thumbs_up.png"),
+        "/home/pi/thumbs_up.png",
+    ]
+    gif_candidates = [
+        os.path.join(script_dir, "thumbs_up.gif"),
+        "/home/pi/thumbs_up.gif",
+    ]
     
     try:
         from PIL import Image, ImageTk
-        import os
-        
+
+        png_path = next((path for path in png_candidates if os.path.exists(path)), None)
+        gif_path = next((path for path in gif_candidates if os.path.exists(path)), None)
+
         # Try PNG first
-        if os.path.exists(png_path):
+        if png_path:
             img = Image.open(png_path)
             # Resize to fit nicely on screen
             img = img.resize((533, 533), Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             thumbs_up_frames = [photo]
-            print(f"Loaded thumbs up from PNG")
-        elif os.path.exists(gif_path):
+            print(f"Loaded thumbs up from PNG: {png_path}")
+        elif gif_path:
             img = Image.open(gif_path)
             # Extract all frames from GIF
             thumbs_up_frames = []
@@ -3388,11 +3397,11 @@ def load_thumbs_up_gif():
         if thumbs_up_frames:
             thumbs_up_label = tk.Label(root, image=thumbs_up_frames[0], bg="black")
         else:
-            thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 400, "bold"),
+            thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 400, "bold"),
                                        foreground="green", background="black")
     except Exception as e:
         print(f"Could not load thumbs up image: {e}")
-        thumbs_up_label = tk.Label(root, text="OK", font=("Helvetica", 400, "bold"),
+        thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 400, "bold"),
                                    foreground="green", background="black")
 def animate_thumbs_up():
     """Animate the thumbs up GIF"""

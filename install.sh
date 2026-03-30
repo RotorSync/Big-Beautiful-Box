@@ -16,6 +16,12 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
 
+append_if_missing() {
+    local file="$1"
+    local line="$2"
+    grep -Fqx "$line" "$file" || echo "$line" | sudo tee -a "$file" > /dev/null
+}
+
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then
     log_error "Do not run as root. Run as the pi user."
@@ -109,12 +115,32 @@ log_step "4/7: Configuring hardware..."
 # Apply tracked BBB boot/display settings
 BBB_BOOT_CFG="/boot/firmware/config.txt"
 BBB_BOOT_SNIPPET="$SCRIPT_DIR/deploy/boot-firmware-bbb.conf"
+UART_CHANGED=0
 if [ -f "$BBB_BOOT_SNIPPET" ]; then
     sudo cp "$BBB_BOOT_CFG" "${BBB_BOOT_CFG}.bbb.bak" 2>/dev/null || true
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        grep -Fqx "$line" "$BBB_BOOT_CFG" || echo "$line" | sudo tee -a "$BBB_BOOT_CFG" > /dev/null
+        if ! grep -Fqx "$line" "$BBB_BOOT_CFG"; then
+            echo "$line" | sudo tee -a "$BBB_BOOT_CFG" > /dev/null
+            case "$line" in
+                enable_uart=*|dtparam=uart0=*|dtoverlay=disable-bt)
+                    UART_CHANGED=1
+                    ;;
+            esac
+        fi
     done < "$BBB_BOOT_SNIPPET"
+fi
+
+# Explicitly enforce BBB UART settings for the switch box serial link.
+for uart_line in "enable_uart=0" "dtparam=uart0=on" "dtoverlay=disable-bt"; do
+    if ! grep -Fqx "$uart_line" "$BBB_BOOT_CFG"; then
+        append_if_missing "$BBB_BOOT_CFG" "$uart_line"
+        UART_CHANGED=1
+    fi
+done
+
+if [ "$UART_CHANGED" -eq 1 ]; then
+    log_warn "Applied UART boot settings for /dev/ttyAMA0. A reboot is required before the switch box serial link will work."
 fi
 
 # Step 5: Install dashboard and Rotorsync files
@@ -150,6 +176,7 @@ sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 # Copy optional files
 [ -f "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" ] && cp "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" "$INSTALL_DIR/"
 [ -f "$SCRIPT_DIR/thumbs_up.png" ] && cp "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_DIR/"
+[ -f "$SCRIPT_DIR/thumbs_up.png" ] && cp "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_HOME/"
 [ -f "$SCRIPT_DIR/README.md" ] && cp "$SCRIPT_DIR/README.md" "$INSTALL_DIR/"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
@@ -194,7 +221,8 @@ log_info "Next steps:"
 log_info "  1. Reboot: sudo reboot"
 log_info "  2. Check status: systemctl status iol_dashboard.service"
 log_info "  3. Check BLE status: systemctl status rotorsync.service"
-log_info "  4. View logs: tail -f ~/iol_dashboard.log"
+log_info "  4. After reboot, confirm serial: ls -l /dev/ttyAMA0"
+log_info "  5. View logs: tail -f ~/iol_dashboard.log"
 echo ""
 
 read -p "Reboot now? (y/n) " -n 1 -r
