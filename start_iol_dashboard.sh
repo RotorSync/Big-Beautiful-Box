@@ -40,19 +40,17 @@ if [ -d "$HOME/iol-hat/src-master-application" ]; then
     cd "$HOME/iol-hat/src-master-application"
 
     if [ -f "/home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl" ]; then
-        # Prefer real-time scheduling (FIFO) on core 3; fall back to normal if unavailable.
-        if command -v chrt >/dev/null 2>&1; then
-            if sudo -n chrt -f 80 taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 & then
-                IOL_MASTER_PID=$!
-                echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_FIFO 80, core 3)" >> "$LOG_FILE"
-            else
-                echo "$(date): WARNING: RT launch failed; starting IOL master without RT scheduling" >> "$LOG_FILE"
-                taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 &
-                IOL_MASTER_PID=$!
-                echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_OTHER, core 3)" >> "$LOG_FILE"
-            fi
+        # Prefer real-time scheduling (FIFO) on core 3, but only if passwordless sudo is actually available.
+        if command -v chrt >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+            sudo -n chrt -f 80 taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 &
+            IOL_MASTER_PID=$!
+            echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_FIFO 80, core 3)" >> "$LOG_FILE"
         else
-            echo "$(date): WARNING: chrt not found; starting IOL master without RT scheduling" >> "$LOG_FILE"
+            if command -v chrt >/dev/null 2>&1; then
+                echo "$(date): WARNING: RT launch unavailable; starting IOL master without RT scheduling" >> "$LOG_FILE"
+            else
+                echo "$(date): WARNING: chrt not found; starting IOL master without RT scheduling" >> "$LOG_FILE"
+            fi
             taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 &
             IOL_MASTER_PID=$!
             echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_OTHER, core 3)" >> "$LOG_FILE"
