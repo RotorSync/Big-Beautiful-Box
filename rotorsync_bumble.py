@@ -37,6 +37,7 @@ DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 9999
 
 BMS_MAC = 'A5:C2:37:31:77:C0'
+BMS_NAME = 'TR2-BMS'
 BMS_NOTIFY_UUID = UUID('0000ff01-0000-1000-8000-00805f9b34fb')
 BMS_WRITE_UUID = UUID('0000ff02-0000-1000-8000-00805f9b34fb')
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
@@ -159,6 +160,33 @@ def query_dashboard_status():
         except Exception as e:
             print(f'Status parse error: {e}', flush=True)
     return False
+
+
+def _extract_jbd_frame(buffer, expected_function=None):
+    """Extract the first complete JBD frame from a notification buffer."""
+    start = buffer.find(b'\xDD')
+    while start != -1:
+        if len(buffer) - start < 7:
+            return None
+
+        function = buffer[start + 1]
+        data_len = buffer[start + 3]
+        frame_len = 4 + data_len + 3
+        end = start + frame_len
+        if len(buffer) < end:
+            return None
+
+        frame = bytes(buffer[start:end])
+        del buffer[:end]
+        if frame[-1] != 0x77:
+            start = buffer.find(b'\xDD')
+            continue
+        if expected_function is not None and function != expected_function:
+            start = buffer.find(b'\xDD')
+            continue
+        return frame
+
+    return None
 
 def find_adapter_by_mac(mac):
     """Find hci index by MAC address"""
@@ -1207,19 +1235,31 @@ async def scan_mopeka(sensor_device, current_time):
     return mopeka_found
 
 async def read_bms(sensor_device, current_time):
-    response = bytearray()
+    response_buffer = bytearray()
     notification_received = asyncio.Event()
     connection = None
     peer = None
     notify_char = None
+    write_char = None
     subscriber = None
 
     try:
-        connection = await sensor_device.connect(
-            BMS_MAC,
-            own_address_type=hci.OwnAddressType.RANDOM,
-            timeout=BMS_TIMEOUT,
-        )
+        connect_errors = []
+        for target in (BMS_NAME, BMS_MAC):
+            try:
+                connection = await sensor_device.connect(
+                    target,
+                    own_address_type=hci.OwnAddressType.RANDOM,
+                    timeout=BMS_TIMEOUT,
+                )
+                print(f'BMS connected via {target}', flush=True)
+                break
+            except Exception as e:
+                connect_errors.append(f'{target}: {type(e).__name__} {e!r}')
+
+        if connection is None:
+            raise TimeoutError('; '.join(connect_errors))
+
         peer = Peer(connection)
         await peer.discover_services()
         notify_chars = await peer.discover_characteristics(uuids=[BMS_NOTIFY_UUID])
@@ -1232,18 +1272,35 @@ async def read_bms(sensor_device, current_time):
         write_char = write_chars[0]
 
         def on_bms_notification(value):
-            response.extend(value)
+            response_buffer.extend(value)
             notification_received.set()
 
         subscriber = on_bms_notification
         await peer.subscribe(notify_char, subscriber)
+        # Match the older working flow: wake/prime with cell-info, then request hw-info.
+        await peer.write_value(write_char, jbd_cmd(0x04), with_response=False)
+        await asyncio.sleep(1.0)
+        notification_received.clear()
+        response_buffer.clear()
         await peer.write_value(write_char, jbd_cmd(0x03), with_response=False)
-        await asyncio.wait_for(notification_received.wait(), timeout=1.5)
 
-        if len(response) <= 20:
-            raise RuntimeError(f'BMS response too short ({len(response)} bytes)')
+        hwinfo_frame = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            await asyncio.wait_for(notification_received.wait(), timeout=max(0.1, deadline - time.time()))
+            notification_received.clear()
+            hwinfo_frame = _extract_jbd_frame(response_buffer, expected_function=0x03)
+            if hwinfo_frame is not None:
+                break
 
-        d = response[4:]
+        if hwinfo_frame is None:
+            raise RuntimeError('Timed out waiting for complete BMS hardware-info frame')
+
+        payload_len = hwinfo_frame[3]
+        d = hwinfo_frame[4:4 + payload_len]
+        if len(d) < 23:
+            raise RuntimeError(f'BMS hardware-info payload too short ({len(d)} bytes)')
+
         sensor_data['bms'] = {
             'voltage': round(int.from_bytes(d[0:2], 'big') * 0.01, 2),
             'soc': d[19],
