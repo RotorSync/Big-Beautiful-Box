@@ -46,7 +46,7 @@ BMS_ENABLED = True
 SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
 SCAN_INTERVAL = 15
-BMS_READ_INTERVAL = 2
+BMS_READ_INTERVAL = 20  # 20 * 15s scan interval = 5 minutes
 STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
 
 # Recovery settings
@@ -1338,6 +1338,8 @@ async def read_sensors(sensor_device, sensor_adapter):
             try:
                 if await read_bms(sensor_device, current_time):
                     bms_failures = 0
+                    bms = sensor_data["bms"]
+                    send_dashboard_command(f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
             except Exception as e:
                 bms_failures += 1
                 print(

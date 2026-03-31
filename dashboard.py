@@ -172,6 +172,8 @@ mopeka1_level_mm = 0.0
 mopeka2_level_mm = 0.0
 mopeka1_level_in = 0.0
 mopeka2_level_in = 0.0
+bms_soc = None
+bms_voltage = None
 
 # Tank calibration workflow state
 calibration_mode = False
@@ -764,6 +766,40 @@ def update_last_load_display():
         fill="cyan",
         anchor="nw",
         tags="last_load",
+    )
+
+
+def update_bms_display():
+    """Draw battery SOC below the last-load block on the left side."""
+    canvas.delete("bms_display")
+    if current_mode == "mix":
+        return
+
+    title_font = ("Helvetica", 72, "bold")
+    value_font = ("Helvetica", 84, "bold")
+
+    if bms_soc is None:
+        value_text = "--"
+    else:
+        value_text = f"{int(round(bms_soc))}%"
+
+    canvas.create_text(
+        20,
+        405,
+        text="Battery:",
+        font=title_font,
+        fill="cyan",
+        anchor="nw",
+        tags="bms_display",
+    )
+    canvas.create_text(
+        20,
+        483,
+        text=value_text,
+        font=value_font,
+        fill="cyan",
+        anchor="nw",
+        tags="bms_display",
     )
 
 
@@ -3017,6 +3053,14 @@ def socket_command_listener():
                                 except Exception as me:
                                     print(f"Mopeka raw parse error: {me}", flush=True)
 
+                            elif line.startswith("BMS:"):
+                                try:
+                                    parts = line[4:].split("|")
+                                    if len(parts) >= 2:
+                                        root.after(0, _apply_bms, float(parts[0]), float(parts[1]))
+                                except Exception as be:
+                                    print(f"BMS parse error: {be}", flush=True)
+
                             elif line == "HISTORY":
                                 try:
                                     with open("/home/pi/fill_history.log", "r") as hf:
@@ -3616,6 +3660,13 @@ def _apply_mopeka_raw(m1mm, m2mm, m1in, m2in):
     mopeka2_level_in = m2in
 
 
+def _apply_bms(soc, voltage):
+    global bms_soc, bms_voltage
+    bms_soc = soc
+    bms_voltage = voltage
+    update_bms_display()
+
+
 def _mopeka_offline():
     """Mark mopeka sensors as offline and update display"""
     global mopeka_connected
@@ -4182,6 +4233,7 @@ print(f"Loaded mode - Mode: {current_mode}, Requested: {requested_gallons}, Fill
 # Redraw requested gallons with the loaded value
 draw_requested_number(f"{requested_gallons:.0f}", "red")
 update_last_load_display()
+update_bms_display()
 
 # Start serial listener in background thread (works without IOL)
 serial_thread = threading.Thread(target=serial_listener, daemon=True)
