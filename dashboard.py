@@ -1778,10 +1778,11 @@ def update_menu_highlight():
             # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
             btn.config(bg="#111111", fg="#ffff00",
                       activebackground="#111111", activeforeground="#ffff00",
-                      font=("Helvetica", 23, "bold"),
+                      font=("Helvetica", 28, "bold"),
                       relief=tk.RAISED, borderwidth=6,
                       highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
-                      width=18, height=1)
+                      width=16, height=2,
+                      wraplength=360, justify=tk.CENTER)
             arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
                         font=("Helvetica", 20, "bold"))
         else:
@@ -1789,9 +1790,10 @@ def update_menu_highlight():
             bg, fg = colors[i]
             btn.config(bg=bg, fg=fg,
                       activebackground=bg, activeforeground=fg,
-                      font=("Helvetica", 22, "bold"),
+                      font=("Helvetica", 28, "bold"),
                       relief=tk.FLAT, borderwidth=2,
-                      width=18, height=1)
+                      width=16, height=2,
+                      wraplength=360, justify=tk.CENTER)
             arrow.config(text="", fg="black")
 
 def menu_navigate_up():
@@ -2104,126 +2106,66 @@ def show_menu():
                                     fg="#ffffff", bg='#0a0a0a')
     menu_position_label.pack(pady=2)
 
-    # Menu buttons frame with professional styling
+    # Menu buttons frame with two-column layout for larger text.
     button_frame = tk.Frame(menu_window, bg='#0a0a0a')
-    button_frame.pack(expand=True, pady=2)
+    button_frame.pack(expand=True, fill=tk.BOTH, padx=24, pady=6)
+    button_frame.grid_columnconfigure(0, weight=1, uniform="menu")
+    button_frame.grid_columnconfigure(1, weight=1, uniform="menu")
 
-    # View Logs button with arrow
-    logs_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    logs_arrow.pack()
-    logs_btn = tk.Button(button_frame, text="VIEW LOGS", font=("Helvetica", 22, "bold"),
-                         bg="blue", fg="white", command=show_log_viewer,
-                         width=18, height=1, borderwidth=2)
-    logs_btn.pack(pady=2)
-    menu_buttons.append(logs_btn)
-    menu_arrows.append(logs_arrow)
+    menu_actions = [
+        ("VIEW LOGS", show_log_viewer),
+        ("FILL HISTORY", show_fill_history),
+        ("FULL TEST", run_full_test),
+        ("RESET SEASON", lambda: confirm_reset_season()),
+        ("SELF TEST", run_self_test),
+        ("SYSTEM UPDATE", run_system_update),
+        ("SHUTDOWN", shutdown_system),
+        ("REBOOT", reboot_system),
+        ("EXIT TO DESKTOP", exit_to_desktop),
+        ("EXIT MENU", close_menu),
+    ]
 
-    # Fill History button with arrow
-    fill_history_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    fill_history_arrow.pack()
-    fill_history_btn = tk.Button(button_frame, text="FILL HISTORY", font=("Helvetica", 22, "bold"),
-                         bg="purple", fg="white", command=show_fill_history,
-                         width=18, height=1, borderwidth=2)
-    fill_history_btn.pack(pady=2)
-    menu_buttons.append(fill_history_btn)
-    menu_arrows.append(fill_history_arrow)
+    for index, (label, action) in enumerate(menu_actions):
+        row = index // 2
+        column = index % 2
 
-    # Full Test button with arrow
-    full_test_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    full_test_arrow.pack()
-    full_test_btn = tk.Button(button_frame, text="FULL TEST", font=("Helvetica", 22, "bold"),
-                         bg="cyan", fg="white", command=run_full_test,
-                         width=18, height=1, borderwidth=2)
-    full_test_btn.pack(pady=2)
-    menu_buttons.append(full_test_btn)
-    menu_arrows.append(full_test_arrow)
+        cell = tk.Frame(button_frame, bg='#0a0a0a')
+        cell.grid(row=row, column=column, sticky="nsew", padx=12, pady=8)
+        cell.grid_columnconfigure(0, weight=1)
 
-    # Reset Season button with arrow - MOVED HERE TO INDEX 3
-    reset_season_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                                 fg="#ffff00", bg="#0a0a0a")
-    reset_season_arrow.pack()
-    reset_season_btn = tk.Button(button_frame, text="RESET SEASON", font=("Helvetica", 22, "bold"),
-                                bg="orange", fg="white", command=lambda: confirm_reset_season(),
-                                width=18, height=1, borderwidth=2)
-    reset_season_btn.pack(pady=2)
-    menu_buttons.append(reset_season_btn)
-    menu_arrows.append(reset_season_arrow)
+        arrow = tk.Label(
+            cell,
+            text="",
+            font=("Helvetica", 20, "bold"),
+            fg="#00ffff",
+            bg="#0a0a0a",
+        )
+        arrow.grid(row=0, column=0, pady=(0, 4))
 
-    # Self Test button with arrow - NOW AT INDEX 4
-    test_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    test_arrow.pack()
-    test_btn = tk.Button(button_frame, text="SELF TEST", font=("Helvetica", 22, "bold"),
-                         bg="green", fg="white", command=run_self_test,
-                         width=18, height=1, borderwidth=2)
-    test_btn.pack(pady=2)
-    menu_buttons.append(test_btn)
-    menu_arrows.append(test_arrow)
+        btn = tk.Button(
+            cell,
+            text=label,
+            font=("Helvetica", 28, "bold"),
+            bg="white",
+            fg="black",
+            command=action,
+            width=16,
+            height=2,
+            borderwidth=3,
+            wraplength=360,
+            justify=tk.CENTER,
+        )
+        btn.grid(row=1, column=0, sticky="nsew")
 
-    # Update button with arrow - NOW AT INDEX 5
-    update_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                           fg="#ffff00", bg="#0a0a0a")
-    update_arrow.pack()
-    update_btn = tk.Button(button_frame, text="SYSTEM UPDATE", font=("Helvetica", 22, "bold"),
-                          bg="purple", fg="white", command=run_system_update,
-                          width=18, height=1, borderwidth=2)
-    update_btn.pack(pady=2)
-    menu_buttons.append(update_btn)
-    menu_arrows.append(update_arrow)
-
-    # Shutdown button with arrow
-    shutdown_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                             fg="#ffff00", bg="#0a0a0a")
-    shutdown_arrow.pack()
-    shutdown_btn = tk.Button(button_frame, text="SHUTDOWN", font=("Helvetica", 22, "bold"),
-                            bg="red", fg="white", command=shutdown_system,
-                            width=18, height=1, borderwidth=2)
-    shutdown_btn.pack(pady=2)
-    menu_buttons.append(shutdown_btn)
-    menu_arrows.append(shutdown_arrow)
-
-    # Reboot button with arrow
-    reboot_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                           fg="#ffff00", bg="#0a0a0a")
-    reboot_arrow.pack()
-    reboot_btn = tk.Button(button_frame, text="REBOOT", font=("Helvetica", 22, "bold"),
-                          bg="orange", fg="white", command=reboot_system,
-                          width=18, height=1, borderwidth=2)
-    reboot_btn.pack(pady=2)
-    menu_buttons.append(reboot_btn)
-    menu_arrows.append(reboot_arrow)
-
-
-    # Exit to Desktop button with arrow
-    exit_desktop_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    exit_desktop_arrow.pack()
-    exit_desktop_btn = tk.Button(button_frame, text="EXIT TO DESKTOP", font=("Helvetica", 22, "bold"),
-                         bg="red4", fg="white", command=exit_to_desktop,
-                         width=18, height=1, borderwidth=2)
-    exit_desktop_btn.pack(pady=2)
-    menu_buttons.append(exit_desktop_btn)
-    menu_arrows.append(exit_desktop_arrow)
-    # Exit button with arrow
-    exit_arrow = tk.Label(button_frame, text="", font=("Helvetica", 20, "bold"),
-                         fg="#ffff00", bg="#0a0a0a")
-    exit_arrow.pack()
-    exit_btn = tk.Button(button_frame, text="EXIT MENU", font=("Helvetica", 22, "bold"),
-                         bg="gray30", fg="white", command=close_menu,
-                         width=18, height=1, borderwidth=2)
-    exit_btn.pack(pady=2)
-    menu_buttons.append(exit_btn)
-    menu_arrows.append(exit_arrow)
+        menu_buttons.append(btn)
+        menu_arrows.append(arrow)
 
     # Instructions - Professional footer
     footer_frame = tk.Frame(menu_window, bg='#1a1a1a', highlightbackground='#333333',
                            highlightthickness=2)
     footer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
 
-    instructions = tk.Label(footer_frame, text="+1 = DOWN  │  -1 = UP  │  OV = SELECT",
+    instructions = tk.Label(footer_frame, text="+1 = NEXT  │  -1 = PREVIOUS  │  OV = SELECT",
                            font=("Helvetica", 20, "bold"), fg="#00d4ff", bg="#1a1a1a")
     instructions.pack(pady=8)
 
