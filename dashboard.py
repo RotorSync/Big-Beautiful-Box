@@ -785,8 +785,8 @@ def update_bms_display():
 
     canvas.create_text(
         20,
-        455,
-        text="Battery:",
+        505,
+        text="SOC:",
         font=title_font,
         fill="cyan",
         anchor="nw",
@@ -794,7 +794,7 @@ def update_bms_display():
     )
     canvas.create_text(
         20,
-        537,
+        587,
         text=value_text,
         font=value_font,
         fill="cyan",
