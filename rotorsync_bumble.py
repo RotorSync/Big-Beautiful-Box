@@ -1334,7 +1334,7 @@ async def read_sensors(sensor_device, sensor_adapter):
             mopeka_failures += 1
             print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
 
-        if BMS_ENABLED and cycle_count % BMS_READ_INTERVAL == 0:
+        if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
             try:
                 if await read_bms(sensor_device, current_time):
                     bms_failures = 0

@@ -748,7 +748,7 @@ def update_last_load_display():
     else:
         load_lines = "--\n--\n--"
     title_font = ("Helvetica", 72, "bold")
-    value_font = ("Helvetica", 84, "bold")
+    value_font = ("Helvetica", 96, "bold")
     canvas.create_text(
         20,
         20,
@@ -760,7 +760,7 @@ def update_last_load_display():
     )
     canvas.create_text(
         20,
-        98,
+        102,
         text=load_lines,
         font=value_font,
         fill="cyan",
@@ -785,7 +785,7 @@ def update_bms_display():
 
     canvas.create_text(
         20,
-        405,
+        455,
         text="Battery:",
         font=title_font,
         fill="cyan",
@@ -794,7 +794,7 @@ def update_bms_display():
     )
     canvas.create_text(
         20,
-        483,
+        537,
         text=value_text,
         font=value_font,
         fill="cyan",
