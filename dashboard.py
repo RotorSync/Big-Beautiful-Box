@@ -1425,33 +1425,33 @@ def show_tank_calibration():
     calibration_window.configure(bg='black')
 
     calibration_title_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 34, "bold"), fg="cyan", bg="black"
+        calibration_window, text="", font=("Helvetica", 72, "bold"), fg="cyan", bg="black"
     )
-    calibration_title_label.pack(pady=16)
+    calibration_title_label.pack(pady=24)
 
     calibration_body_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 32, "bold"),
+        font=("Helvetica", 120, "bold"),
         fg="white",
         bg="black",
         justify=tk.CENTER,
     )
-    calibration_body_label.pack(expand=True, padx=30, pady=20)
+    calibration_body_label.pack(expand=True, padx=40, pady=30)
 
     calibration_hint_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 22), fg="#ffff99", bg="black"
+        calibration_window, text="", font=("Helvetica", 44, "bold"), fg="#ffff99", bg="black"
     )
-    calibration_hint_label.pack(pady=10)
+    calibration_hint_label.pack(pady=14)
 
     calibration_footer_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 22, "bold"),
+        font=("Helvetica", 44, "bold"),
         fg="#00ffff",
         bg="#0a0a0a",
     )
-    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=12, ipady=8)
+    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=14, ipady=12)
 
     _refresh_calibration_window()
 
