@@ -1312,11 +1312,18 @@ async def read_sensors(sensor_device, sensor_adapter):
 
             if mopeka_found:
                 mopeka_failures = 0
-                m1_gal = sensor_data["mopeka1"].get("gallons", 0)
-                m2_gal = sensor_data["mopeka2"].get("gallons", 0)
-                m1_q = sensor_data["mopeka1"].get("quality", 0)
-                m2_q = sensor_data["mopeka2"].get("quality", 0)
+                m1 = sensor_data["mopeka1"]
+                m2 = sensor_data["mopeka2"]
+                m1_gal = m1.get("gallons", 0)
+                m2_gal = m2.get("gallons", 0)
+                m1_q = m1.get("quality", 0)
+                m2_q = m2.get("quality", 0)
+                m1_mm = m1.get("level_mm", 0)
+                m2_mm = m2.get("level_mm", 0)
+                m1_in = m1.get("level_in", 0)
+                m2_in = m2.get("level_in", 0)
                 send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
+                send_dashboard_command(f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
             else:
                 mopeka_failures += 1
                 if mopeka_failures > 1:

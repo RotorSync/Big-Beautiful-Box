@@ -147,12 +147,40 @@ fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
 mix_requested_gallons = 40  # Preset for mix mode (default 40)
 mode_indicator_label = None  # Label to display "MIX" in corner
 
+# Shared menu order.
+MENU_ITEMS = [
+    "VIEW LOGS",
+    "FILL HISTORY",
+    "TANK CALIBRATION",
+    "FULL TEST",
+    "RESET SEASON",
+    "SELF TEST",
+    "SYSTEM UPDATE",
+    "SHUTDOWN",
+    "REBOOT",
+    "EXIT TO DESKTOP",
+    "EXIT MENU",
+]
+
 # Mopeka tank level display
 mopeka1_gallons = 0
 mopeka2_gallons = 0
 mopeka1_quality = 0
 mopeka2_quality = 0
 mopeka_connected = False
+mopeka1_level_mm = 0.0
+mopeka2_level_mm = 0.0
+mopeka1_level_in = 0.0
+mopeka2_level_in = 0.0
+
+# Tank calibration workflow state
+calibration_mode = False
+calibration_window = None
+calibration_title_label = None
+calibration_body_label = None
+calibration_footer_label = None
+calibration_hint_label = None
+calibration_state = None
 
 
 # Batch mix data from iPad (cached)
@@ -788,6 +816,12 @@ def record_pending_fill():
 def handle_thumbs_up_press(source):
     """Accept thumbs up only after flow has stopped."""
     button_log = "/home/pi/button_debug.log"
+    if calibration_mode:
+        msg = f"Thumbs up ignored from {source}: calibration workflow active"
+        print(msg)
+        log_serial_debug(msg)
+        return
+
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
 
     if is_flowing:
@@ -1177,6 +1211,336 @@ def close_fill_history():
         fill_history_window = None
         fill_history_text = None
     show_menu()
+
+
+def _default_calibration_state():
+    return {
+        "phase": "choose_tank",
+        "tank": "front",
+        "total_capacity": 1070,
+        "target_capacity": 1000,
+        "step_size": 10,
+        "current_step": 10,
+        "points": [],
+        "flow_started": False,
+        "settle_deadline": None,
+        "last_step_actual": 0.0,
+        "reading": None,
+    }
+
+
+def _selected_tank_reading():
+    tank = calibration_state.get("tank", "front")
+    if tank == "front":
+        return {
+            "tank": "front",
+            "level_mm": mopeka1_level_mm,
+            "level_in": mopeka1_level_in,
+            "gallons": mopeka1_gallons,
+            "quality": mopeka1_quality,
+        }
+    return {
+        "tank": "back",
+        "level_mm": mopeka2_level_mm,
+        "level_in": mopeka2_level_in,
+        "gallons": mopeka2_gallons,
+        "quality": mopeka2_quality,
+    }
+
+
+def _calibration_points_path():
+    return "/home/pi/tank_calibration_points.csv"
+
+
+def _calibration_runs_path():
+    return "/home/pi/tank_calibration_runs.json"
+
+
+def _save_calibration_run():
+    if not calibration_state or not calibration_state.get("points"):
+        return
+
+    run_record = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "tank": calibration_state["tank"],
+        "total_capacity": calibration_state["total_capacity"],
+        "target_capacity": calibration_state["target_capacity"],
+        "step_size": calibration_state["step_size"],
+        "points": calibration_state["points"],
+    }
+
+    runs_path = _calibration_runs_path()
+    try:
+        if os.path.exists(runs_path):
+            with open(runs_path, "r") as f:
+                runs = json.load(f)
+                if not isinstance(runs, list):
+                    runs = []
+        else:
+            runs = []
+    except Exception:
+        runs = []
+
+    runs.append(run_record)
+    with open(runs_path, "w") as f:
+        json.dump(runs, f, indent=2)
+
+    points_path = _calibration_points_path()
+    write_header = not os.path.exists(points_path)
+    with open(points_path, "a") as f:
+        if write_header:
+            f.write(
+                "timestamp,tank,total_capacity,target_capacity,step_target_gallons,"
+                "actual_total_gallons,level_mm,level_in,display_gallons,quality\n"
+            )
+        for point in calibration_state["points"]:
+            f.write(
+                f"{run_record['timestamp']},{run_record['tank']},{run_record['total_capacity']},"
+                f"{run_record['target_capacity']},{point['step_target_gallons']},"
+                f"{point['actual_total_gallons']:.3f},{point['level_mm']:.1f},"
+                f"{point['level_in']:.2f},{point['display_gallons']:.1f},{point['quality']}\n"
+            )
+
+
+def _refresh_calibration_window():
+    if not calibration_window or not calibration_state:
+        return
+
+    phase = calibration_state["phase"]
+    tank_label = calibration_state["tank"].title()
+    title = "TANK CALIBRATION"
+    body = ""
+    footer = ""
+    hint = ""
+
+    if phase == "choose_tank":
+        body = f"Select Tank\n\n{tank_label} Tank"
+        footer = "+1/-1 = CHANGE   OV = CONFIRM   PS = CANCEL"
+        hint = "Choose which trailer tank to calibrate."
+    elif phase == "set_total":
+        body = f"{tank_label} Tank\n\nTotal Capacity\n{calibration_state['total_capacity']} gal"
+        footer = "+10/-10, +1/-1 = ADJUST   OV = NEXT   PS = BACK"
+        hint = "Set the full physical tank capacity."
+    elif phase == "set_target":
+        body = (
+            f"{tank_label} Tank\n\nCalibration Endpoint\n"
+            f"{calibration_state['target_capacity']} gal"
+        )
+        footer = "+10/-10, +1/-1 = ADJUST   OV = NEXT   PS = BACK"
+        hint = "Set the usable gallons to calibrate up to."
+    elif phase == "confirm_empty":
+        body = f"{tank_label} Tank\n\nConfirm this tank is completely empty."
+        footer = "OV = YES, START   PS = BACK"
+        hint = "The workflow will fill in 10 gallon increments."
+    elif phase == "wait_for_fill":
+        step = calibration_state["current_step"]
+        body = (
+            f"{tank_label} Tank\n\nTarget Step: {step} gal\n\n"
+            "Start the pump.\nBBB will stop flow automatically."
+        )
+        footer = "PS = ABORT"
+        hint = "Waiting for flow to start."
+        if calibration_state.get("flow_started"):
+            hint = "Filling..."
+    elif phase == "settling":
+        remaining = max(0, int(calibration_state["settle_deadline"] - time.time()))
+        body = (
+            f"{tank_label} Tank\n\n{calibration_state['current_step']} gal reached.\n\n"
+            f"Waiting for Mopeka to settle...\n{remaining} sec remaining"
+        )
+        footer = "PS = ABORT"
+        hint = "Do not disturb the tank during the settle period."
+    elif phase == "review":
+        reading = calibration_state.get("reading") or _selected_tank_reading()
+        body = (
+            f"{tank_label} Tank\n\nStep: {calibration_state['current_step']} gal\n"
+            f"Actual: {calibration_state['last_step_actual']:.1f} gal\n"
+            f"Mopeka: {reading['level_mm']:.1f} mm / {reading['level_in']:.2f} in\n"
+            f"Display: {reading['gallons']:.0f} gal   Quality: {reading['quality']}"
+        )
+        footer = "OV = SAVE/NEXT   +1 = REREAD   -1 = WAIT 2 MORE MIN   PS = ABORT"
+        hint = "Confirm the Mopeka reading before continuing."
+    elif phase == "complete":
+        body = (
+            f"{tank_label} Tank Calibration Complete\n\n"
+            f"Saved {len(calibration_state['points'])} calibration points\n"
+            f"through {calibration_state['target_capacity']} gallons."
+        )
+        footer = "OV = RETURN TO MENU"
+        hint = _calibration_points_path()
+
+    calibration_title_label.config(text=title)
+    calibration_body_label.config(text=body)
+    calibration_footer_label.config(text=footer)
+    calibration_hint_label.config(text=hint)
+
+
+def _calibration_prepare_next_step():
+    global requested_gallons, fill_requested_gallons, colors_are_green
+    step = calibration_state["current_step"]
+    calibration_state["phase"] = "wait_for_fill"
+    calibration_state["flow_started"] = False
+    calibration_state["settle_deadline"] = None
+    calibration_state["reading"] = None
+    requested_gallons = float(step)
+    fill_requested_gallons = requested_gallons
+    colors_are_green = False
+    draw_requested_number(f"{requested_gallons:.0f}", "red")
+    _refresh_calibration_window()
+
+
+def _close_calibration_window(return_to_menu=True):
+    global calibration_mode, calibration_window, calibration_state
+    global calibration_title_label, calibration_body_label, calibration_footer_label, calibration_hint_label
+    calibration_mode = False
+    calibration_state = None
+    if calibration_window:
+        calibration_window.destroy()
+        calibration_window = None
+    calibration_title_label = None
+    calibration_body_label = None
+    calibration_footer_label = None
+    calibration_hint_label = None
+    if return_to_menu:
+        show_menu()
+
+
+def show_tank_calibration():
+    global calibration_mode, calibration_window, calibration_state
+    global calibration_title_label, calibration_body_label, calibration_footer_label, calibration_hint_label
+
+    if menu_window:
+        close_menu()
+    if calibration_window:
+        try:
+            calibration_window.destroy()
+        except Exception:
+            pass
+
+    calibration_mode = True
+    calibration_state = _default_calibration_state()
+    calibration_window = tk.Toplevel()
+    calibration_window.title("Tank Calibration")
+    calibration_window.attributes('-fullscreen', True)
+    calibration_window.configure(bg='black')
+
+    calibration_title_label = tk.Label(
+        calibration_window, text="", font=("Helvetica", 34, "bold"), fg="cyan", bg="black"
+    )
+    calibration_title_label.pack(pady=16)
+
+    calibration_body_label = tk.Label(
+        calibration_window,
+        text="",
+        font=("Helvetica", 32, "bold"),
+        fg="white",
+        bg="black",
+        justify=tk.CENTER,
+    )
+    calibration_body_label.pack(expand=True, padx=30, pady=20)
+
+    calibration_hint_label = tk.Label(
+        calibration_window, text="", font=("Helvetica", 22), fg="#ffff99", bg="black"
+    )
+    calibration_hint_label.pack(pady=10)
+
+    calibration_footer_label = tk.Label(
+        calibration_window,
+        text="",
+        font=("Helvetica", 22, "bold"),
+        fg="#00ffff",
+        bg="#0a0a0a",
+    )
+    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=12, ipady=8)
+
+    _refresh_calibration_window()
+
+
+def calibration_adjust_value(delta):
+    if not calibration_state:
+        return
+    phase = calibration_state["phase"]
+    if phase == "choose_tank":
+        calibration_state["tank"] = "back" if calibration_state["tank"] == "front" else "front"
+    elif phase == "set_total":
+        calibration_state["total_capacity"] = max(10, calibration_state["total_capacity"] + delta)
+        if calibration_state["target_capacity"] > calibration_state["total_capacity"]:
+            calibration_state["target_capacity"] = calibration_state["total_capacity"]
+    elif phase == "set_target":
+        calibration_state["target_capacity"] = min(
+            calibration_state["total_capacity"],
+            max(10, calibration_state["target_capacity"] + delta),
+        )
+    elif phase == "review" and delta == -1:
+        calibration_state["phase"] = "settling"
+        calibration_state["settle_deadline"] = time.time() + 120
+    _refresh_calibration_window()
+
+
+def calibration_confirm():
+    if not calibration_state:
+        return
+
+    phase = calibration_state["phase"]
+    if phase == "choose_tank":
+        calibration_state["phase"] = "set_total"
+    elif phase == "set_total":
+        calibration_state["phase"] = "set_target"
+    elif phase == "set_target":
+        calibration_state["phase"] = "confirm_empty"
+    elif phase == "confirm_empty":
+        calibration_state["current_step"] = calibration_state["step_size"]
+        switch_mode("fill")
+        _calibration_prepare_next_step()
+    elif phase == "review":
+        reading = calibration_state.get("reading") or _selected_tank_reading()
+        calibration_state["points"].append({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "step_target_gallons": calibration_state["current_step"],
+            "actual_total_gallons": calibration_state["last_step_actual"],
+            "level_mm": reading["level_mm"],
+            "level_in": reading["level_in"],
+            "display_gallons": reading["gallons"],
+            "quality": reading["quality"],
+        })
+        next_step = calibration_state["current_step"] + calibration_state["step_size"]
+        if next_step <= calibration_state["target_capacity"]:
+            calibration_state["current_step"] = next_step
+            _calibration_prepare_next_step()
+            return
+        _save_calibration_run()
+        calibration_state["phase"] = "complete"
+    elif phase == "complete":
+        _close_calibration_window(return_to_menu=True)
+        return
+
+    _refresh_calibration_window()
+
+
+def calibration_cancel():
+    if not calibration_state:
+        return
+
+    phase = calibration_state["phase"]
+    if phase == "choose_tank":
+        _close_calibration_window(return_to_menu=True)
+        return
+    if phase == "set_total":
+        calibration_state["phase"] = "choose_tank"
+    elif phase == "set_target":
+        calibration_state["phase"] = "set_total"
+    elif phase == "confirm_empty":
+        calibration_state["phase"] = "set_target"
+    else:
+        _close_calibration_window(return_to_menu=True)
+        return
+    _refresh_calibration_window()
+
+
+def calibration_reread_now():
+    if calibration_state and calibration_state["phase"] == "review":
+        calibration_state["reading"] = _selected_tank_reading()
+        _refresh_calibration_window()
 
 def run_self_test():
     """Run system self-test"""
@@ -1754,10 +2118,10 @@ def update_menu_highlight():
         return
 
     # Update position indicator with current selection
-    menu_items_names = ["VIEW LOGS", "FILL HISTORY", "FULL TEST", "RESET SEASON", "SELF TEST",
-                       "SYSTEM UPDATE", "SHUTDOWN", "REBOOT", "EXIT TO DESKTOP", "EXIT MENU"]
     if menu_position_label:
-        menu_position_label.config(text=f"Option {menu_selected_index + 1} of 10: {menu_items_names[menu_selected_index]}")
+        menu_position_label.config(
+            text=f"Option {menu_selected_index + 1} of {len(MENU_ITEMS)}: {MENU_ITEMS[menu_selected_index]}"
+        )
 
     # High-contrast unselected palette for sunlight readability.
     colors = [
@@ -1800,7 +2164,7 @@ def menu_navigate_up():
     """Move selection up in menu"""
     global menu_selected_index
     old_index = menu_selected_index
-    menu_selected_index = (menu_selected_index - 1) % 10  # Wrap around - 10 menu items
+    menu_selected_index = (menu_selected_index - 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_up: {old_index} -> {menu_selected_index}\n")
     update_menu_highlight()
@@ -1809,7 +2173,7 @@ def menu_navigate_down():
     """Move selection down in menu"""
     global menu_selected_index
     old_index = menu_selected_index
-    menu_selected_index = (menu_selected_index + 1) % 10  # Wrap around - 10 menu items
+    menu_selected_index = (menu_selected_index + 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_down: {old_index} -> {menu_selected_index}\n")
     update_menu_highlight()
@@ -1819,30 +2183,30 @@ def menu_select():
     global menu_selected_index
 
     # Debug logging to track selection
-    menu_items = ["VIEW LOGS", "FILL HISTORY", "FULL TEST", "RESET SEASON", "SELF TEST",
-                  "SYSTEM UPDATE", "SHUTDOWN", "REBOOT", "EXIT TO DESKTOP", "EXIT MENU"]
     with open('/home/pi/menu_debug.log', 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_select() called with index={menu_selected_index}, item={menu_items[menu_selected_index] if menu_selected_index < len(menu_items) else 'UNKNOWN'}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_select() called with index={menu_selected_index}, item={MENU_ITEMS[menu_selected_index] if menu_selected_index < len(MENU_ITEMS) else 'UNKNOWN'}\n")
 
     if menu_selected_index == 0:
         show_log_viewer()
     elif menu_selected_index == 1:
         show_fill_history()
     elif menu_selected_index == 2:
-        run_full_test()
+        show_tank_calibration()
     elif menu_selected_index == 3:
-        confirm_reset_season()
+        run_full_test()
     elif menu_selected_index == 4:
-        run_self_test()
+        confirm_reset_season()
     elif menu_selected_index == 5:
-        run_system_update()
+        run_self_test()
     elif menu_selected_index == 6:
-        shutdown_system()
+        run_system_update()
     elif menu_selected_index == 7:
-        reboot_system()
+        shutdown_system()
     elif menu_selected_index == 8:
-        exit_to_desktop()
+        reboot_system()
     elif menu_selected_index == 9:
+        exit_to_desktop()
+    elif menu_selected_index == 10:
         close_menu()
 
 def exit_to_desktop():
@@ -1991,6 +2355,7 @@ def show_menu():
     # Defensive cleanup in case any stale submenu window/mode was left behind.
     global log_viewer_mode, log_viewer_window, log_viewer_text
     global fill_history_mode, fill_history_window, fill_history_text
+    global calibration_mode, calibration_window, calibration_state
 
     log_viewer_mode = False
     if log_viewer_window:
@@ -2009,6 +2374,15 @@ def show_menu():
             pass
         fill_history_window = None
         fill_history_text = None
+
+    calibration_mode = False
+    if calibration_window:
+        try:
+            calibration_window.destroy()
+        except Exception:
+            pass
+        calibration_window = None
+        calibration_state = None
 
     if menu_window:
         try:
@@ -2098,10 +2472,8 @@ def show_menu():
 
     # Position indicator - make it global so we can update it
     global menu_position_label
-    menu_items_names = ["VIEW LOGS", "FILL HISTORY", "FULL TEST", "RESET SEASON", "SELF TEST",
-                       "SYSTEM UPDATE", "SHUTDOWN", "REBOOT", "EXIT TO DESKTOP", "EXIT MENU"]
     menu_position_label = tk.Label(menu_window,
-                                    text=f"Option 1 of 10: {menu_items_names[0]}",
+                                    text=f"Option 1 of {len(MENU_ITEMS)}: {MENU_ITEMS[0]}",
                                     font=("Helvetica", 18, "bold"),
                                     fg="#ffffff", bg='#0a0a0a')
     menu_position_label.pack(pady=2)
@@ -2115,6 +2487,7 @@ def show_menu():
     menu_actions = [
         ("VIEW LOGS", show_log_viewer),
         ("FILL HISTORY", show_fill_history),
+        ("TANK CALIBRATION", show_tank_calibration),
         ("FULL TEST", run_full_test),
         ("RESET SEASON", lambda: confirm_reset_season()),
         ("SELF TEST", run_self_test),
@@ -2603,6 +2976,21 @@ def socket_command_listener():
                                 except Exception as me:
                                     print(f"Mopeka parse error: {me}", flush=True)
 
+                            elif line.startswith("MOPEKA_RAW:"):
+                                try:
+                                    parts = line[11:].split("|")
+                                    if len(parts) >= 4:
+                                        root.after(
+                                            0,
+                                            _apply_mopeka_raw,
+                                            float(parts[0]),
+                                            float(parts[1]),
+                                            float(parts[2]),
+                                            float(parts[3]),
+                                        )
+                                except Exception as me:
+                                    print(f"Mopeka raw parse error: {me}", flush=True)
+
                             elif line == "HISTORY":
                                 try:
                                     with open("/home/pi/fill_history.log", "r") as hf:
@@ -2771,6 +3159,35 @@ def serial_listener():
                                 else:
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reminders mode: '{line}'\n")
+
+                            elif calibration_mode:
+                                if calibration_state and calibration_state.get("phase") == "review" and line == '+1':
+                                    msg = "Serial: Calibration reread"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_reread_now)
+                                elif line in ('+1', '-1', '+10', '-10'):
+                                    msg = f"Serial: Calibration command {line}"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_adjust_value, int(line))
+                                elif line == 'OV':
+                                    msg = "Serial: Calibration confirm"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_confirm)
+                                elif line == 'PS':
+                                    msg = "Serial: Calibration cancel/back"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_cancel)
+                                else:
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in calibration mode: '{line}'\n")
 
                             # Handle log viewer navigation if in log viewer mode
                             elif log_viewer_mode:
@@ -3165,6 +3582,14 @@ def _apply_mopeka(m1g, m2g, m1q, m2q):
     update_mopeka_display()
 
 
+def _apply_mopeka_raw(m1mm, m2mm, m1in, m2in):
+    global mopeka1_level_mm, mopeka2_level_mm, mopeka1_level_in, mopeka2_level_in
+    mopeka1_level_mm = m1mm
+    mopeka2_level_mm = m2mm
+    mopeka1_level_in = m1in
+    mopeka2_level_in = m2in
+
+
 def _mopeka_offline():
     """Mark mopeka sensors as offline and update display"""
     global mopeka_connected
@@ -3405,7 +3830,7 @@ def update_dashboard():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
-    global flow_cycle_counter
+    global flow_cycle_counter, calibration_state
 
     actual = read_flow_meter()
 
@@ -3445,38 +3870,66 @@ def update_dashboard():
         recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
+    calibration_waiting_for_fill = (
+        calibration_mode
+        and calibration_state
+        and calibration_state.get("phase") == "wait_for_fill"
+        and calibration_state.get("flow_started")
+    )
+
     # Store fill data when flow stops (don't record yet - wait for thumbs up)
     if was_flowing and not is_flowing:
-        # Determine if shutoff was automatic or manual
-        shutoff_type = "Auto" if last_alert_triggered else "Manual"
-
-        if shutoff_type == "Auto" and last_trigger_flow_gpm > 0:
-            pending_fill_flow_gpm = last_trigger_flow_gpm
-            pending_fill_trigger_threshold = last_trigger_threshold
+        if calibration_waiting_for_fill:
+            calibration_state["last_step_actual"] = actual
+            calibration_state["phase"] = "settling"
+            calibration_state["settle_deadline"] = time.time() + 120
+            calibration_state["flow_started"] = False
+            if thumbs_up_label:
+                thumbs_up_label.place_forget()
+            pending_fill_gallons = 0.0
+            pending_fill_requested = 0.0
+            pending_fill_shutoff_type = ""
+            pending_fill_flow_gpm = 0.0
+            pending_fill_trigger_threshold = 0.0
+            last_trigger_flow_gpm = 0.0
+            last_trigger_threshold = 0.0
+            last_trigger_actual = 0.0
+            recent_flow_rates_l_per_s.clear()
+            _refresh_calibration_window()
         else:
-            smoothed_stop_flow_l_per_s = get_smoothed_flow_rate()
-            pending_fill_flow_gpm = smoothed_stop_flow_l_per_s * config.LITERS_PER_SEC_TO_GPM
-            pending_fill_trigger_threshold = calculate_trigger_threshold(smoothed_stop_flow_l_per_s)
+            # Determine if shutoff was automatic or manual
+            shutoff_type = "Auto" if last_alert_triggered else "Manual"
 
-        # Store pending fill data (will be recorded when thumbs up is pressed)
-        pending_fill_gallons = actual
-        pending_fill_requested = requested_gallons
-        pending_fill_shutoff_type = shutoff_type
+            if shutoff_type == "Auto" and last_trigger_flow_gpm > 0:
+                pending_fill_flow_gpm = last_trigger_flow_gpm
+                pending_fill_trigger_threshold = last_trigger_threshold
+            else:
+                smoothed_stop_flow_l_per_s = get_smoothed_flow_rate()
+                pending_fill_flow_gpm = smoothed_stop_flow_l_per_s * config.LITERS_PER_SEC_TO_GPM
+                pending_fill_trigger_threshold = calculate_trigger_threshold(smoothed_stop_flow_l_per_s)
 
-        print(
-            f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
-            f"Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}, "
-            f"FlowAtStop: {pending_fill_flow_gpm:.1f} GPM, Threshold: {pending_fill_trigger_threshold:.3f}"
-        )
-        print(f"Waiting for thumbs up button to record fill...")
+            # Store pending fill data (will be recorded when thumbs up is pressed)
+            pending_fill_gallons = actual
+            pending_fill_requested = requested_gallons
+            pending_fill_shutoff_type = shutoff_type
 
-        # NOTE: Do NOT hide thumbs up when flow stops - keep it visible so user can press it
-        # Thumbs up will be hidden after button is pressed or when new fill starts
+            print(
+                f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
+                f"Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}, "
+                f"FlowAtStop: {pending_fill_flow_gpm:.1f} GPM, Threshold: {pending_fill_trigger_threshold:.3f}"
+            )
+            print(f"Waiting for thumbs up button to record fill...")
+
+            # NOTE: Do NOT hide thumbs up when flow stops - keep it visible so user can press it
+            # Thumbs up will be hidden after button is pressed or when new fill starts
 
     # Reset colors when new fill cycle starts
     if not was_flowing and is_flowing:
         flow_cycle_counter += 1
         colors_are_green = False
+        if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
+            calibration_state["flow_started"] = True
+            _refresh_calibration_window()
         # Hide thumbs up when new cycle starts
         if thumbs_up_label:
             thumbs_up_label.place_forget()
@@ -3491,6 +3944,12 @@ def update_dashboard():
         last_trigger_actual = 0.0
         recent_flow_rates_l_per_s.clear()
         print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
+
+    if calibration_mode and calibration_state and calibration_state.get("phase") == "settling":
+        if time.time() >= calibration_state.get("settle_deadline", time.time()):
+            calibration_state["phase"] = "review"
+            calibration_state["reading"] = _selected_tank_reading()
+        _refresh_calibration_window()
 
     # Update flow state for next cycle
     was_flowing = is_flowing
