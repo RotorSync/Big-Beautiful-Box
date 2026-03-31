@@ -1775,13 +1775,14 @@ def update_menu_highlight():
 
     for i, (btn, arrow) in enumerate(zip(menu_buttons, menu_arrows)):
         if i == menu_selected_index:
-            # SELECTED - Make it very obvious with red border (keep same font size to prevent layout shift)
-            btn.config(bg="white", fg="black",
-                      font=("Helvetica", 22, "bold"),
+            # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
+            btn.config(bg="#111111", fg="#ffff00",
+                      activebackground="#111111", activeforeground="#ffff00",
+                      font=("Helvetica", 23, "bold"),
                       relief=tk.RAISED, borderwidth=6,
-                      highlightbackground="red", highlightthickness=4, highlightcolor="red",
+                      highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
                       width=18, height=1)
-            arrow.config(text=">>> SELECTED >>>", fg="yellow",
+            arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
                         font=("Helvetica", 20, "bold"))
         else:
             # Unselected - Keep it bright enough to read in direct sun.
