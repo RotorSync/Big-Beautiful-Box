@@ -742,14 +742,25 @@ def update_last_load_display():
     if current_mode == "mix":
         return
     if last_loads_gallons:
-        load_lines = "\n".join(f"{load:.1f} gal" for load in last_loads_gallons[:3])
+        load_lines = "\n".join(f"{load:.1f} g" for load in last_loads_gallons[:3])
     else:
         load_lines = "--\n--\n--"
+    title_font = ("Helvetica", 72, "bold")
+    value_font = ("Helvetica", 84, "bold")
     canvas.create_text(
         20,
         20,
-        text=f"Last Loads:\n{load_lines}",
-        font=("Helvetica", 72, "bold"),
+        text="Last Loads:",
+        font=title_font,
+        fill="cyan",
+        anchor="nw",
+        tags="last_load",
+    )
+    canvas.create_text(
+        20,
+        98,
+        text=load_lines,
+        font=value_font,
         fill="cyan",
         anchor="nw",
         tags="last_load",
