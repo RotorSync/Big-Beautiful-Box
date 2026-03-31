@@ -1226,6 +1226,7 @@ def _default_calibration_state():
         "settle_deadline": None,
         "last_step_actual": 0.0,
         "reading": None,
+        "return_phase": None,
     }
 
 
@@ -1368,6 +1369,13 @@ def _refresh_calibration_window():
         )
         footer = "OV = RETURN TO MENU"
         hint = _calibration_points_path()
+    elif phase == "abort_confirm":
+        body = (
+            f"{tank_label} Tank\n\nAbort Calibration?\n\n"
+            "This will discard the current calibration run."
+        )
+        footer = "OV = YES, ABORT   PS = NO, GO BACK"
+        hint = "Use OV to exit the calibration workflow."
 
     calibration_title_label.config(text=title)
     calibration_body_label.config(text=body)
@@ -1510,6 +1518,9 @@ def calibration_confirm():
             return
         _save_calibration_run()
         calibration_state["phase"] = "complete"
+    elif phase == "abort_confirm":
+        _close_calibration_window(return_to_menu=True)
+        return
     elif phase == "complete":
         _close_calibration_window(return_to_menu=True)
         return
@@ -1523,7 +1534,8 @@ def calibration_cancel():
 
     phase = calibration_state["phase"]
     if phase == "choose_tank":
-        _close_calibration_window(return_to_menu=True)
+        calibration_state["return_phase"] = "choose_tank"
+        calibration_state["phase"] = "abort_confirm"
         return
     if phase == "set_total":
         calibration_state["phase"] = "choose_tank"
@@ -1531,9 +1543,12 @@ def calibration_cancel():
         calibration_state["phase"] = "set_total"
     elif phase == "confirm_empty":
         calibration_state["phase"] = "set_target"
+    elif phase == "abort_confirm":
+        calibration_state["phase"] = calibration_state.get("return_phase") or "choose_tank"
+        calibration_state["return_phase"] = None
     else:
-        _close_calibration_window(return_to_menu=True)
-        return
+        calibration_state["return_phase"] = phase
+        calibration_state["phase"] = "abort_confirm"
     _refresh_calibration_window()
 
 
