@@ -242,6 +242,15 @@ if [ -f "$SCRIPT_DIR/deploy/journald-bbb.conf" ]; then
     sudo systemctl restart systemd-journald
 fi
 
+# Disable unattended package updates for in-season stability.
+if [ -f "$SCRIPT_DIR/deploy/20auto-upgrades-bbb" ]; then
+    sudo cp "$SCRIPT_DIR/deploy/20auto-upgrades-bbb" /etc/apt/apt.conf.d/20auto-upgrades
+fi
+if [ -f "$SCRIPT_DIR/deploy/10periodic-bbb" ]; then
+    sudo cp "$SCRIPT_DIR/deploy/10periodic-bbb" /etc/apt/apt.conf.d/10periodic
+fi
+sudo systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+
 # Done!
 echo ""
 log_info "=========================================="
