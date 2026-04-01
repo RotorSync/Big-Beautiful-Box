@@ -4004,6 +4004,7 @@ def update_dashboard():
     if not was_flowing and is_flowing:
         flow_cycle_counter += 1
         colors_are_green = False
+        last_alert_triggered = False
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
@@ -4059,9 +4060,6 @@ def update_dashboard():
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
         relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
         relay_thread.start()
-    elif actual < requested_gallons - trigger_threshold:
-        last_alert_triggered = False  # Reset for next cycle
-
     # Update status label
     status_parts = []
     if connection_error:
