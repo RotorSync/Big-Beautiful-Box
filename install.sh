@@ -22,6 +22,117 @@ append_if_missing() {
     grep -Fqx "$line" "$file" || echo "$line" | sudo tee -a "$file" > /dev/null
 }
 
+install_boot_logo() {
+    local image_path="$1"
+    local theme_name="trailersync"
+    local theme_dir="/usr/share/plymouth/themes/${theme_name}"
+    local plymouth_file="${theme_dir}/${theme_name}.plymouth"
+    local script_file="${theme_dir}/${theme_name}.script"
+    local image_name="Trailersync.png"
+    local cmdline_file=""
+    local candidate
+
+    if [ ! -f "$image_path" ]; then
+        log_warn "Boot logo image missing; skipping Plymouth theme install."
+        return
+    fi
+
+    if ! command -v update-initramfs >/dev/null 2>&1 || ! command -v update-alternatives >/dev/null 2>&1; then
+        log_warn "Plymouth tools missing; skipping boot logo install."
+        return
+    fi
+
+    sudo mkdir -p "$theme_dir"
+    sudo cp "$image_path" "${theme_dir}/${image_name}"
+
+    sudo tee "$plymouth_file" > /dev/null <<EOF
+[Plymouth Theme]
+Name=TrailerSync
+Description=TrailerSync boot splash with a centered fading logo
+ModuleName=script
+
+[script]
+ImageDir=${theme_dir}
+ScriptFile=${script_file}
+EOF
+
+    sudo tee "$script_file" > /dev/null <<'EOF'
+Window.SetBackgroundTopColor(0.0, 0.0, 0.0);
+Window.SetBackgroundBottomColor(0.0, 0.0, 0.0);
+
+logo_image = Image("Trailersync.png");
+logo_sprite = Sprite(logo_image);
+
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+logo_width = logo_image.GetWidth();
+logo_height = logo_image.GetHeight();
+
+logo_sprite.SetX((screen_width - logo_width) / 2);
+logo_sprite.SetY((screen_height - logo_height) / 2);
+logo_sprite.SetZ(100);
+logo_sprite.SetOpacity(0.0);
+
+opacity = 0.0;
+fade_step = 0.02;
+
+fun refresh_callback() {
+    if (opacity < 1.0) {
+        opacity += fade_step;
+
+        if (opacity > 1.0) {
+            opacity = 1.0;
+        }
+
+        logo_sprite.SetOpacity(opacity);
+    }
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+EOF
+
+    sudo chmod 644 "${theme_dir}/${image_name}" "$plymouth_file" "$script_file"
+
+    sudo update-alternatives --install \
+        /usr/share/plymouth/themes/default.plymouth \
+        default.plymouth \
+        "$plymouth_file" \
+        220 >/dev/null
+
+    sudo update-alternatives --set \
+        default.plymouth \
+        "$plymouth_file" >/dev/null
+
+    for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+        if [ -f "$candidate" ]; then
+            cmdline_file="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$cmdline_file" ]; then
+        if ! grep -qw quiet "$cmdline_file" || ! grep -qw splash "$cmdline_file"; then
+            sudo cp "$cmdline_file" "${cmdline_file}.bak.$(date +%Y%m%d%H%M%S)"
+            sudo python3 - "$cmdline_file" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+parts = path.read_text().strip().split()
+for flag in ("quiet", "splash"):
+    if flag not in parts:
+        parts.append(flag)
+path.write_text(" ".join(parts) + "\n")
+PY
+        fi
+    else
+        log_warn "No cmdline.txt found; skipped quiet/splash enforcement."
+    fi
+
+    sudo update-initramfs -u
+    log_info "Installed TrailerSync Plymouth boot logo."
+}
+
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then
     log_error "Do not run as root. Run as the pi user."
@@ -188,7 +299,6 @@ cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
 cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
 cp -r "$SCRIPT_DIR/deploy/"* "$INSTALL_DIR/deploy/"
 cp "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/"
-[ -f "$SCRIPT_DIR/install-trailersync-boot-logo.sh" ] && cp "$SCRIPT_DIR/install-trailersync-boot-logo.sh" "$INSTALL_DIR/"
 [ -f "$SCRIPT_DIR/Trailersync.png" ] && cp "$SCRIPT_DIR/Trailersync.png" "$INSTALL_DIR/"
 
 # Copy Rotorsync runtime files to /opt to match service paths
@@ -207,7 +317,6 @@ sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
-[ -f "$INSTALL_DIR/install-trailersync-boot-logo.sh" ] && chmod +x "$INSTALL_DIR/install-trailersync-boot-logo.sh"
 
 # Step 6: Install systemd services
 log_step "6/7: Installing systemd service..."
@@ -256,10 +365,9 @@ if [ -f "$SCRIPT_DIR/deploy/10periodic-bbb" ]; then
 fi
 sudo systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
-# Install TrailerSync Plymouth boot logo if the bundled script + asset are present.
-if [ -f "$INSTALL_DIR/install-trailersync-boot-logo.sh" ] && [ -f "$INSTALL_DIR/Trailersync.png" ]; then
-    log_info "Installing TrailerSync boot logo..."
-    sudo "$INSTALL_DIR/install-trailersync-boot-logo.sh" "$INSTALL_DIR/Trailersync.png" || \
+# Install TrailerSync Plymouth boot logo if the bundled asset is present.
+if [ -f "$INSTALL_DIR/Trailersync.png" ]; then
+    install_boot_logo "$INSTALL_DIR/Trailersync.png" || \
         log_warn "Boot logo install failed; continuing"
 fi
 
