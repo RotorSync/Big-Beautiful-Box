@@ -62,7 +62,7 @@ LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 
 # Flow-based shutoff coast calibration
 # Use a short rolling average of flow rather than a single instant sample.
-FLOW_AVERAGING_SAMPLES = 10  # 10 x 200 ms updates = ~2.0 s average
+FLOW_AVERAGING_SAMPLES = 3  # 3 x 200 ms updates = ~0.6 s average
 
 # Piecewise coast model derived from usable March 2026 auto-shutoff samples.
 # Low band samples:
