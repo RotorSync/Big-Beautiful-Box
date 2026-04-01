@@ -84,7 +84,9 @@ sudo apt install -y \
     python3-pip \
     python3-yaml \
     bluez \
-    bluez-tools
+    bluez-tools \
+    plymouth \
+    plymouth-themes
 
 sudo usermod -a -G dialout $INSTALL_USER
 
@@ -186,6 +188,8 @@ cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
 cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
 cp -r "$SCRIPT_DIR/deploy/"* "$INSTALL_DIR/deploy/"
 cp "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/"
+[ -f "$SCRIPT_DIR/install-trailersync-boot-logo.sh" ] && cp "$SCRIPT_DIR/install-trailersync-boot-logo.sh" "$INSTALL_DIR/"
+[ -f "$SCRIPT_DIR/Trailersync.png" ] && cp "$SCRIPT_DIR/Trailersync.png" "$INSTALL_DIR/"
 
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
@@ -203,6 +207,7 @@ sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
+[ -f "$INSTALL_DIR/install-trailersync-boot-logo.sh" ] && chmod +x "$INSTALL_DIR/install-trailersync-boot-logo.sh"
 
 # Step 6: Install systemd services
 log_step "6/7: Installing systemd service..."
@@ -250,6 +255,13 @@ if [ -f "$SCRIPT_DIR/deploy/10periodic-bbb" ]; then
     sudo cp "$SCRIPT_DIR/deploy/10periodic-bbb" /etc/apt/apt.conf.d/10periodic
 fi
 sudo systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+
+# Install TrailerSync Plymouth boot logo if the bundled script + asset are present.
+if [ -f "$INSTALL_DIR/install-trailersync-boot-logo.sh" ] && [ -f "$INSTALL_DIR/Trailersync.png" ]; then
+    log_info "Installing TrailerSync boot logo..."
+    sudo "$INSTALL_DIR/install-trailersync-boot-logo.sh" "$INSTALL_DIR/Trailersync.png" || \
+        log_warn "Boot logo install failed; continuing"
+fi
 
 # Done!
 echo ""
