@@ -156,6 +156,7 @@ MENU_ITEMS = [
     "FULL TEST",
     "RESET SEASON",
     "SELF TEST",
+    "CAPTURE BUG",
     "SYSTEM UPDATE",
     "SHUTDOWN",
     "REBOOT",
@@ -2054,6 +2055,113 @@ def run_system_update():
     update_thread = threading.Thread(target=run_update, daemon=True)
     update_thread.start()
 
+
+def run_bug_capture():
+    """Capture a compact bug report with the most useful recent diagnostics."""
+    global update_mode, update_window
+
+    update_mode = True
+    update_window = tk.Toplevel()
+    update_window.title("Capture Bug Report")
+    update_window.attributes('-fullscreen', True)
+    update_window.configure(bg='black')
+
+    title = tk.Label(update_window, text="CAPTURE BUG REPORT", font=("Helvetica", 36, "bold"),
+                     fg="cyan", bg="black")
+    title.pack(pady=20)
+
+    controls = tk.Label(update_window, text="OV=EXIT TO MENU",
+                       font=("Helvetica", 22, "bold"), fg="#ffff00", bg="#0a0a0a")
+    controls.pack(pady=2)
+
+    status_frame = tk.Frame(update_window, bg='black')
+    status_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
+
+    status_text = tk.Text(status_frame, font=("Courier", 24, "bold"), bg="black", fg="lime",
+                         wrap=tk.WORD)
+    status_text.pack(fill=tk.BOTH, expand=True)
+
+    def append(msg):
+        status_text.insert(tk.END, msg)
+        status_text.see(tk.END)
+        status_text.update()
+
+    def run_capture():
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        report_dir = "/home/pi/bug_reports"
+        report_path = f"{report_dir}/bug-report-{timestamp}.txt"
+        capture_script = f"""set -e
+mkdir -p {report_dir}
+{{
+  echo "BBB Bug Report"
+  echo "Generated: $(date)"
+  echo "Version: {VERSION}"
+  echo
+  echo "=== SYSTEM ==="
+  uname -a
+  echo
+  uptime
+  echo
+  df -h /
+  echo
+  echo "=== SERVICES ==="
+  systemctl --no-pager --full status iol_dashboard.service rotorsync.service rotorsync_watchdog.service || true
+  echo
+  echo "=== JOURNAL: IOL DASHBOARD (LAST 120) ==="
+  journalctl -u iol_dashboard.service -n 120 --no-pager || true
+  echo
+  echo "=== JOURNAL: ROTORSYNC (LAST 120) ==="
+  journalctl -u rotorsync.service -n 120 --no-pager || true
+  echo
+  echo "=== FILL HISTORY (LAST 40) ==="
+  tail -n 40 /home/pi/fill_history.log 2>/dev/null || true
+  echo
+  echo "=== FILL CALIBRATION (LAST 40) ==="
+  tail -n 40 /home/pi/fill_calibration.log 2>/dev/null || true
+  echo
+  echo "=== SERIAL DEBUG (LAST 200) ==="
+  tail -n 200 /home/pi/serial_debug.log 2>/dev/null || true
+  echo
+  echo "=== MENU DEBUG (LAST 120) ==="
+  tail -n 120 /home/pi/menu_debug.log 2>/dev/null || true
+  echo
+  echo "=== BUTTON DEBUG (LAST 120) ==="
+  tail -n 120 /home/pi/button_debug.log 2>/dev/null || true
+  echo
+  echo "=== WATCHDOG LOG (LAST 120) ==="
+  tail -n 120 /home/pi/rotorsync_watchdog.log 2>/dev/null || true
+  echo
+  echo "=== IOL DASHBOARD LOG (LAST 400) ==="
+  tail -n 400 /home/pi/iol_dashboard.log 2>/dev/null || true
+}} > {report_path}
+echo {report_path}
+"""
+
+        append("Capturing bug report...\n\n")
+        try:
+            result = subprocess.run(
+                ['bash', '-lc', capture_script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                append("ERROR: Bug capture failed\n\n")
+                if result.stderr:
+                    append(result.stderr + "\n")
+            else:
+                path = result.stdout.strip().splitlines()[-1]
+                append("Bug report captured successfully.\n\n")
+                append(f"Saved to:\n{path}\n\n")
+                append("Press OV to return to menu\n")
+        except subprocess.TimeoutExpired:
+            append("ERROR: Bug capture timed out\n\nPress OV to return to menu\n")
+        except Exception as e:
+            append(f"ERROR: {e}\n\nPress OV to return to menu\n")
+
+    capture_thread = threading.Thread(target=run_capture, daemon=True)
+    capture_thread.start()
+
 def close_update():
     """Close update window and return to menu"""
     global update_mode, update_window
@@ -2262,14 +2370,16 @@ def menu_select():
     elif menu_selected_index == 5:
         run_self_test()
     elif menu_selected_index == 6:
-        run_system_update()
+        run_bug_capture()
     elif menu_selected_index == 7:
-        shutdown_system()
+        run_system_update()
     elif menu_selected_index == 8:
-        reboot_system()
+        shutdown_system()
     elif menu_selected_index == 9:
-        exit_to_desktop()
+        reboot_system()
     elif menu_selected_index == 10:
+        exit_to_desktop()
+    elif menu_selected_index == 11:
         close_menu()
 
 def exit_to_desktop():
@@ -2554,6 +2664,7 @@ def show_menu():
         ("FULL TEST", run_full_test),
         ("RESET SEASON", lambda: confirm_reset_season()),
         ("SELF TEST", run_self_test),
+        ("CAPTURE BUG", run_bug_capture),
         ("SYSTEM UPDATE", run_system_update),
         ("SHUTDOWN", shutdown_system),
         ("REBOOT", reboot_system),

@@ -215,8 +215,8 @@ sudo systemctl enable iol_dashboard.service
 sudo systemctl enable rotorsync.service
 sudo systemctl enable rotorsync_watchdog.service
 
-# Step 7: Configure auto-login and screen
-log_step "7/7: Configuring display settings..."
+# Step 7: Configure auto-login, screen, and log retention
+log_step "7/7: Configuring display settings and log retention..."
 
 # GDM3 auto-login / X11 display manager settings
 if [ -f /etc/gdm3/custom.conf ] && [ -f "$SCRIPT_DIR/deploy/gdm3-custom.conf" ]; then
@@ -227,6 +227,19 @@ fi
 # Disable idle timeout
 if ! grep -q "IdleAction=ignore" /etc/systemd/logind.conf 2>/dev/null; then
     echo -e "\nIdleAction=ignore\nIdleActionSec=0" | sudo tee -a /etc/systemd/logind.conf > /dev/null
+fi
+
+# Cap noisy BBB logs while preserving seasonal fill history logs.
+sudo mkdir -p /home/pi/bug_reports
+if [ -f "$SCRIPT_DIR/deploy/bbb-logrotate.conf" ]; then
+    sudo cp "$SCRIPT_DIR/deploy/bbb-logrotate.conf" /etc/logrotate.d/bbb
+fi
+
+# Cap journald disk usage for unattended deployments.
+if [ -f "$SCRIPT_DIR/deploy/journald-bbb.conf" ]; then
+    sudo mkdir -p /etc/systemd/journald.conf.d
+    sudo cp "$SCRIPT_DIR/deploy/journald-bbb.conf" /etc/systemd/journald.conf.d/bbb.conf
+    sudo systemctl restart systemd-journald
 fi
 
 # Done!
