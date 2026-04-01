@@ -84,6 +84,7 @@ requested_gallons = config.REQUESTED_GALLONS
 serial_connected = False
 override_mode = False
 last_alert_triggered = False
+auto_shutoff_latched = False  # True once the pump-stop relay has fired for the current fill cycle
 last_successful_read_time = time.time()
 was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
 colors_are_green = False  # Track if colors have been changed to green
@@ -3903,7 +3904,7 @@ load_thumbs_up_gif()
 
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
-    global last_alert_triggered, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
+    global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
@@ -3975,7 +3976,7 @@ def update_dashboard():
             _refresh_calibration_window()
         else:
             # Determine if shutoff was automatic or manual
-            shutoff_type = "Auto" if last_alert_triggered else "Manual"
+            shutoff_type = "Auto" if auto_shutoff_latched else "Manual"
 
             if shutoff_type == "Auto" and last_trigger_flow_gpm > 0:
                 pending_fill_flow_gpm = last_trigger_flow_gpm
@@ -4005,6 +4006,7 @@ def update_dashboard():
         flow_cycle_counter += 1
         colors_are_green = False
         last_alert_triggered = False
+        auto_shutoff_latched = False
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
@@ -4054,6 +4056,7 @@ def update_dashboard():
     # Only if override mode is OFF and flow meter is connected
     if not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
         last_alert_triggered = True
+        auto_shutoff_latched = True
         last_trigger_flow_gpm = flow_rate_gpm
         last_trigger_threshold = trigger_threshold
         last_trigger_actual = actual
