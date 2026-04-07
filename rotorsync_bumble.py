@@ -70,6 +70,7 @@ TRAILER_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefa')   # Trailer sel
 CONFIG_CMD_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefb') # Config command write
 CONFIG_DATA_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefc') # Config data read
 STATE_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefd')      # Live iOS-friendly dashboard state
+COMMAND_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefe')    # JSON command channel for iOS app
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -384,6 +385,87 @@ def pump_write_handler(connection, value):
     if cmd in ['1', 'PS', 'STOP']:
         send_dashboard_command('PS')
     return
+
+
+def command_write_handler(connection, value):
+    """Handle compact JSON commands from the iOS app."""
+    try:
+        payload = value.decode('utf-8').strip()
+        print(f'Command write: {payload[:200]}', flush=True)
+        cmd = json.loads(payload)
+        if not isinstance(cmd, dict):
+            raise ValueError('command payload must be a JSON object')
+    except Exception as e:
+        print(f'Command write parse error: {e}', flush=True)
+        return
+
+    command = str(cmd.get('cmd', '')).strip().lower()
+    if not command:
+        print('Command write ignored: missing cmd', flush=True)
+        return
+
+    if command == 'pump_stop':
+        send_dashboard_command('PS')
+        query_dashboard_status()
+        return
+
+    if command == 'confirm_fill':
+        send_dashboard_command('TU')
+        query_dashboard_status()
+        return
+
+    if command == 'set_mode':
+        mode = str(cmd.get('mode', '')).strip().lower()
+        if mode == 'mix':
+            send_dashboard_command('MIX')
+            query_dashboard_status()
+        elif mode == 'fill':
+            send_dashboard_command('FILL')
+            query_dashboard_status()
+        else:
+            print(f'Command write ignored: invalid mode {mode!r}', flush=True)
+        return
+
+    if command == 'adjust':
+        delta = cmd.get('delta')
+        allowed = {
+            1: '+1',
+            -1: '-1',
+            10: '+10',
+            -10: '-10',
+        }
+        try:
+            delta = int(delta)
+        except Exception:
+            delta = None
+        if delta in allowed:
+            send_dashboard_command(allowed[delta])
+            query_dashboard_status()
+        else:
+            print(f'Command write ignored: invalid delta {delta!r}', flush=True)
+        return
+
+    if command == 'set_override':
+        enabled = cmd.get('enabled')
+        desired = bool(enabled)
+        current = bool(dashboard_status.get('state', {}).get('ov', False))
+        if desired != current:
+            send_dashboard_command('OV')
+            query_dashboard_status()
+        return
+
+    if command == 'set_batchmix':
+        data = cmd.get('data')
+        if isinstance(data, dict):
+            send_dashboard_command(
+                f'BATCHMIX:{json.dumps(data, separators=(",", ":"))}'
+            )
+        else:
+            print('Command write ignored: set_batchmix missing object data', flush=True)
+        return
+
+    print(f'Command write ignored: unsupported cmd {command!r}', flush=True)
+
 
 def gallons_write_handler(connection, value):
     """Handle gallons adjustment. Write '+1', '-1', '+10', '-10'."""
@@ -1544,6 +1626,12 @@ async def main():
         Characteristic.READABLE,
         CharacteristicValue(read=make_state_read_handler()),
     )
+    command_char = Characteristic(
+        COMMAND_CHAR_UUID,
+        Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
+        Characteristic.WRITEABLE,
+        CharacteristicValue(write=command_write_handler),
+    )
 
     history_char = Characteristic(HISTORY_CHAR_UUID, Characteristic.Properties.READ,
         Characteristic.READABLE, CharacteristicValue(read=make_history_read_handler()))
@@ -1578,6 +1666,7 @@ async def main():
             requested_char,
             actual_char,
             state_char,
+            command_char,
             history_char,
             batchmix_char,
             trailer_char,
@@ -1613,6 +1702,7 @@ async def main():
     print('  def6: Requested (read)  - requested gallons', flush=True)
     print('  def7: Actual (read)     - actual gallons', flush=True)
     print('  defd: State (r/n)       - live dashboard JSON snapshot', flush=True)
+    print('  defe: Command (write)   - JSON command channel for iPad app', flush=True)
     print('  def8: History (read)    - last 5 fills', flush=True)
     print('  def9: BatchMix (write)  - JSON batch mix data from iPad', flush=True)
     print('  defa: Trailer (r/w)     - write trailer # to configure, read for current', flush=True)
