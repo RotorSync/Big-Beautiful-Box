@@ -2,7 +2,7 @@
 # IOL Dashboard Installation Script for Raspberry Pi 5
 # Big-Beautiful-Box Project
 
-set -e
+set -Eeuo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -15,6 +15,15 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
+
+on_error() {
+    local exit_code="$1"
+    local line_no="$2"
+    log_error "Installer failed at line ${line_no}: ${BASH_COMMAND}"
+    exit "$exit_code"
+}
+
+trap 'on_error $? $LINENO' ERR
 
 append_if_missing() {
     local file="$1"
@@ -145,7 +154,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
 OPT_DIR="/opt"
 SOFTWARE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")"
-SOURCE_BRANCH="$(git -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || echo master)"
+SOURCE_BRANCH="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
 
 if [ "$INSTALL_USER" != "pi" ]; then
     log_error "This installer currently expects to run as the pi user."
@@ -266,7 +276,23 @@ if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     else
         [ -d "$INSTALL_DIR" ] && mv "$INSTALL_DIR" "${INSTALL_DIR}.pre-install-backup.$(date +%Y%m%d-%H%M%S)"
         log_info "Cloning BBB locally from $SCRIPT_DIR into $INSTALL_DIR"
-        git clone --branch "$SOURCE_BRANCH" "$SCRIPT_DIR" "$INSTALL_DIR"
+        if git clone "$SCRIPT_DIR" "$INSTALL_DIR"; then
+            if [ -n "$SOURCE_BRANCH" ]; then
+                git -C "$INSTALL_DIR" checkout -f "$SOURCE_BRANCH" >/dev/null 2>&1 || \
+                    log_warn "Could not switch cloned checkout to branch $SOURCE_BRANCH; continuing with cloned HEAD"
+            fi
+            if [ -n "$SOURCE_COMMIT" ]; then
+                git -C "$INSTALL_DIR" reset --hard "$SOURCE_COMMIT" >/dev/null 2>&1 || \
+                    log_warn "Could not align cloned checkout to source commit $SOURCE_COMMIT"
+            fi
+        else
+            log_warn "Local git clone failed; continuing with a plain file install. GitHub updater will need manual repair."
+            mkdir -p "$INSTALL_DIR"
+            mkdir -p "$INSTALL_DIR/src"
+            mkdir -p "$INSTALL_DIR/RPi"
+            mkdir -p "$INSTALL_DIR/mopeka"
+            mkdir -p "$INSTALL_DIR/deploy"
+        fi
     fi
 else
     log_warn "Installer is not running from a git checkout; GitHub updater may not work on this box."
@@ -329,7 +355,8 @@ sudo systemctl enable rotorsync_watchdog.service
 log_step "7/7: Configuring display settings and log retention..."
 
 # GDM3 auto-login / X11 display manager settings
-if [ -f /etc/gdm3/custom.conf ] && [ -f "$SCRIPT_DIR/deploy/gdm3-custom.conf" ]; then
+if [ -f "$SCRIPT_DIR/deploy/gdm3-custom.conf" ]; then
+    sudo mkdir -p /etc/gdm3
     sudo cp /etc/gdm3/custom.conf /etc/gdm3/custom.conf.bbb.bak 2>/dev/null || true
     sudo cp "$SCRIPT_DIR/deploy/gdm3-custom.conf" /etc/gdm3/custom.conf
 fi
@@ -349,7 +376,7 @@ fi
 if [ -f "$SCRIPT_DIR/deploy/journald-bbb.conf" ]; then
     sudo mkdir -p /etc/systemd/journald.conf.d
     sudo cp "$SCRIPT_DIR/deploy/journald-bbb.conf" /etc/systemd/journald.conf.d/bbb.conf
-    sudo systemctl restart systemd-journald
+    sudo systemctl restart systemd-journald || log_warn "Could not restart systemd-journald"
 fi
 
 # Disable unattended package updates for in-season stability.
