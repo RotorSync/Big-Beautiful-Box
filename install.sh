@@ -245,9 +245,11 @@ sudo usermod -a -G dialout $INSTALL_USER
 sudo systemctl enable ssh
 sudo systemctl start ssh
 
-# Install Python packages used by the BLE/Rotorsync stack
-python3 -m pip install --break-system-packages --upgrade pip
-python3 -m pip install --break-system-packages bleak bumble
+# Install Python packages used by the BLE/Rotorsync stack.
+# Rotorsync runs as a systemd service via /usr/bin/python3, so these must be
+# available to the system interpreter rather than only the pi user's site-packages.
+sudo python3 -m pip install --break-system-packages --upgrade pip
+sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble
 
 # Step 3: Install vendored IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."
