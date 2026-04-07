@@ -47,6 +47,7 @@ VERSION = _read_local_version()
 import config
 
 # Set up rotating loggers
+from src.auto_shutoff import AutoShutoffTuningModel
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
 main_logger = get_main_logger()
 serial_logger = get_serial_logger()
@@ -127,11 +128,17 @@ pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
 pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
+pending_fill_flow_variation_gpm = 0.0  # Flow stability window for the completed fill
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
 last_trigger_actual = 0.0  # Actual gallons when auto shutoff triggered
 recent_flow_rates_l_per_s = deque(maxlen=config.FLOW_AVERAGING_SAMPLES)
+AUTO_TUNE_STABILITY_SAMPLE_COUNT = max(
+    2,
+    int(round((config.AUTO_TUNE_STABILITY_WINDOW_SECONDS * 1000.0) / config.UPDATE_INTERVAL)),
+)
+recent_learning_flow_rates_l_per_s = deque(maxlen=AUTO_TUNE_STABILITY_SAMPLE_COUNT)
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
@@ -191,35 +198,30 @@ calibration_state = None
 batch_mix_data = None  # Cached JSON data from iPad
 batch_mix_overlay = None  # Reference to batch mix overlay frame
 
-def calculate_trigger_threshold(flow_rate_l_per_s):
-    """
-    Calculate how many gallons before target to trigger shutoff based on flow rate.
-    Uses calibration data to predict coast distance after relay activation.
+def log_auto_shutoff_event(message, level="info"):
+    """Send auto-shutoff observability messages to the main logger."""
+    log_method = getattr(main_logger, level, main_logger.info)
+    log_method(message)
 
-    Args:
-        flow_rate_l_per_s: Current flow rate in liters per second
 
-    Returns:
-        Gallons before target to trigger shutoff (predicted coast distance)
-    """
-    # Convert L/s to GPM
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-
-    if flow_rate_gpm <= config.FLOW_CURVE_SPLIT_GPM:
-        predicted_coast = (
-            config.FLOW_CURVE_LOW_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_LOW_INTERCEPT
-        )
-    else:
-        predicted_coast = (
-            config.FLOW_CURVE_HIGH_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_HIGH_INTERCEPT
-        )
-
-    # Ensure we don't have negative threshold (minimum 0.1 gallon before target)
-    threshold = max(predicted_coast, 0.1)
-
-    return threshold
+auto_shutoff_model = AutoShutoffTuningModel(config.AUTO_TUNE_MODEL_FILE)
+if not config.AUTO_TUNE_ENABLED:
+    log_auto_shutoff_event("Auto-shutoff tuner disabled; using base curve only")
+elif auto_shutoff_model.load_status == "loaded":
+    log_auto_shutoff_event(
+        f"Auto-shutoff tuner loaded {auto_shutoff_model.sample_count} samples from "
+        f"{auto_shutoff_model.model_path}"
+    )
+elif auto_shutoff_model.load_status == "error":
+    log_auto_shutoff_event(
+        f"Auto-shutoff tuner failed to load {auto_shutoff_model.model_path}: "
+        f"{auto_shutoff_model.last_load_error}. Falling back to base curve.",
+        level="warning",
+    )
+else:
+    log_auto_shutoff_event(
+        f"Auto-shutoff tuner starting fresh at {auto_shutoff_model.model_path}"
+    )
 
 
 def get_smoothed_flow_rate():
@@ -227,6 +229,17 @@ def get_smoothed_flow_rate():
     if not recent_flow_rates_l_per_s:
         return last_flow_rate
     return sum(recent_flow_rates_l_per_s) / len(recent_flow_rates_l_per_s)
+
+
+def get_recent_flow_variation_gpm():
+    """Return the max-min spread of the recent learning window in GPM."""
+    if len(recent_learning_flow_rates_l_per_s) < 2:
+        return 0.0
+    variation_l_per_s = (
+        max(recent_learning_flow_rates_l_per_s)
+        - min(recent_learning_flow_rates_l_per_s)
+    )
+    return variation_l_per_s * config.LITERS_PER_SEC_TO_GPM
 
 def load_totals():
     """Load daily and season totals from files"""
@@ -823,7 +836,8 @@ def update_flow_rate_display(flow_rate_gpm):
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_loads_gallons
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_flow_variation_gpm
+    global thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
@@ -852,12 +866,55 @@ def record_pending_fill():
         print(f"Fill recorded - Actual: {pending_fill_gallons:.3f} gal")
         print(f"Updated totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
 
+        learning_result = auto_shutoff_model.record_confirmed_fill(
+            shutoff_type=pending_fill_shutoff_type,
+            flow_gpm=pending_fill_flow_gpm,
+            requested_gallons=pending_fill_requested,
+            actual_gallons=pending_fill_gallons,
+            applied_threshold_gal=pending_fill_trigger_threshold,
+            flow_variation_gpm=pending_fill_flow_variation_gpm,
+        )
+        if learning_result.accepted and learning_result.sample:
+            log_auto_shutoff_event(
+                "Auto-tune accepted sample: "
+                f"flow={learning_result.sample.flow_gpm:.1f} GPM, "
+                f"variation={learning_result.flow_variation_gpm:.2f} GPM, "
+                f"applied={learning_result.sample.applied_threshold_gal:.3f} gal, "
+                f"base={learning_result.base_threshold_gal:.3f} gal, "
+                f"corrected={learning_result.corrected_threshold_gal:.3f} gal, "
+                f"delta={learning_result.delta_from_base_gal:+.3f} gal, "
+                f"samples={learning_result.sample_count}"
+            )
+            if learning_result.save_error:
+                log_auto_shutoff_event(
+                    f"Auto-tune sample failed to persist to {auto_shutoff_model.model_path}: "
+                    f"{learning_result.save_error}",
+                    level="warning",
+                )
+        elif learning_result.skipped:
+            log_auto_shutoff_event(
+                f"Auto-tune skipped confirmed fill: {learning_result.reason}"
+            )
+        else:
+            log_auto_shutoff_event(
+                "Auto-tune rejected sample: "
+                f"{learning_result.reason} "
+                f"(type={pending_fill_shutoff_type}, "
+                f"flow={pending_fill_flow_gpm:.1f} GPM, "
+                f"variation={pending_fill_flow_variation_gpm:.2f} GPM, "
+                f"requested={pending_fill_requested:.3f} gal, "
+                f"actual={pending_fill_gallons:.3f} gal, "
+                f"threshold={pending_fill_trigger_threshold:.3f} gal)",
+                level="warning",
+            )
+
         # Clear pending fill data
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
+        pending_fill_flow_variation_gpm = 0.0
 
     else:
         print("No pending fill to record")
@@ -4017,7 +4074,8 @@ def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_flow_variation_gpm
+    global last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global flow_cycle_counter, calibration_state
 
@@ -4057,6 +4115,7 @@ def update_dashboard():
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
     if is_flowing:
         recent_flow_rates_l_per_s.append(last_flow_rate)
+        recent_learning_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
     calibration_waiting_for_fill = (
@@ -4080,10 +4139,12 @@ def update_dashboard():
             pending_fill_shutoff_type = ""
             pending_fill_flow_gpm = 0.0
             pending_fill_trigger_threshold = 0.0
+            pending_fill_flow_variation_gpm = 0.0
             last_trigger_flow_gpm = 0.0
             last_trigger_threshold = 0.0
             last_trigger_actual = 0.0
             recent_flow_rates_l_per_s.clear()
+            recent_learning_flow_rates_l_per_s.clear()
             _refresh_calibration_window()
         else:
             # Determine if shutoff was automatic or manual
@@ -4094,8 +4155,12 @@ def update_dashboard():
                 pending_fill_trigger_threshold = last_trigger_threshold
             else:
                 smoothed_stop_flow_l_per_s = get_smoothed_flow_rate()
-                pending_fill_flow_gpm = smoothed_stop_flow_l_per_s * config.LITERS_PER_SEC_TO_GPM
-                pending_fill_trigger_threshold = calculate_trigger_threshold(smoothed_stop_flow_l_per_s)
+                stop_threshold = auto_shutoff_model.calculate_threshold(
+                    smoothed_stop_flow_l_per_s
+                )
+                pending_fill_flow_gpm = stop_threshold.flow_gpm
+                pending_fill_trigger_threshold = stop_threshold.final_threshold_gal
+            pending_fill_flow_variation_gpm = get_recent_flow_variation_gpm()
 
             # Store pending fill data (will be recorded when thumbs up is pressed)
             pending_fill_gallons = actual
@@ -4105,7 +4170,9 @@ def update_dashboard():
             print(
                 f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
                 f"Diff: {actual - requested_gallons:+.3f}, Type: {shutoff_type}, "
-                f"FlowAtStop: {pending_fill_flow_gpm:.1f} GPM, Threshold: {pending_fill_trigger_threshold:.3f}"
+                f"FlowAtStop: {pending_fill_flow_gpm:.1f} GPM, "
+                f"Variation: {pending_fill_flow_variation_gpm:.2f} GPM, "
+                f"Threshold: {pending_fill_trigger_threshold:.3f}"
             )
             print(f"Waiting for thumbs up button to record fill...")
 
@@ -4130,10 +4197,12 @@ def update_dashboard():
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
+        pending_fill_flow_variation_gpm = 0.0
         last_trigger_flow_gpm = 0.0
         last_trigger_threshold = 0.0
         last_trigger_actual = 0.0
         recent_flow_rates_l_per_s.clear()
+        recent_learning_flow_rates_l_per_s.clear()
         print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
 
     if calibration_mode and calibration_state and calibration_state.get("phase") == "settling":
@@ -4160,8 +4229,11 @@ def update_dashboard():
 
     # Calculate dynamic trigger threshold based on current flow rate
     smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
-    flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-    trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
+    threshold_details = auto_shutoff_model.calculate_threshold(
+        smoothed_flow_rate_l_per_s
+    )
+    flow_rate_gpm = threshold_details.flow_gpm
+    trigger_threshold = threshold_details.final_threshold_gal
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
@@ -4171,6 +4243,15 @@ def update_dashboard():
         last_trigger_flow_gpm = flow_rate_gpm
         last_trigger_threshold = trigger_threshold
         last_trigger_actual = actual
+        log_auto_shutoff_event(
+            "Auto-shutoff trigger details: "
+            f"flow={flow_rate_gpm:.1f} GPM, "
+            f"base={threshold_details.base_threshold_gal:.3f} gal, "
+            f"adaptive_delta={threshold_details.adaptive_delta_gal:+.3f} gal, "
+            f"confidence={threshold_details.confidence:.2f}, "
+            f"final_threshold={trigger_threshold:.3f} gal, "
+            f"samples={threshold_details.sample_count}"
+        )
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
         relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
         relay_thread.start()

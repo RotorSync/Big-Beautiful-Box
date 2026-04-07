@@ -153,15 +153,24 @@ Edit `config.py` to adjust:
 
 ### Flow Shutoff Curve
 
-The system predicts coast distance based on flow rate:
+The system predicts coast distance from a calibrated piecewise flow curve:
 
 ```
-coast_gallons = 0.030625 × GPM - 0.22375
+if GPM <= 70:
+    base_threshold = 0.025434093 * GPM - 0.128196183
+else:
+    base_threshold = 0.030867815 * GPM - 0.383364124
 ```
 
-Calibration data:
-- 22 GPM → 0.45 gal coast
-- 70 GPM → 1.92 gal coast
+The live trigger threshold then applies a bounded self-tuning overlay:
+
+```
+final_threshold = clamp(base_threshold + confidence * adaptive_delta)
+```
+
+The adaptive delta is learned only from confirmed auto fills and is persisted to
+`/home/pi/auto_shutoff_tuning.json`. Delete that file to reset the tuner back to
+the base curve.
 
 ## Installation
 

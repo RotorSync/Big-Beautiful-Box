@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from src.calculations import (
     calculate_trigger_threshold,
+    calculate_trigger_threshold_gpm,
     liters_to_gallons,
     gallons_to_liters,
     l_per_s_to_gpm,
@@ -62,17 +63,12 @@ class TestFlowThreshold:
         assert high_flow > low_flow
     
     def test_calibration_points(self):
-        """Test against known calibration data points."""
-        # From config: 22 GPM → 0.45 gal coast, 70 GPM → 1.92 gal coast
-        # 22 GPM = 22 / 15.85 = 1.388 L/s
-        threshold_22gpm = calculate_trigger_threshold(22 / config.LITERS_PER_SEC_TO_GPM)
-        # Should be close to 0.45 (within calibration tolerance)
-        assert 0.3 < threshold_22gpm < 0.6
-        
-        # 70 GPM = 70 / 15.85 = 4.416 L/s
-        threshold_70gpm = calculate_trigger_threshold(70 / config.LITERS_PER_SEC_TO_GPM)
-        # Should be close to 1.92
-        assert 1.5 < threshold_70gpm < 2.3
+        """Test against representative low-band and high-band calibration points."""
+        threshold_42_3gpm = calculate_trigger_threshold_gpm(42.3)
+        assert threshold_42_3gpm == pytest.approx(0.95, abs=0.15)
+
+        threshold_84_4gpm = calculate_trigger_threshold_gpm(84.4)
+        assert threshold_84_4gpm == pytest.approx(2.22, abs=0.15)
 
 
 class TestFlowDetection:

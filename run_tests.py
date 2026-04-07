@@ -7,6 +7,7 @@ For full test suite, use pytest in CI or with venv.
 import sys
 import os
 import traceback
+import tempfile
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,17 +38,45 @@ def run_basic_tests():
     try:
         from src.calculations import (
             calculate_trigger_threshold,
+            calculate_trigger_threshold_gpm,
             liters_to_gallons,
             is_flow_stopped,
             should_trigger_alert
         )
+        from src.auto_shutoff import AutoShutoffTuningModel
+        import config
         
         # Basic checks
         assert liters_to_gallons(0) == 0
         assert abs(liters_to_gallons(1) - 0.264172) < 0.001
         assert calculate_trigger_threshold(0) >= 0.1
+        assert calculate_trigger_threshold_gpm(42.3) > 0.8
+        assert calculate_trigger_threshold_gpm(84.4) > calculate_trigger_threshold_gpm(42.3)
         assert is_flow_stopped(0) is True
         assert is_flow_stopped(1.0) is False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = AutoShutoffTuningModel(os.path.join(temp_dir, "auto_tune.json"))
+            base_threshold = calculate_trigger_threshold_gpm(60.0)
+            manual_result = model.record_confirmed_fill(
+                "Manual", 60.0, 100.0, 100.5, base_threshold, 0.0
+            )
+            assert manual_result.skipped is True
+            for _ in range(config.AUTO_TUNE_MIN_SAMPLES):
+                learn_result = model.record_confirmed_fill(
+                    "Auto", 60.0, 100.0, 100.5, base_threshold, 0.0
+                )
+                assert learn_result.accepted is True
+            tuned = model.calculate_threshold(60.0 / config.LITERS_PER_SEC_TO_GPM)
+            assert tuned.final_threshold_gal > tuned.base_threshold_gal
+            unstable = model.record_confirmed_fill(
+                "Auto",
+                60.0,
+                100.0,
+                100.1,
+                base_threshold,
+                config.AUTO_TUNE_MAX_FLOW_VARIATION_GPM + 0.5,
+            )
+            assert unstable.accepted is False
         
         print("✓ PASS")
         passed += 1

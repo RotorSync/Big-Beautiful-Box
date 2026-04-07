@@ -15,6 +15,8 @@ import logging
 
 import config
 
+from .calculations import calculate_trigger_threshold as calculate_shared_trigger_threshold
+
 # Try to import iolhat
 try:
     import sys
@@ -188,14 +190,7 @@ def calculate_trigger_threshold(flow_rate_l_per_s: float) -> float:
     """
     Calculate shutoff trigger threshold based on flow rate.
     
-    Uses calibration curve to predict coast distance after relay activation.
-    
-    Args:
-        flow_rate_l_per_s: Current flow rate in liters per second
-        
-    Returns:
-        Gallons before target to trigger shutoff
+    This delegates to the shared base trigger threshold so the repo has a
+    single source of truth for the calibrated curve.
     """
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-    predicted_coast = config.FLOW_CURVE_SLOPE * flow_rate_gpm + config.FLOW_CURVE_INTERCEPT
-    return max(predicted_coast, 0.1)
+    return calculate_shared_trigger_threshold(flow_rate_l_per_s)
