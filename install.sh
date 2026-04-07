@@ -145,8 +145,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
 OPT_DIR="/opt"
 SOFTWARE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")"
-REPO_URL="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
-REPO_BRANCH="master"
+SOURCE_BRANCH="$(git -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || echo master)"
 
 if [ "$INSTALL_USER" != "pi" ]; then
     log_error "This installer currently expects to run as the pi user."
@@ -261,19 +260,16 @@ fi
 # Step 5: Install dashboard and Rotorsync files
 log_step "5/7: Installing dashboard files..."
 
-if [ -n "$REPO_URL" ]; then
-    if git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        log_info "Refreshing BBB git checkout in $INSTALL_DIR"
-        git -C "$INSTALL_DIR" fetch origin
-        git -C "$INSTALL_DIR" checkout -f "$REPO_BRANCH"
-        git -C "$INSTALL_DIR" reset --hard "origin/$REPO_BRANCH"
+if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ "$(realpath "$SCRIPT_DIR")" = "$(realpath "$INSTALL_DIR")" ]; then
+        log_info "Using current BBB checkout in $INSTALL_DIR"
     else
-        [ -d "$INSTALL_DIR" ] && mv "$INSTALL_DIR" "${INSTALL_DIR}.pre-git-backup.$(date +%Y%m%d-%H%M%S)"
-        log_info "Cloning BBB repo into $INSTALL_DIR"
-        git clone --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
+        [ -d "$INSTALL_DIR" ] && mv "$INSTALL_DIR" "${INSTALL_DIR}.pre-install-backup.$(date +%Y%m%d-%H%M%S)"
+        log_info "Cloning BBB locally from $SCRIPT_DIR into $INSTALL_DIR"
+        git clone --branch "$SOURCE_BRANCH" "$SCRIPT_DIR" "$INSTALL_DIR"
     fi
 else
-    log_warn "Installer repo has no origin remote; installing plain files and GitHub updater will not work on this box."
+    log_warn "Installer is not running from a git checkout; GitHub updater may not work on this box."
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR/src"
     mkdir -p "$INSTALL_DIR/RPi"
@@ -370,6 +366,11 @@ if [ -f "$INSTALL_DIR/Trailersync.png" ]; then
     install_boot_logo "$INSTALL_DIR/Trailersync.png" || \
         log_warn "Boot logo install failed; continuing"
 fi
+
+# Start services now so the system is usable immediately after install.
+sudo systemctl restart iol_dashboard.service || log_warn "Could not start iol_dashboard.service"
+sudo systemctl restart rotorsync.service || log_warn "Could not start rotorsync.service"
+sudo systemctl restart rotorsync_watchdog.service || log_warn "Could not start rotorsync_watchdog.service"
 
 # Done!
 echo ""
