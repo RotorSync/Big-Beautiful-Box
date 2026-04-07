@@ -69,6 +69,7 @@ BATCHMIX_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdef9')  # Batch mix d
 TRAILER_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefa')   # Trailer selection
 CONFIG_CMD_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefb') # Config command write
 CONFIG_DATA_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefc') # Config data read
+STATE_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefd')      # Live iOS-friendly dashboard state
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,8 +93,30 @@ dashboard_status = {
     'actual': 0.0,
     'mode': 'fill',
     'history': '',
+    'state': {},
+    'state_json': '{}',
     'last_update': 0
 }
+
+
+def _encode_ble_state_payload(state):
+    """Encode the dashboard snapshot into a compact BLE/iOS-friendly JSON payload."""
+    compact = {
+        'ver': state.get('version'),
+        'req': state.get('requested_gal'),
+        'act': state.get('actual_gal'),
+        'flow': state.get('flow_gpm'),
+        'mode': state.get('mode'),
+        'ov': state.get('override'),
+        'thumb': state.get('thumbs_visible'),
+        'pend': state.get('fill_pending'),
+        'confirm': state.get('can_confirm_fill'),
+        'green': state.get('colors_green'),
+        'latch': state.get('pump_stop_latched'),
+        'fm_ok': state.get('flow_meter_connected'),
+        'sb_ok': state.get('switch_box_connected'),
+    }
+    return json.dumps(compact, separators=(',', ':'))
 
 # Config command state
 config_response = '{"ok":false,"error":"No command issued"}'
@@ -141,12 +164,26 @@ def query_fill_history():
     return False
 
 def query_dashboard_status():
-    """Query dashboard for current requested/actual gallons"""
+    """Query dashboard for current state snapshot, with legacy STATUS fallback."""
     global dashboard_status
+    response = send_dashboard_command('STATE_JSON')
+    if response and response.startswith('STATE_JSON:'):
+        try:
+            payload = response.split(':', 1)[1]
+            state = json.loads(payload)
+            dashboard_status['state'] = state
+            dashboard_status['state_json'] = _encode_ble_state_payload(state)
+            dashboard_status['requested'] = float(state.get('requested_gal', 0.0))
+            dashboard_status['actual'] = float(state.get('actual_gal', 0.0))
+            dashboard_status['mode'] = str(state.get('mode', 'fill'))
+            dashboard_status['last_update'] = time.time()
+            return True
+        except Exception as e:
+            print(f'State JSON parse error: {e}', flush=True)
+
     response = send_dashboard_command('STATUS')
     if response and response.startswith('REQ:'):
         try:
-            # Parse "REQ:10.0|ACT:5.5|MODE:fill"
             parts = response.split('|')
             for part in parts:
                 if part.startswith('REQ:'):
@@ -155,6 +192,14 @@ def query_dashboard_status():
                     dashboard_status['actual'] = float(part[4:])
                 elif part.startswith('MODE:'):
                     dashboard_status['mode'] = part[5:]
+            dashboard_status['state'] = {
+                'requested_gal': dashboard_status['requested'],
+                'actual_gal': dashboard_status['actual'],
+                'mode': dashboard_status['mode'],
+            }
+            dashboard_status['state_json'] = _encode_ble_state_payload(
+                dashboard_status['state']
+            )
             dashboard_status['last_update'] = time.time()
             return True
         except Exception as e:
@@ -321,6 +366,14 @@ def make_dashboard_read_handler(field):
     def read_value(connection):
         value = str(dashboard_status[field])
         print(f'ReadValue {field}: {value}', flush=True)
+        return bytes(value, 'utf-8')
+    return read_value
+
+
+def make_state_read_handler():
+    def read_value(connection):
+        value = dashboard_status.get('state_json', '{}')
+        print(f'ReadValue state: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
 
@@ -1325,12 +1378,20 @@ def jbd_cmd(func):
     crc = sum([-b for b in frame[2:4]]) & 0xFFFF
     return bytes(frame + [crc >> 8, crc & 0xFF, 0x77])
 
-async def poll_dashboard_status():
-    """Periodically poll dashboard for status"""
+async def poll_dashboard_status(device, state_char):
+    """Periodically poll dashboard state and notify subscribers on change."""
     poll_count = 0
+    last_notified_state_json = dashboard_status.get('state_json', '{}')
     while True:
         try:
-            query_dashboard_status()
+            updated = query_dashboard_status()
+            current_state_json = dashboard_status.get('state_json', '{}')
+            if updated and current_state_json != last_notified_state_json:
+                await device.notify_subscribers(
+                    state_char,
+                    bytes(current_state_json, 'utf-8'),
+                )
+                last_notified_state_json = current_state_json
             # Poll history every 50 cycles (~10 seconds at 0.2s interval)
             poll_count += 1
             if poll_count >= 50:
@@ -1446,7 +1507,6 @@ async def main():
 
     if sensor_adapter:
         sensor_task = asyncio.create_task(read_sensors(sensor_device, sensor_adapter))
-    status_task = asyncio.create_task(poll_dashboard_status())
     gatt_monitor_task = asyncio.create_task(
         monitor_gatt_adapter(gatt_adapter, gatt_device_path)
     )
@@ -1478,6 +1538,12 @@ async def main():
         Characteristic.READABLE, CharacteristicValue(read=make_dashboard_read_handler('requested')))
     actual_char = Characteristic(ACTUAL_CHAR_UUID, Characteristic.Properties.READ,
         Characteristic.READABLE, CharacteristicValue(read=make_dashboard_read_handler('actual')))
+    state_char = Characteristic(
+        STATE_CHAR_UUID,
+        Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+        Characteristic.READABLE,
+        CharacteristicValue(read=make_state_read_handler()),
+    )
 
     history_char = Characteristic(HISTORY_CHAR_UUID, Characteristic.Properties.READ,
         Characteristic.READABLE, CharacteristicValue(read=make_history_read_handler()))
@@ -1501,8 +1567,26 @@ async def main():
         Characteristic.Properties.READ,
         Characteristic.READABLE, CharacteristicValue(read=config_data_read_handler))
 
-    service = Service(SERVICE_UUID, [bms_char, mopeka1_char, mopeka2_char, pump_char, gallons_char, requested_char, actual_char, history_char, batchmix_char, trailer_char, config_cmd_char, config_data_char])
+    service = Service(
+        SERVICE_UUID,
+        [
+            bms_char,
+            mopeka1_char,
+            mopeka2_char,
+            pump_char,
+            gallons_char,
+            requested_char,
+            actual_char,
+            state_char,
+            history_char,
+            batchmix_char,
+            trailer_char,
+            config_cmd_char,
+            config_data_char,
+        ],
+    )
     device.add_service(service)
+    status_task = asyncio.create_task(poll_dashboard_status(device, state_char))
 
     await device.power_on()
     print(f'Device address: {device.public_address}', flush=True)
@@ -1528,6 +1612,7 @@ async def main():
     print('  def5: Gallons (write)   - "+1", "-1", "+10", "-10"', flush=True)
     print('  def6: Requested (read)  - requested gallons', flush=True)
     print('  def7: Actual (read)     - actual gallons', flush=True)
+    print('  defd: State (r/n)       - live dashboard JSON snapshot', flush=True)
     print('  def8: History (read)    - last 5 fills', flush=True)
     print('  def9: BatchMix (write)  - JSON batch mix data from iPad', flush=True)
     print('  defa: Trailer (r/w)     - write trailer # to configure, read for current', flush=True)

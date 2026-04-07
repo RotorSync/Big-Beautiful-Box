@@ -348,6 +348,7 @@ def switch_mode(new_mode):
             thumbs_up_animation_id = None
         if thumbs_up_label:
             thumbs_up_label.place_forget()
+            _set_thumbs_up_visible(False)
 
     # Update mode indicator
     if mode_indicator_label:
@@ -995,6 +996,7 @@ def change_colors_to_green(from_button=False):
             # Show big thumbs up on the right side and start animation!
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
+                _set_thumbs_up_visible(True)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -1017,6 +1019,7 @@ def change_colors_to_green(from_button=False):
             # Show thumbs up but DO NOT change colors to green
             if thumbs_up_label:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
+                _set_thumbs_up_visible(True)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -1304,6 +1307,40 @@ def _calibration_points_path():
 
 def _calibration_runs_path():
     return "/home/pi/tank_calibration_runs.json"
+
+
+def _build_dashboard_state_snapshot():
+    """Build a compact state snapshot for BLE/iPad clients."""
+    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+    flow_meter_connected = (time.time() - last_successful_read_time) <= config.FLOW_METER_TIMEOUT
+    switch_box_connected = bool(serial_connected and not heartbeat_disconnected)
+    fill_pending = pending_fill_gallons > 0
+    can_confirm_fill = bool(fill_pending and last_flow_rate < config.FLOW_STOPPED_THRESHOLD)
+
+    return {
+        "version": VERSION,
+        "requested_gal": round(requested_gallons, 3),
+        "actual_gal": round(actual_gallons, 3),
+        "flow_gpm": round(flow_gpm, 2),
+        "mode": current_mode,
+        "override": bool(override_mode),
+        "thumbs_visible": bool(thumbs_up_visible),
+        "fill_pending": bool(fill_pending),
+        "can_confirm_fill": bool(can_confirm_fill),
+        "colors_green": bool(colors_are_green),
+        "pump_stop_latched": bool(auto_shutoff_latched),
+        "flow_meter_connected": bool(flow_meter_connected),
+        "switch_box_connected": bool(switch_box_connected),
+        "bms_soc": None if bms_soc is None else int(round(bms_soc)),
+        "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
+        "front_tank_gal": round(mopeka1_gallons, 1),
+        "back_tank_gal": round(mopeka2_gallons, 1),
+        "front_tank_quality": int(mopeka1_quality),
+        "back_tank_quality": int(mopeka2_quality),
+        "mopeka_connected": bool(mopeka_connected),
+        "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
+    }
 
 
 def _save_calibration_run():
@@ -3052,6 +3089,13 @@ def socket_command_listener():
                                 client.send(response.encode())
                                 continue
 
+                            if line == "STATE_JSON":
+                                snapshot = _build_dashboard_state_snapshot()
+                                client.send(
+                                    f"STATE_JSON:{json.dumps(snapshot, separators=(',', ':'))}\n".encode()
+                                )
+                                continue
+
                             elif line == "MIX":
                                 root.after(0, lambda: switch_mode("mix"))
 
@@ -3945,6 +3989,7 @@ thumbs_up_frames = []
 thumbs_up_frame_index = [0]  # Use list for mutable reference
 thumbs_up_label = None
 thumbs_up_animation_id = None
+thumbs_up_visible = False
 
 def load_thumbs_up_gif():
     """Load thumbs up image (PNG or GIF) for display"""
@@ -4001,6 +4046,14 @@ def load_thumbs_up_gif():
         print(f"Could not load thumbs up image: {e}")
         thumbs_up_label = tk.Label(root, text="👍", font=("Helvetica", 400, "bold"),
                                    foreground="green", background="black")
+
+
+def _set_thumbs_up_visible(visible):
+    """Track whether the thumbs-up indicator is currently visible."""
+    global thumbs_up_visible
+    thumbs_up_visible = bool(visible)
+
+
 def animate_thumbs_up():
     """Animate the thumbs up GIF"""
     global thumbs_up_animation_id
@@ -4075,6 +4128,7 @@ def update_dashboard():
             calibration_state["flow_started"] = False
             if thumbs_up_label:
                 thumbs_up_label.place_forget()
+                _set_thumbs_up_visible(False)
             pending_fill_gallons = 0.0
             pending_fill_requested = 0.0
             pending_fill_shutoff_type = ""
@@ -4124,6 +4178,7 @@ def update_dashboard():
         # Hide thumbs up when new cycle starts
         if thumbs_up_label:
             thumbs_up_label.place_forget()
+            _set_thumbs_up_visible(False)
         # Clear any pending fill data from previous cycle
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
