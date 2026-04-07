@@ -220,6 +220,7 @@ sudo apt upgrade -y
 # Step 2: Install dependencies
 log_step "2/7: Installing dependencies..."
 sudo apt install -y \
+    openssh-server \
     python3 \
     python3-tk \
     python3-serial \
@@ -241,6 +242,8 @@ sudo apt install -y \
     plymouth-themes
 
 sudo usermod -a -G dialout $INSTALL_USER
+sudo systemctl enable ssh
+sudo systemctl start ssh
 
 # Install Python packages used by the BLE/Rotorsync stack
 python3 -m pip install --break-system-packages --upgrade pip
