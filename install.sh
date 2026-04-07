@@ -31,6 +31,38 @@ append_if_missing() {
     grep -Fqx "$line" "$file" || echo "$line" | sudo tee -a "$file" > /dev/null
 }
 
+copy_if_needed() {
+    local src="$1"
+    local dst="$2"
+
+    if [ ! -e "$src" ]; then
+        log_warn "Missing expected file: $src"
+        return 1
+    fi
+
+    if [ "$(realpath "$src")" = "$(realpath -m "$dst")" ]; then
+        return 0
+    fi
+
+    cp "$src" "$dst"
+}
+
+copy_tree_contents_if_needed() {
+    local src_dir="$1"
+    local dst_dir="$2"
+
+    if [ ! -d "$src_dir" ]; then
+        log_warn "Missing expected directory: $src_dir"
+        return 1
+    fi
+
+    if [ "$(realpath "$src_dir")" = "$(realpath -m "$dst_dir")" ]; then
+        return 0
+    fi
+
+    cp -r "$src_dir/"* "$dst_dir/"
+}
+
 install_boot_logo() {
     local image_path="$1"
     local theme_name="trailersync"
@@ -311,17 +343,17 @@ sudo mkdir -p "$OPT_DIR/src"
 sudo mkdir -p "$OPT_DIR/mopeka"
 
 # Copy dashboard/runtime files
-cp "$SCRIPT_DIR/dashboard.py" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/config.py" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/iolhat.py" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/start_iol_dashboard.sh" "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/src/"* "$INSTALL_DIR/src/"
-cp -r "$SCRIPT_DIR/RPi/"* "$INSTALL_DIR/RPi/"
-cp -r "$SCRIPT_DIR/mopeka/"* "$INSTALL_DIR/mopeka/"
-cp -r "$SCRIPT_DIR/deploy/"* "$INSTALL_DIR/deploy/"
-cp "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/"
-[ -f "$SCRIPT_DIR/Trailersync.png" ] && cp "$SCRIPT_DIR/Trailersync.png" "$INSTALL_DIR/"
+copy_if_needed "$SCRIPT_DIR/dashboard.py" "$INSTALL_DIR/dashboard.py"
+copy_if_needed "$SCRIPT_DIR/config.py" "$INSTALL_DIR/config.py"
+copy_if_needed "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
+copy_if_needed "$SCRIPT_DIR/iolhat.py" "$INSTALL_DIR/iolhat.py"
+copy_if_needed "$SCRIPT_DIR/start_iol_dashboard.sh" "$INSTALL_DIR/start_iol_dashboard.sh"
+copy_tree_contents_if_needed "$SCRIPT_DIR/src" "$INSTALL_DIR/src"
+copy_tree_contents_if_needed "$SCRIPT_DIR/RPi" "$INSTALL_DIR/RPi"
+copy_tree_contents_if_needed "$SCRIPT_DIR/mopeka" "$INSTALL_DIR/mopeka"
+copy_tree_contents_if_needed "$SCRIPT_DIR/deploy" "$INSTALL_DIR/deploy"
+copy_if_needed "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/install.sh"
+[ -f "$SCRIPT_DIR/Trailersync.png" ] && copy_if_needed "$SCRIPT_DIR/Trailersync.png" "$INSTALL_DIR/Trailersync.png"
 
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
@@ -332,10 +364,10 @@ sudo cp -r "$SCRIPT_DIR/mopeka/"* "$OPT_DIR/mopeka/"
 sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 # Copy optional files
-[ -f "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" ] && cp "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" "$INSTALL_DIR/"
-[ -f "$SCRIPT_DIR/thumbs_up.png" ] && cp "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_DIR/"
-[ -f "$SCRIPT_DIR/thumbs_up.png" ] && cp "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_HOME/"
-[ -f "$SCRIPT_DIR/README.md" ] && cp "$SCRIPT_DIR/README.md" "$INSTALL_DIR/"
+[ -f "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" ] && copy_if_needed "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" "$INSTALL_DIR/bbb_diagram_rotated.jpeg"
+[ -f "$SCRIPT_DIR/thumbs_up.png" ] && copy_if_needed "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_DIR/thumbs_up.png"
+[ -f "$SCRIPT_DIR/thumbs_up.png" ] && copy_if_needed "$SCRIPT_DIR/thumbs_up.png" "$INSTALL_HOME/thumbs_up.png"
+[ -f "$SCRIPT_DIR/README.md" ] && copy_if_needed "$SCRIPT_DIR/README.md" "$INSTALL_DIR/README.md"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
