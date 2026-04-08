@@ -71,6 +71,7 @@ CONFIG_CMD_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefb') # Config com
 CONFIG_DATA_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefc') # Config data read
 STATE_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefd')      # Live iOS-friendly dashboard state
 COMMAND_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefe')    # JSON command channel for iOS app
+CONFIG_NOTIFY_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdeff')  # Config response notify/read
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -122,6 +123,8 @@ def _encode_ble_state_payload(state):
 # Config command state
 config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
+config_notify_char = None
+ble_device = None
 
 # Chunked config command buffer
 config_cmd_chunks = {}
@@ -377,6 +380,70 @@ def make_state_read_handler():
         print(f'ReadValue state: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
+
+
+def make_config_notify_read_handler():
+    def read_value(connection):
+        value = config_response
+        print(f'ReadValue config_notify: {value[:120]}', flush=True)
+        return bytes(value, 'utf-8')
+    return read_value
+
+
+def _connection_key(connection):
+    for attr in ('peer_address', 'address', 'handle'):
+        value = getattr(connection, attr, None)
+        if value is not None:
+            return str(value)
+    return 'default'
+
+
+def _notify_config_response():
+    if not ble_device or not config_notify_char:
+        return
+
+    async def _notify():
+        try:
+            await ble_device.notify_subscribers(config_notify_char, config_response.encode('utf-8'))
+        except Exception as e:
+            print(f'Config notify error: {e}', flush=True)
+
+    try:
+        asyncio.get_running_loop().create_task(_notify())
+    except RuntimeError:
+        pass
+
+
+def _set_config_response_obj(obj):
+    global config_response
+    config_response = json.dumps(obj, separators=(',', ':'))
+    _notify_config_response()
+
+
+def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450):
+    global config_response_pages
+    pages = paginate_response(items, page_size_bytes=page_size_bytes)
+    enriched_pages = []
+    for page_json in pages:
+        page_obj = json.loads(page_json)
+        if request_id is not None:
+            page_obj['request_id'] = request_id
+        if op:
+            page_obj['op'] = op
+        enriched_pages.append(json.dumps(page_obj, separators=(',', ':')))
+    config_response_pages = enriched_pages
+    if enriched_pages:
+        _set_config_response_obj(json.loads(enriched_pages[0]))
+    else:
+        _set_config_response_obj({
+            'ok': True,
+            'op': op,
+            'request_id': request_id,
+            'page': 1,
+            'total_pages': 1,
+            'total_items': 0,
+            'items': [],
+        })
 
 def pump_write_handler(connection, value):
     """Handle pump control writes. Write '1' or 'PS' to stop pump."""
@@ -837,24 +904,25 @@ def _wifi_code_from_response(resp):
 def _wifi_set_from_ble(cmd):
     """Handle WIFI_SET operation from config command channel and forward to dashboard."""
     global config_response, config_response_pages
+    request_id = cmd.get('request_id')
 
     ssid = str(cmd.get('ssid', '')).strip()
     password = str(cmd.get('password', ''))
     hidden = bool(cmd.get('hidden', False))
 
     if not ssid:
-        config_response = json.dumps({'ok': False, 'error': 'Missing ssid'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'WIFI_SET', 'request_id': request_id, 'error': 'Missing ssid'})
         return
 
     if len(ssid) > 64:
-        config_response = json.dumps({'ok': False, 'error': 'SSID too long'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'WIFI_SET', 'request_id': request_id, 'error': 'SSID too long'})
         return
 
     if len(password) > 128:
-        config_response = json.dumps({'ok': False, 'error': 'Password too long'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'WIFI_SET', 'request_id': request_id, 'error': 'Password too long'})
         return
 
     payload = {
@@ -872,16 +940,20 @@ def _wifi_set_from_ble(cmd):
         except Exception:
             data = {'ssid': ssid}
         data['ok'] = True
-        config_response = json.dumps(data, separators=(',', ':'))
+        data['op'] = 'WIFI_SET'
+        if request_id is not None:
+            data['request_id'] = request_id
+        _set_config_response_obj(data)
     else:
-        config_response = json.dumps({'ok': False, 'error': code}, separators=(',', ':'))
+        _set_config_response_obj({'ok': False, 'op': 'WIFI_SET', 'request_id': request_id, 'error': code})
 
     config_response_pages = []
 
 
-def _wifi_status_from_ble():
+def _wifi_status_from_ble(cmd=None):
     """Query current WiFi status from dashboard."""
     global config_response, config_response_pages
+    request_id = cmd.get('request_id') if isinstance(cmd, dict) else None
 
     resp = send_dashboard_command('WIFI_STATUS')
     if resp and resp.startswith('WIFI_STATUS:'):
@@ -890,9 +962,12 @@ def _wifi_status_from_ble():
             data = json.loads(payload)
         except Exception:
             data = {'ok': False, 'error': 'PARSE_ERROR'}
-        config_response = json.dumps(data, separators=(',', ':'))
+        data['op'] = 'WIFI_STATUS'
+        if request_id is not None:
+            data['request_id'] = request_id
+        _set_config_response_obj(data)
     else:
-        config_response = json.dumps({'ok': False, 'error': 'NO_RESPONSE'}, separators=(',', ':'))
+        _set_config_response_obj({'ok': False, 'op': 'WIFI_STATUS', 'request_id': request_id, 'error': 'NO_RESPONSE'})
     config_response_pages = []
 
 
@@ -908,43 +983,110 @@ def process_config_command(cmd_str):
         return
 
     op = cmd.get('op', '')
+    request_id = cmd.get('request_id')
     print(f'Config command: {op}', flush=True)
 
     try:
         if op == 'WIFI_SET':
             _wifi_set_from_ble(cmd)
         elif op == 'WIFI_STATUS':
-            _wifi_status_from_ble()
+            _wifi_status_from_ble(cmd)
+        elif op == 'GET_TRAILER':
+            _cmd_get_trailer(request_id=request_id)
+        elif op == 'SELECT_TRAILER':
+            _cmd_select_trailer(cmd, request_id=request_id)
         elif op == 'LIST_TRAILERS':
-            _cmd_list_trailers()
+            _cmd_list_trailers(request_id=request_id)
         elif op == 'LIST_SENSORS':
-            _cmd_list_sensors(cmd)
+            _cmd_list_sensors(cmd, request_id=request_id)
         elif op == 'ADD_SENSOR':
-            _cmd_add_sensor(cmd)
+            _cmd_add_sensor(cmd, request_id=request_id)
         elif op == 'UPDATE_SENSOR':
-            _cmd_update_sensor(cmd)
+            _cmd_update_sensor(cmd, request_id=request_id)
         elif op == 'DELETE_SENSOR':
-            _cmd_delete_sensor(cmd)
+            _cmd_delete_sensor(cmd, request_id=request_id)
         elif op == 'LIST_CALIBRATION':
-            _cmd_list_calibration()
+            _cmd_list_calibration(request_id=request_id)
         elif op == 'ADD_CALIBRATION':
-            _cmd_add_calibration(cmd)
+            _cmd_add_calibration(cmd, request_id=request_id)
         elif op == 'UPDATE_CALIBRATION':
-            _cmd_update_calibration(cmd)
+            _cmd_update_calibration(cmd, request_id=request_id)
         elif op == 'DELETE_CALIBRATION':
-            _cmd_delete_calibration(cmd)
+            _cmd_delete_calibration(cmd, request_id=request_id)
         elif op == 'PAGE':
-            _cmd_page(cmd)
+            _cmd_page(cmd, request_id=request_id)
         else:
-            config_response = json.dumps({'ok': False, 'error': f'Unknown op: {op}'})
+            _set_config_response_obj({'ok': False, 'error': f'Unknown op: {op}', 'request_id': request_id, 'op': op})
             config_response_pages = []
     except Exception as e:
         print(f'Config command error: {e}', flush=True)
-        config_response = json.dumps({'ok': False, 'error': str(e)})
+        _set_config_response_obj({'ok': False, 'error': str(e), 'request_id': request_id, 'op': op})
         config_response_pages = []
 
 
-def _cmd_list_trailers():
+def _current_trailer_info():
+    cfg = load_config()
+    trailer_num = cfg.get('trailer')
+    if trailer_num is None:
+        return {'trailer': None}
+
+    sensors = load_sensor_csv()
+    trailer_sensors = [s for s in sensors if str(s.get('Trailer')) == str(trailer_num)]
+    front = next((s for s in trailer_sensors if s.get('Tank') == 'Front'), None)
+    back = next((s for s in trailer_sensors if s.get('Tank') == 'Back'), None)
+    man = trailer_sensors[0].get('Man', '') if trailer_sensors else ''
+
+    def get_offset(sensor):
+        if sensor and sensor.get('Height Offset'):
+            try:
+                return float(sensor['Height Offset'])
+            except ValueError:
+                pass
+        return 0.0
+
+    return {
+        'trailer': trailer_num,
+        'man': man,
+        'front': {
+            'id': front['Mopeka ID'] if front else '---------------',
+            'offset': get_offset(front)
+        },
+        'back': {
+            'id': back['Mopeka ID'] if back else '---------------',
+            'offset': get_offset(back)
+        }
+    }
+
+
+def _cmd_get_trailer(*, request_id=None):
+    global config_response_pages
+    config_response_pages = []
+    payload = {'ok': True, 'op': 'GET_TRAILER', 'current': _current_trailer_info()}
+    if request_id is not None:
+        payload['request_id'] = request_id
+    _set_config_response_obj(payload)
+
+
+def _cmd_select_trailer(cmd, *, request_id=None):
+    global config_response_pages
+    trailer_num = cmd.get('trailer')
+    try:
+        trailer_num = int(trailer_num)
+    except Exception:
+        config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'error': 'Invalid trailer'})
+        return
+
+    result = apply_trailer(trailer_num)
+    config_response_pages = []
+    if result is None:
+        _set_config_response_obj({'ok': False, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'error': f'Trailer {trailer_num} not found'})
+        return
+
+    _set_config_response_obj({'ok': True, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'current': result})
+
+
+def _cmd_list_trailers(*, request_id=None):
     global config_response, config_response_pages
     sensors = load_sensor_csv()
 
@@ -961,12 +1103,10 @@ def _cmd_list_trailers():
             trailers[t]['back'] = mid
 
     items = sorted(trailers.values(), key=lambda x: x.get('trailer', 0))
-    pages = paginate_response(items)
-    config_response_pages = pages
-    config_response = pages[0] if pages else json.dumps({'page': 1, 'total_pages': 1, 'total_items': 0, 'items': []})
+    _set_paginated_config_response(items, request_id=request_id, op='LIST_TRAILERS')
 
 
-def _cmd_list_sensors(cmd):
+def _cmd_list_sensors(cmd, *, request_id=None):
     global config_response, config_response_pages
     sensors = load_sensor_csv()
 
@@ -986,17 +1126,15 @@ def _cmd_list_sensors(cmd):
         }
         items.append(item)
 
-    pages = paginate_response(items)
-    config_response_pages = pages
-    config_response = pages[0] if pages else json.dumps({'page': 1, 'total_pages': 1, 'total_items': 0, 'items': []})
+    _set_paginated_config_response(items, request_id=request_id, op='LIST_SENSORS')
 
 
-def _cmd_add_sensor(cmd):
+def _cmd_add_sensor(cmd, *, request_id=None):
     global config_response, config_response_pages
     data = cmd.get('data')
     if not data:
-        config_response = json.dumps({'ok': False, 'error': 'Missing data field'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'ADD_SENSOR', 'request_id': request_id, 'error': 'Missing data field'})
         return
 
     sensors = load_sensor_csv()
@@ -1013,8 +1151,8 @@ def _cmd_add_sensor(cmd):
             new_sensor[csv_key] = str(data[json_key])
 
     if 'Mopeka ID' not in new_sensor or 'Trailer' not in new_sensor or 'Tank' not in new_sensor:
-        config_response = json.dumps({'ok': False, 'error': 'Required: id, trailer, tank'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'ADD_SENSOR', 'request_id': request_id, 'error': 'Required: id, trailer, tank'})
         return
 
     sensors.append(new_sensor)
@@ -1024,17 +1162,17 @@ def _cmd_add_sensor(cmd):
     save_sensor_csv(sensors)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'ADD_SENSOR', 'id': new_sensor.get('Mopeka ID', '')})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'ADD_SENSOR', 'request_id': request_id, 'id': new_sensor.get('Mopeka ID', '')})
 
 
-def _cmd_update_sensor(cmd):
+def _cmd_update_sensor(cmd, *, request_id=None):
     global config_response, config_response_pages
     sensor_id = cmd.get('id')
     data = cmd.get('data')
     if not sensor_id or not data:
-        config_response = json.dumps({'ok': False, 'error': 'Required: id, data'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'UPDATE_SENSOR', 'request_id': request_id, 'error': 'Required: id, data'})
         return
 
     sensors = load_sensor_csv()
@@ -1054,23 +1192,23 @@ def _cmd_update_sensor(cmd):
             break
 
     if not found:
-        config_response = json.dumps({'ok': False, 'error': f'Sensor {sensor_id} not found'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'UPDATE_SENSOR', 'request_id': request_id, 'error': f'Sensor {sensor_id} not found'})
         return
 
     save_sensor_csv(sensors)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'UPDATE_SENSOR', 'id': sensor_id})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'UPDATE_SENSOR', 'request_id': request_id, 'id': sensor_id})
 
 
-def _cmd_delete_sensor(cmd):
+def _cmd_delete_sensor(cmd, *, request_id=None):
     global config_response, config_response_pages
     sensor_id = cmd.get('id')
     if not sensor_id:
-        config_response = json.dumps({'ok': False, 'error': 'Required: id'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'DELETE_SENSOR', 'request_id': request_id, 'error': 'Required: id'})
         return
 
     sensors = load_sensor_csv()
@@ -1078,18 +1216,18 @@ def _cmd_delete_sensor(cmd):
     sensors = [s for s in sensors if s.get('Mopeka ID') != sensor_id]
 
     if len(sensors) == original_len:
-        config_response = json.dumps({'ok': False, 'error': f'Sensor {sensor_id} not found'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'DELETE_SENSOR', 'request_id': request_id, 'error': f'Sensor {sensor_id} not found'})
         return
 
     save_sensor_csv(sensors)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'DELETE_SENSOR', 'id': sensor_id})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'DELETE_SENSOR', 'request_id': request_id, 'id': sensor_id})
 
 
-def _cmd_list_calibration():
+def _cmd_list_calibration(*, request_id=None):
     global config_response, config_response_pages
     points = load_calibration_csv()
 
@@ -1102,22 +1240,20 @@ def _cmd_list_calibration():
             'tank_size': p['tank_size']
         })
 
-    pages = paginate_response(items)
-    config_response_pages = pages
-    config_response = pages[0] if pages else json.dumps({'page': 1, 'total_pages': 1, 'total_items': 0, 'items': []})
+    _set_paginated_config_response(items, request_id=request_id, op='LIST_CALIBRATION')
 
 
-def _cmd_add_calibration(cmd):
+def _cmd_add_calibration(cmd, *, request_id=None):
     global config_response, config_response_pages
     data = cmd.get('data')
     if not data:
-        config_response = json.dumps({'ok': False, 'error': 'Missing data field'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'ADD_CALIBRATION', 'request_id': request_id, 'error': 'Missing data field'})
         return
 
     if 'tank_level_in' not in data or 'gallons' not in data:
-        config_response = json.dumps({'ok': False, 'error': 'Required: tank_level_in, gallons'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'ADD_CALIBRATION', 'request_id': request_id, 'error': 'Required: tank_level_in, gallons'})
         return
 
     points = load_calibration_csv()
@@ -1130,23 +1266,23 @@ def _cmd_add_calibration(cmd):
     save_calibration_csv(points)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'ADD_CALIBRATION'})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'ADD_CALIBRATION', 'request_id': request_id})
 
 
-def _cmd_update_calibration(cmd):
+def _cmd_update_calibration(cmd, *, request_id=None):
     global config_response, config_response_pages
     index = cmd.get('index')
     data = cmd.get('data')
     if index is None or not data:
-        config_response = json.dumps({'ok': False, 'error': 'Required: index, data'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'error': 'Required: index, data'})
         return
 
     points = load_calibration_csv()
     if index < 0 or index >= len(points):
-        config_response = json.dumps({'ok': False, 'error': f'Index {index} out of range (0-{len(points)-1})'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'error': f'Index {index} out of range (0-{len(points)-1})'})
         return
 
     for key in ('tank_level_in', 'gallons', 'tank_size'):
@@ -1156,44 +1292,47 @@ def _cmd_update_calibration(cmd):
     save_calibration_csv(points)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'UPDATE_CALIBRATION', 'index': index})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'index': index})
 
 
-def _cmd_delete_calibration(cmd):
+def _cmd_delete_calibration(cmd, *, request_id=None):
     global config_response, config_response_pages
     index = cmd.get('index')
     if index is None:
-        config_response = json.dumps({'ok': False, 'error': 'Required: index'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'error': 'Required: index'})
         return
 
     points = load_calibration_csv()
     if index < 0 or index >= len(points):
-        config_response = json.dumps({'ok': False, 'error': f'Index {index} out of range (0-{len(points)-1})'})
         config_response_pages = []
+        _set_config_response_obj({'ok': False, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'error': f'Index {index} out of range (0-{len(points)-1})'})
         return
 
     points.pop(index)
     save_calibration_csv(points)
     _reload_converter()
 
-    config_response = json.dumps({'ok': True, 'op': 'DELETE_CALIBRATION', 'index': index})
     config_response_pages = []
+    _set_config_response_obj({'ok': True, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'index': index})
 
 
-def _cmd_page(cmd):
+def _cmd_page(cmd, *, request_id=None):
     global config_response
     page = cmd.get('page', 1)
     if not config_response_pages:
-        config_response = json.dumps({'ok': False, 'error': 'No paginated data available'})
+        _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': 'No paginated data available'})
         return
 
     if page < 1 or page > len(config_response_pages):
-        config_response = json.dumps({'ok': False, 'error': f'Page {page} out of range (1-{len(config_response_pages)})'})
+        _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': f'Page {page} out of range (1-{len(config_response_pages)})'})
         return
 
-    config_response = config_response_pages[page - 1]
+    page_obj = json.loads(config_response_pages[page - 1])
+    if request_id is not None:
+        page_obj['request_id'] = request_id
+    _set_config_response_obj(page_obj)
 
 
 def _reload_converter():
@@ -1210,40 +1349,7 @@ def _reload_converter():
 
 def trailer_read_handler(connection):
     """Read current trailer config as JSON."""
-    cfg = load_config()
-    trailer_num = cfg.get('trailer')
-    if trailer_num is None:
-        value = json.dumps({'trailer': None})
-        print(f'ReadValue trailer: {value}', flush=True)
-        return value.encode('utf-8')
-
-    sensors = load_sensor_csv()
-    trailer_sensors = [s for s in sensors if str(s.get('Trailer')) == str(trailer_num)]
-
-    front = next((s for s in trailer_sensors if s.get('Tank') == 'Front'), None)
-    back = next((s for s in trailer_sensors if s.get('Tank') == 'Back'), None)
-    man = trailer_sensors[0].get('Man', '') if trailer_sensors else ''
-
-    def get_offset(sensor):
-        if sensor and sensor.get('Height Offset'):
-            try:
-                return float(sensor['Height Offset'])
-            except ValueError:
-                pass
-        return 0.0
-
-    info = {
-        'trailer': trailer_num,
-        'man': man,
-        'front': {
-            'id': front['Mopeka ID'] if front else '---------------',
-            'offset': get_offset(front)
-        },
-        'back': {
-            'id': back['Mopeka ID'] if back else '---------------',
-            'offset': get_offset(back)
-        }
-    }
+    info = _current_trailer_info()
     value = json.dumps(info, separators=(',', ':'))
     print(f'ReadValue trailer: {value}', flush=True)
     return value.encode('utf-8')
@@ -1271,6 +1377,7 @@ def config_cmd_write_handler(connection, value):
 
     try:
         data_str = value.decode('utf-8').strip()
+        connection_key = _connection_key(connection)
 
         if data_str.startswith('CHUNK:'):
             parts = data_str.split(':', 2)
@@ -1281,25 +1388,27 @@ def config_cmd_write_handler(connection, value):
 
                 print(f'ConfigCmd chunk {chunk_num}/{total_chunks} ({len(chunk_data)} bytes)', flush=True)
 
-                if 'total' not in config_cmd_chunks or config_cmd_chunks['total'] != total_chunks:
-                    config_cmd_chunks = {
+                buffer = config_cmd_chunks.get(connection_key)
+                if not buffer or buffer.get('total') != total_chunks:
+                    buffer = {
                         'chunks': {},
                         'total': total_chunks,
                         'timestamp': time.time()
                     }
+                    config_cmd_chunks[connection_key] = buffer
 
-                config_cmd_chunks['chunks'][chunk_num] = chunk_data
-                config_cmd_chunks['timestamp'] = time.time()
+                buffer['chunks'][chunk_num] = chunk_data
+                buffer['timestamp'] = time.time()
 
-                if len(config_cmd_chunks['chunks']) == total_chunks:
+                if len(buffer['chunks']) == total_chunks:
                     assembled = ''
                     for i in range(1, total_chunks + 1):
-                        if i in config_cmd_chunks['chunks']:
-                            assembled += config_cmd_chunks['chunks'][i]
+                        if i in buffer['chunks']:
+                            assembled += buffer['chunks'][i]
                         else:
                             print(f'ConfigCmd: missing chunk {i}!', flush=True)
                             return
-                    config_cmd_chunks = {}
+                    config_cmd_chunks.pop(connection_key, None)
                     process_config_command(assembled)
         else:
             process_config_command(data_str)
@@ -1551,6 +1660,7 @@ async def read_sensors(sensor_device, sensor_adapter):
         await asyncio.sleep(SCAN_INTERVAL)
 
 async def main():
+    global ble_device, config_notify_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
@@ -1598,6 +1708,7 @@ async def main():
 
     host = Host(hci_transport.source, hci_transport.sink)
     device = Device(name='TrailerSync-TR2', host=host)
+    ble_device = device
 
     # Create characteristics - READ for sensors
     bms_char = Characteristic(BMS_CHAR_UUID, Characteristic.Properties.READ,
@@ -1654,6 +1765,12 @@ async def main():
     config_data_char = Characteristic(CONFIG_DATA_CHAR_UUID,
         Characteristic.Properties.READ,
         Characteristic.READABLE, CharacteristicValue(read=config_data_read_handler))
+    config_notify_char = Characteristic(
+        CONFIG_NOTIFY_CHAR_UUID,
+        Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+        Characteristic.READABLE,
+        CharacteristicValue(read=make_config_notify_read_handler()),
+    )
 
     service = Service(
         SERVICE_UUID,
@@ -1672,6 +1789,7 @@ async def main():
             trailer_char,
             config_cmd_char,
             config_data_char,
+            config_notify_char,
         ],
     )
     device.add_service(service)
@@ -1708,6 +1826,7 @@ async def main():
     print('  defa: Trailer (r/w)     - write trailer # to configure, read for current', flush=True)
     print('  defb: ConfigCmd (write) - JSON commands for sensor/calibration CRUD', flush=True)
     print('  defc: ConfigData (read) - response from last config command', flush=True)
+    print('  deff: ConfigNotify(r/n) - last config response with request_id echo', flush=True)
 
     await asyncio.Event().wait()
 
