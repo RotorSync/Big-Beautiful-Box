@@ -761,6 +761,16 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
+def _normalize_ble_mac(value):
+    mac = str(value or '').strip().upper().replace('-', ':')
+    parts = mac.split(':')
+    if len(parts) != 6 or any(len(part) != 2 for part in parts):
+        return None
+    if any(any(ch not in '0123456789ABCDEF' for ch in part) for part in parts):
+        return None
+    return ':'.join(parts)
+
+
 # =============================================================================
 # Trailer Selection Logic
 # =============================================================================
@@ -801,11 +811,12 @@ def apply_trailer(trailer_num):
         MOPEKA2_MAC_SUFFIX = back_id
 
     # Persist to config
-    cfg = {
+    cfg = load_config()
+    cfg.update({
         'trailer': trailer_num,
         'front_id': front_id,
         'back_id': back_id
-    }
+    })
     save_config(cfg)
 
     # Reload mopeka_converter so offsets match new sensors
@@ -835,6 +846,16 @@ def restore_trailer_config():
             print(f'Restored trailer {trailer_num} from config', flush=True)
         else:
             print(f'Failed to restore trailer {trailer_num}', flush=True)
+
+
+def restore_bms_config():
+    """Restore BMS config from mopeka_config.json."""
+    global BMS_MAC
+    cfg = load_config()
+    saved_mac = _normalize_ble_mac(cfg.get('bms_mac'))
+    if saved_mac:
+        BMS_MAC = saved_mac
+        print(f'Restored BMS MAC from config: {BMS_MAC}', flush=True)
 
 
 # =============================================================================
@@ -991,6 +1012,10 @@ def process_config_command(cmd_str):
             _wifi_set_from_ble(cmd)
         elif op == 'WIFI_STATUS':
             _wifi_status_from_ble(cmd)
+        elif op == 'GET_BMS':
+            _cmd_get_bms(request_id=request_id)
+        elif op == 'SET_BMS_MAC':
+            _cmd_set_bms_mac(cmd, request_id=request_id)
         elif op == 'GET_TRAILER':
             _cmd_get_trailer(request_id=request_id)
         elif op == 'SELECT_TRAILER':
@@ -1065,6 +1090,54 @@ def _cmd_get_trailer(*, request_id=None):
     if request_id is not None:
         payload['request_id'] = request_id
     _set_config_response_obj(payload)
+
+
+def _cmd_get_bms(*, request_id=None):
+    global config_response_pages
+    config_response_pages = []
+    payload = {
+        'ok': True,
+        'op': 'GET_BMS',
+        'bms': {
+            'mac': BMS_MAC,
+            'name': BMS_NAME,
+            'enabled': bool(BMS_ENABLED),
+        },
+    }
+    if request_id is not None:
+        payload['request_id'] = request_id
+    _set_config_response_obj(payload)
+
+
+def _cmd_set_bms_mac(cmd, *, request_id=None):
+    global config_response_pages, BMS_MAC
+    raw_mac = cmd.get('mac')
+    mac = _normalize_ble_mac(raw_mac)
+    config_response_pages = []
+
+    if not mac:
+        _set_config_response_obj({
+            'ok': False,
+            'op': 'SET_BMS_MAC',
+            'request_id': request_id,
+            'error': 'Invalid MAC address',
+        })
+        return
+
+    BMS_MAC = mac
+    cfg = load_config()
+    cfg['bms_mac'] = mac
+    save_config(cfg)
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'SET_BMS_MAC',
+        'request_id': request_id,
+        'bms': {
+            'mac': BMS_MAC,
+            'name': BMS_NAME,
+            'enabled': bool(BMS_ENABLED),
+        },
+    })
 
 
 def _cmd_select_trailer(cmd, *, request_id=None):
@@ -1664,6 +1737,9 @@ async def main():
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
+
+    # Restore BMS config from last session
+    restore_bms_config()
 
     # Restore trailer config from last session
     restore_trailer_config()
