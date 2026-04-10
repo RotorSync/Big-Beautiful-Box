@@ -425,6 +425,11 @@ if [ -f "$SCRIPT_DIR/deploy/10periodic-bbb" ]; then
 fi
 sudo systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
+# Force Bumble-only Bluetooth ownership for BBB. BlueZ can be D-Bus activated by
+# the desktop stack unless it is both disabled and masked.
+sudo systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
+sudo systemctl mask bluetooth.service >/dev/null 2>&1 || true
+
 # Install TrailerSync Plymouth boot logo if the bundled asset is present.
 if [ -f "$INSTALL_DIR/Trailersync.png" ]; then
     install_boot_logo "$INSTALL_DIR/Trailersync.png" || \

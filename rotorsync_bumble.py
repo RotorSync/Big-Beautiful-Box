@@ -771,6 +771,20 @@ def _normalize_ble_mac(value):
     return ':'.join(parts)
 
 
+def enforce_bumble_only_stack():
+    """Best-effort block of BlueZ so Bumble can keep exclusive HCI ownership."""
+    commands = [
+        ['systemctl', 'disable', '--now', 'bluetooth.service'],
+        ['systemctl', 'mask', 'bluetooth.service'],
+        ['systemctl', 'stop', 'bluetooth.service'],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, capture_output=True)
+        except Exception:
+            pass
+
+
 # =============================================================================
 # Trailer Selection Logic
 # =============================================================================
@@ -1762,7 +1776,7 @@ async def main():
     if sensor_adapter:
         print(f'Sensor adapter: {sensor_adapter} ({SENSOR_ADAPTER_MAC})', flush=True)
 
-    subprocess.run(['systemctl', 'stop', 'bluetooth.service'], capture_output=True)
+    enforce_bumble_only_stack()
     await asyncio.sleep(0.5)
 
     sensor_device = None
