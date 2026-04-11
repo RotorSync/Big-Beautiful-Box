@@ -147,6 +147,11 @@ current_mode = "fill"  # Current mode: "fill" or "mix"
 fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
 mix_requested_gallons = 40  # Preset for mix mode (default 40)
 mode_indicator_label = None  # Label to display "MIX" in corner
+last_status_text = None  # Cache bottom status line to avoid needless redraws
+last_daily_total_text = None  # Cache daily total footer text
+last_daily_total_mode = None  # Track mode used for daily total rendering
+last_flow_rate_text = None  # Cache flow rate footer text
+last_flow_rate_mode = None  # Track mode used for flow footer rendering
 
 # Shared menu order.
 MENU_ITEMS = [
@@ -808,18 +813,33 @@ def update_bms_display():
 
 def update_flow_rate_display(flow_rate_gpm):
     """Draw the current flow rate in the bottom-right corner."""
+    global last_flow_rate_text, last_flow_rate_mode
+
+    flow_text = f"Flow:\n{flow_rate_gpm:.1f} GPM"
+    if current_mode == "mix":
+        if last_flow_rate_mode != "mix":
+            canvas.delete("flow_rate")
+        last_flow_rate_mode = "mix"
+        last_flow_rate_text = None
+        return
+
+    if last_flow_rate_mode == current_mode and last_flow_rate_text == flow_text:
+        return
+
     canvas.delete("flow_rate")
     if current_mode == "mix":
         return
     canvas.create_text(
         canvas.winfo_width() - 10,
         canvas.winfo_height() - 10,
-        text=f"Flow:\n{flow_rate_gpm:.1f} GPM",
+        text=flow_text,
         font=("Helvetica", 72, "bold"),
         fill="cyan",
         anchor="se",
         tags="flow_rate",
     )
+    last_flow_rate_text = flow_text
+    last_flow_rate_mode = current_mode
 
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
@@ -2333,12 +2353,14 @@ def update_menu_highlight():
 
     # High-contrast unselected palette for sunlight readability.
     colors = [
-        ("#d7efff", "#111111"),  # Logs
+        ("#d7efff", "#111111"),  # View Logs
         ("#eadcff", "#111111"),  # Fill History
-        ("#d8ffff", "#111111"),  # Full Test
-        ("#ffe3bf", "#111111"),  # Reset Season
-        ("#dff7d9", "#111111"),  # Self Test
-        ("#eadcff", "#111111"),  # Update
+        ("#d8ffff", "#111111"),  # Tank Calibration
+        ("#ffe3bf", "#111111"),  # Full Test
+        ("#dff7d9", "#111111"),  # Reset Season
+        ("#e7ffd8", "#111111"),  # Self Test
+        ("#fff0b8", "#111111"),  # Capture Bug
+        ("#eadcff", "#111111"),  # System Update
         ("#ffd6d6", "#111111"),  # Shutdown
         ("#ffe3bf", "#111111"),  # Reboot
         ("#ffc9c9", "#111111"),  # Exit to Desktop
@@ -2359,11 +2381,14 @@ def update_menu_highlight():
                         font=("Helvetica", 20, "bold"))
         else:
             # Unselected - Keep it bright enough to read in direct sun.
-            bg, fg = colors[i]
+            bg, fg = colors[i % len(colors)]
             btn.config(bg=bg, fg=fg,
                       activebackground=bg, activeforeground=fg,
                       font=("Helvetica", 28, "bold"),
                       relief=tk.FLAT, borderwidth=2,
+                      highlightthickness=0,
+                      highlightbackground=bg,
+                      highlightcolor=bg,
                       width=16, height=2,
                       wraplength=360, justify=tk.CENTER)
             arrow.config(text="", fg="black")
@@ -2693,6 +2718,8 @@ def show_menu():
     button_frame.pack(expand=True, fill=tk.BOTH, padx=24, pady=6)
     button_frame.grid_columnconfigure(0, weight=1, uniform="menu")
     button_frame.grid_columnconfigure(1, weight=1, uniform="menu")
+    for row in range((len(MENU_ITEMS) + 1) // 2):
+        button_frame.grid_rowconfigure(row, weight=1, uniform="menu_row")
 
     menu_actions = [
         ("VIEW LOGS", show_log_viewer),
@@ -2716,6 +2743,7 @@ def show_menu():
         cell = tk.Frame(button_frame, bg='#0a0a0a')
         cell.grid(row=row, column=column, sticky="nsew", padx=12, pady=8)
         cell.grid_columnconfigure(0, weight=1)
+        cell.grid_rowconfigure(1, weight=1)
 
         arrow = tk.Label(
             cell,
@@ -4072,7 +4100,7 @@ def update_dashboard():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
-    global flow_cycle_counter, calibration_state
+    global flow_cycle_counter, calibration_state, last_status_text, last_daily_total_text, last_daily_total_mode
 
     actual = read_flow_meter()
 
@@ -4248,17 +4276,24 @@ def update_dashboard():
     if override_mode:
         status_parts.append("OVERRIDE: ON")
 
-    # Draw status text on canvas
-    canvas.delete("status")
-    if status_parts:
-        canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=" | ".join(status_parts),
-                          font=("Helvetica", 20), fill="yellow", tags="status")
+    # Draw status text only when it changes.
+    status_text = " | ".join(status_parts)
+    if status_text != last_status_text:
+        canvas.delete("status")
+        if status_text:
+            canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=status_text,
+                              font=("Helvetica", 20), fill="yellow", tags="status")
+        last_status_text = status_text
 
-    # Draw daily total in bottom left corner (only in fill mode)
-    canvas.delete("daily_total")
-    if current_mode != "mix":
-        canvas.create_text(10, canvas.winfo_height() - 10, text=f"Today:\n{daily_total:.1f} gal",
-                          font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
+    # Draw daily total only when the visible text changes.
+    daily_total_text = f"Today:\n{daily_total:.1f} gal" if current_mode != "mix" else ""
+    if daily_total_text != last_daily_total_text or current_mode != last_daily_total_mode:
+        canvas.delete("daily_total")
+        if daily_total_text:
+            canvas.create_text(10, canvas.winfo_height() - 10, text=daily_total_text,
+                              font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
+        last_daily_total_text = daily_total_text
+        last_daily_total_mode = current_mode
     update_flow_rate_display(flow_rate_gpm)
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)

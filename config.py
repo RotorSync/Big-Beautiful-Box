@@ -101,7 +101,7 @@ WARNING_THRESHOLD = 2         # Gallons before target to show warning color
 # =============================================================================
 
 # User interface settings
-UPDATE_INTERVAL = 200         # Milliseconds between GUI updates (lower = more responsive)
+UPDATE_INTERVAL = 150         # Milliseconds between GUI updates (lower = more responsive)
 
 
 # =============================================================================
