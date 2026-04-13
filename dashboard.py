@@ -2091,6 +2091,27 @@ def run_system_update():
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.conf /etc/logrotate.d/bbb; "
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.service /etc/systemd/system/bbb-logrotate.service; "
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.timer /etc/systemd/system/bbb-logrotate.timer; "
+                "python3 - <<'PY'\n"
+                "from pathlib import Path\n"
+                "cfg = Path('/boot/firmware/config.txt')\n"
+                "text = cfg.read_text()\n"
+                "text = text.replace('hdmi_group=2', 'hdmi_group=1')\n"
+                "text = text.replace('hdmi_mode=87', 'hdmi_mode=34')\n"
+                "text = text.replace('hdmi_cvt=1024 600 60 6 0 0 0\\n', '')\n"
+                "for line in ('hdmi_force_hotplug=1', 'hdmi_drive=2', 'hdmi_group=1', 'hdmi_mode=34'):\n"
+                "    if line not in text:\n"
+                "        text += ('\\n' if not text.endswith('\\n') else '') + line + '\\n'\n"
+                "cfg.write_text(text)\n"
+                "video_arg = 'video=HDMI-A-1:1920x1080M@30D'\n"
+                "for path_str in ('/boot/firmware/current/cmdline.txt', '/boot/firmware/cmdline.txt', '/boot/cmdline.txt'):\n"
+                "    p = Path(path_str)\n"
+                "    if not p.exists():\n"
+                "        continue\n"
+                "    parts = p.read_text().strip().split()\n"
+                "    if video_arg not in parts:\n"
+                "        parts.append(video_arg)\n"
+                "        p.write_text(' '.join(parts) + '\\n')\n"
+                "PY\n"
                 "systemctl daemon-reload; "
                 "systemctl enable --now bbb-logrotate.timer; "
                 "systemctl start bbb-logrotate.service"
@@ -2105,6 +2126,7 @@ def run_system_update():
                     status_text.insert(tk.END, result.stderr + "\n")
             else:
                 status_text.insert(tk.END, "BBB log rotation updated.\n")
+                status_text.insert(tk.END, "Boot display config updated to 1080p30.\n")
             status_text.update()
 
             status_text.insert(tk.END, "\n=== UPDATE COMPLETE ===\n\n")

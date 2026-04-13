@@ -31,6 +31,25 @@ append_if_missing() {
     grep -Fqx "$line" "$file" || echo "$line" | sudo tee -a "$file" > /dev/null
 }
 
+ensure_cmdline_arg() {
+    local file="$1"
+    local arg="$2"
+
+    [ -f "$file" ] || return 0
+
+    sudo python3 - "$file" "$arg" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+arg = sys.argv[2]
+parts = path.read_text().strip().split()
+if arg not in parts:
+    parts.append(arg)
+path.write_text(" ".join(parts) + "\n")
+PY
+}
+
 copy_if_needed() {
     local src="$1"
     local dst="$2"
@@ -276,6 +295,7 @@ log_step "4/7: Configuring hardware..."
 # Apply tracked BBB boot/display settings
 BBB_BOOT_CFG="/boot/firmware/config.txt"
 BBB_BOOT_SNIPPET="$SCRIPT_DIR/deploy/boot-firmware-bbb.conf"
+BBB_VIDEO_ARG="video=HDMI-A-1:1920x1080M@30D"
 UART_CHANGED=0
 if [ -f "$BBB_BOOT_SNIPPET" ]; then
     sudo cp "$BBB_BOOT_CFG" "${BBB_BOOT_CFG}.bbb.bak" 2>/dev/null || true
@@ -303,6 +323,11 @@ done
 if [ "$UART_CHANGED" -eq 1 ]; then
     log_warn "Applied UART boot settings for /dev/ttyAMA0. A reboot is required before the switch box serial link will work."
 fi
+
+# Force the desktop/KMS stack to boot the primary HDMI output at 1080p30.
+for cmdline_file in /boot/firmware/current/cmdline.txt /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+    ensure_cmdline_arg "$cmdline_file" "$BBB_VIDEO_ARG"
+done
 
 # Step 5: Install dashboard and Rotorsync files
 log_step "5/7: Installing dashboard files..."
