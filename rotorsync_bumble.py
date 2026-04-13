@@ -54,6 +54,7 @@ STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
 MAX_CONSECUTIVE_FAILURES = 5
 ADAPTER_RESET_COOLDOWN = 30
 GATT_ADAPTER_CHECK_INTERVAL = 5
+SENSOR_LOOP_HEARTBEAT_TIMEOUT = 120
 
 # UUIDs
 SERVICE_UUID = UUID('12345678-1234-5678-1234-56789abcdef0')
@@ -99,6 +100,8 @@ dashboard_status = {
     'state_json': '{}',
     'last_update': 0
 }
+
+sensor_loop_heartbeat = 0.0
 
 
 def _encode_ble_state_payload(state):
@@ -870,6 +873,43 @@ def restore_bms_config():
     if saved_mac:
         BMS_MAC = saved_mac
         print(f'Restored BMS MAC from config: {BMS_MAC}', flush=True)
+
+
+def restore_adapter_config():
+    """Restore per-box Bluetooth adapter MACs from mopeka_config.json."""
+    global GATT_ADAPTER_MAC, SENSOR_ADAPTER_MAC
+    cfg = load_config()
+
+    saved_gatt = _normalize_ble_mac(cfg.get('gatt_adapter_mac'))
+    if saved_gatt:
+        GATT_ADAPTER_MAC = saved_gatt
+        print(f'Restored GATT adapter MAC from config: {GATT_ADAPTER_MAC}', flush=True)
+
+    saved_sensor = _normalize_ble_mac(cfg.get('sensor_adapter_mac'))
+    if saved_sensor:
+        SENSOR_ADAPTER_MAC = saved_sensor
+        print(f'Restored sensor adapter MAC from config: {SENSOR_ADAPTER_MAC}', flush=True)
+
+
+def persist_adapter_config():
+    """Persist the active per-box Bluetooth adapter MACs to mopeka_config.json."""
+    cfg = load_config()
+    changed = False
+
+    if _normalize_ble_mac(cfg.get('gatt_adapter_mac')) != GATT_ADAPTER_MAC:
+        cfg['gatt_adapter_mac'] = GATT_ADAPTER_MAC
+        changed = True
+
+    if _normalize_ble_mac(cfg.get('sensor_adapter_mac')) != SENSOR_ADAPTER_MAC:
+        cfg['sensor_adapter_mac'] = SENSOR_ADAPTER_MAC
+        changed = True
+
+    if changed:
+        save_config(cfg)
+        print(
+            f'Persisted adapter config: gatt={GATT_ADAPTER_MAC} sensor={SENSOR_ADAPTER_MAC}',
+            flush=True,
+        )
 
 
 # =============================================================================
@@ -1680,7 +1720,7 @@ async def poll_dashboard_status(device, state_char):
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
 async def read_sensors(sensor_device, sensor_adapter):
-    global sensor_data
+    global sensor_data, sensor_loop_heartbeat
 
     print(f"Sensor reader started on {sensor_adapter}", flush=True)
     if BMS_ENABLED:
@@ -1695,6 +1735,7 @@ async def read_sensors(sensor_device, sensor_adapter):
     last_adapter_reset = 0
 
     while True:
+        sensor_loop_heartbeat = time.time()
         cycle_count += 1
         current_time = time.time()
 
@@ -1746,11 +1787,53 @@ async def read_sensors(sensor_device, sensor_adapter):
 
         await asyncio.sleep(SCAN_INTERVAL)
 
+
+def _handle_sensor_task_done(task):
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        log_watchdog_event('Sensor task was cancelled; exiting for restart')
+        os._exit(1)
+    except Exception as e:
+        log_watchdog_event(f'Failed to inspect sensor task completion: {type(e).__name__}: {e}')
+        os._exit(1)
+
+    if exc is not None:
+        log_watchdog_event(f'Sensor task crashed: {type(exc).__name__}: {exc}')
+        os._exit(1)
+
+    log_watchdog_event('Sensor task exited unexpectedly; exiting for restart')
+    os._exit(1)
+
+
+async def monitor_sensor_health(sensor_task):
+    global sensor_loop_heartbeat
+
+    while True:
+        await asyncio.sleep(10)
+
+        if sensor_task.done():
+            _handle_sensor_task_done(sensor_task)
+            return
+
+        if sensor_loop_heartbeat == 0:
+            continue
+
+        stale_for = time.time() - sensor_loop_heartbeat
+        if stale_for > SENSOR_LOOP_HEARTBEAT_TIMEOUT:
+            log_watchdog_event(
+                f'Sensor loop heartbeat stale for {stale_for:.0f}s; exiting for restart'
+            )
+            os._exit(1)
+
 async def main():
     global ble_device, config_notify_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
+
+    # Restore adapter config from last session
+    restore_adapter_config()
 
     # Restore BMS config from last session
     restore_bms_config()
@@ -1770,6 +1853,7 @@ async def main():
 
     gatt_adapter_index = int(gatt_adapter.replace('hci', ''))
     sensor_adapter_index = int(sensor_adapter.replace('hci', '')) if sensor_adapter else None
+    persist_adapter_config()
     gatt_device_path = get_adapter_device_path(gatt_adapter)
     persist_gatt_device_path(gatt_device_path)
     print(f'GATT adapter: {gatt_adapter} ({GATT_ADAPTER_MAC})', flush=True)
@@ -1789,6 +1873,8 @@ async def main():
 
     if sensor_adapter:
         sensor_task = asyncio.create_task(read_sensors(sensor_device, sensor_adapter))
+        sensor_task.add_done_callback(_handle_sensor_task_done)
+        asyncio.create_task(monitor_sensor_health(sensor_task))
     gatt_monitor_task = asyncio.create_task(
         monitor_gatt_adapter(gatt_adapter, gatt_device_path)
     )
