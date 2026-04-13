@@ -408,6 +408,13 @@ sudo mkdir -p /home/pi/bug_reports
 if [ -f "$SCRIPT_DIR/deploy/bbb-logrotate.conf" ]; then
     sudo cp "$SCRIPT_DIR/deploy/bbb-logrotate.conf" /etc/logrotate.d/bbb
 fi
+if [ -f "$SCRIPT_DIR/deploy/bbb-logrotate.service" ] && [ -f "$SCRIPT_DIR/deploy/bbb-logrotate.timer" ]; then
+    sudo cp "$SCRIPT_DIR/deploy/bbb-logrotate.service" /etc/systemd/system/bbb-logrotate.service
+    sudo cp "$SCRIPT_DIR/deploy/bbb-logrotate.timer" /etc/systemd/system/bbb-logrotate.timer
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now bbb-logrotate.timer || log_warn "Could not enable bbb-logrotate.timer"
+    sudo systemctl start bbb-logrotate.service || log_warn "Could not start bbb-logrotate.service"
+fi
 
 # Cap journald disk usage for unattended deployments.
 if [ -f "$SCRIPT_DIR/deploy/journald-bbb.conf" ]; then

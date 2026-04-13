@@ -2083,6 +2083,30 @@ def run_system_update():
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 return
 
+            status_text.insert(tk.END, "Refreshing BBB log rotation...\n")
+            status_text.update()
+
+            deploy_cmd = (
+                "set -e; "
+                "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.conf /etc/logrotate.d/bbb; "
+                "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.service /etc/systemd/system/bbb-logrotate.service; "
+                "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.timer /etc/systemd/system/bbb-logrotate.timer; "
+                "systemctl daemon-reload; "
+                "systemctl enable --now bbb-logrotate.timer; "
+                "systemctl start bbb-logrotate.service"
+            )
+            result = subprocess.run(
+                ['bash', '-lc', f"printf 'raspi\\n' | sudo -S bash -lc {shlex.quote(deploy_cmd)}"],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                status_text.insert(tk.END, "WARNING: Could not refresh BBB log rotation.\n")
+                if result.stderr:
+                    status_text.insert(tk.END, result.stderr + "\n")
+            else:
+                status_text.insert(tk.END, "BBB log rotation updated.\n")
+            status_text.update()
+
             status_text.insert(tk.END, "\n=== UPDATE COMPLETE ===\n\n")
             status_text.insert(tk.END, "Restarting service to apply changes...\n\n")
             status_text.update()

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly rotation of BBB application logs
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
