@@ -257,6 +257,7 @@ sudo apt install -y \
     python3-yaml \
     bluez \
     bluez-tools \
+    zstd \
     plymouth \
     plymouth-themes
 
