@@ -6,6 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$HOME/iol_dashboard.log"
+LOG_FILTER="$SCRIPT_DIR/src/log_filter.py"
 
 # Find Xwayland auth file dynamically
 if [ -d "/run/user/1000" ]; then
@@ -42,7 +43,8 @@ if [ -d "$HOME/iol-hat/src-master-application" ]; then
     if [ -f "/home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl" ]; then
         # Prefer real-time scheduling (FIFO) on core 3, but only if passwordless sudo is actually available.
         if command -v chrt >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-            sudo -n chrt -f 80 taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 &
+            sudo -n chrt -f 80 taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 \
+                > >(python3 -u "$LOG_FILTER" "$LOG_FILE") 2>&1 &
             IOL_MASTER_PID=$!
             echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_FIFO 80, core 3)" >> "$LOG_FILE"
         else
@@ -51,7 +53,8 @@ if [ -d "$HOME/iol-hat/src-master-application" ]; then
             else
                 echo "$(date): WARNING: chrt not found; starting IOL master without RT scheduling" >> "$LOG_FILE"
             fi
-            taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 >> "$LOG_FILE" 2>&1 &
+            taskset -c 3 /home/pi/iol-hat/src-master-application/bin/debug/iol-master-appl -m0 0 -m1 3 -i 34 \
+                > >(python3 -u "$LOG_FILTER" "$LOG_FILE") 2>&1 &
             IOL_MASTER_PID=$!
             echo "$(date): IOL Master PID: $IOL_MASTER_PID (SCHED_OTHER, core 3)" >> "$LOG_FILE"
         fi
@@ -72,7 +75,7 @@ fi
 # Start the dashboard
 echo "$(date): Starting Dashboard GUI..." >> "$LOG_FILE"
 cd "$SCRIPT_DIR"
-python3 dashboard.py >> "$LOG_FILE" 2>&1 &
+python3 dashboard.py > >(python3 -u "$LOG_FILTER" "$LOG_FILE") 2>&1 &
 DASHBOARD_PID=$!
 echo "$(date): Dashboard PID: $DASHBOARD_PID" >> "$LOG_FILE"
 

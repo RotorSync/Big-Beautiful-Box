@@ -3154,8 +3154,9 @@ def socket_command_listener():
                                 except Exception:
                                     safe_line = 'WIFI_SET:{...}'
 
-                            with open(debug_log, "a") as f:
-                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{safe_line}'\n")
+                            if line != "STATE_JSON":
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{safe_line}'\n")
 
                             if line == "STATUS":
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
