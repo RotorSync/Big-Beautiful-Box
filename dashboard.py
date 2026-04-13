@@ -2029,6 +2029,14 @@ def run_system_update():
             status_text.insert(tk.END, f"Current Version: {VERSION}\n\n")
             status_text.update()
 
+            if not os.path.isdir('/home/pi/Big-Beautiful-Box/.git'):
+                status_text.insert(tk.END, "ERROR: Installed BBB folder is not a git repository.\n")
+                status_text.insert(tk.END, "This box must be installed from a real git checkout for updates to work.\n")
+                status_text.insert(tk.END, "Re-run install.sh from a cloned BBB repo.\n")
+                status_text.insert(tk.END, "Press OV to return to menu\n")
+                status_text.update()
+                return
+
             # Step 1: Navigate to git repo and pull latest
             status_text.insert(tk.END, "=== Step 1: Checking for updates ===\n")
             status_text.update()

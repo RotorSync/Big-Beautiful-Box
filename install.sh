@@ -204,6 +204,7 @@ INSTALL_HOME=$HOME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$INSTALL_HOME/Big-Beautiful-Box"
 OPT_DIR="/opt"
+REPO_URL="https://github.com/RotorSync/Big-Beautiful-Box.git"
 SOFTWARE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")"
 SOURCE_BRANCH="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
@@ -336,34 +337,30 @@ log_step "5/7: Installing dashboard files..."
 if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [ "$(realpath "$SCRIPT_DIR")" = "$(realpath "$INSTALL_DIR")" ]; then
         log_info "Using current BBB checkout in $INSTALL_DIR"
+        git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
     else
         [ -d "$INSTALL_DIR" ] && mv "$INSTALL_DIR" "${INSTALL_DIR}.pre-install-backup.$(date +%Y%m%d-%H%M%S)"
         log_info "Cloning BBB locally from $SCRIPT_DIR into $INSTALL_DIR"
-        if git clone "$SCRIPT_DIR" "$INSTALL_DIR"; then
-            if [ -n "$SOURCE_BRANCH" ]; then
-                git -C "$INSTALL_DIR" checkout -f "$SOURCE_BRANCH" >/dev/null 2>&1 || \
-                    log_warn "Could not switch cloned checkout to branch $SOURCE_BRANCH; continuing with cloned HEAD"
-            fi
-            if [ -n "$SOURCE_COMMIT" ]; then
-                git -C "$INSTALL_DIR" reset --hard "$SOURCE_COMMIT" >/dev/null 2>&1 || \
-                    log_warn "Could not align cloned checkout to source commit $SOURCE_COMMIT"
-            fi
-        else
-            log_warn "Local git clone failed; continuing with a plain file install. GitHub updater will need manual repair."
-            mkdir -p "$INSTALL_DIR"
-            mkdir -p "$INSTALL_DIR/src"
-            mkdir -p "$INSTALL_DIR/RPi"
-            mkdir -p "$INSTALL_DIR/mopeka"
-            mkdir -p "$INSTALL_DIR/deploy"
+        git clone "$SCRIPT_DIR" "$INSTALL_DIR"
+        git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
+        if [ -n "$SOURCE_BRANCH" ]; then
+            git -C "$INSTALL_DIR" checkout -f "$SOURCE_BRANCH" >/dev/null 2>&1 || \
+                log_warn "Could not switch cloned checkout to branch $SOURCE_BRANCH; continuing with cloned HEAD"
+        fi
+        if [ -n "$SOURCE_COMMIT" ]; then
+            git -C "$INSTALL_DIR" reset --hard "$SOURCE_COMMIT" >/dev/null 2>&1 || \
+                log_warn "Could not align cloned checkout to source commit $SOURCE_COMMIT"
         fi
     fi
 else
-    log_warn "Installer is not running from a git checkout; GitHub updater may not work on this box."
-    mkdir -p "$INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR/src"
-    mkdir -p "$INSTALL_DIR/RPi"
-    mkdir -p "$INSTALL_DIR/mopeka"
-    mkdir -p "$INSTALL_DIR/deploy"
+    log_error "Installer must be run from a real git checkout so the installed box has a working GitHub updater."
+    log_error "Clone ${REPO_URL} first, then rerun ./install.sh"
+    exit 1
+fi
+
+if ! git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log_error "Installed BBB directory is not a git checkout. Refusing to continue."
+    exit 1
 fi
 
 mkdir -p "$INSTALL_DIR/src"
