@@ -82,6 +82,8 @@ CALIBRATION_CSV_PATH = os.path.join(MOPEKA_DIR, 'calibration-points-1070gal-tank
 MOPEKA_CONFIG_PATH = os.path.join(MOPEKA_DIR, 'mopeka_config.json')
 WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
+DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
+DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
 
 # Sensor data with timestamps
 sensor_data = {
@@ -423,6 +425,18 @@ def _set_config_response_obj(obj):
     _notify_config_response()
 
 
+def _schedule_identity_restart(reason, delay=1.0):
+    async def _restart():
+        await asyncio.sleep(delay)
+        log_watchdog_event(reason)
+        os._exit(0)
+
+    try:
+        asyncio.get_running_loop().create_task(_restart())
+    except RuntimeError:
+        pass
+
+
 def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450):
     global config_response_pages
     pages = paginate_response(items, page_size_bytes=page_size_bytes)
@@ -754,7 +768,11 @@ def load_config():
         with open(MOPEKA_CONFIG_PATH, 'r') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {'trailer': None}
+        return {
+            'box_mode': 'fleet',
+            'assigned_trailer': None,
+            'trailer': None,
+        }
 
 
 def save_config(cfg):
@@ -772,6 +790,48 @@ def _normalize_ble_mac(value):
     if any(any(ch not in '0123456789ABCDEF' for ch in part) for part in parts):
         return None
     return ':'.join(parts)
+
+
+def _normalize_box_mode(value):
+    mode = str(value or 'fleet').strip().lower()
+    return 'customer' if mode == 'customer' else 'fleet'
+
+
+def _get_assigned_trailer(cfg=None):
+    cfg = cfg or load_config()
+    return cfg.get('assigned_trailer', cfg.get('trailer'))
+
+
+def _box_mode_uses_trailer_list(cfg=None):
+    cfg = cfg or load_config()
+    return _normalize_box_mode(cfg.get('box_mode')) == 'fleet'
+
+
+def _compute_ble_name(cfg=None):
+    cfg = cfg or load_config()
+    mode = _normalize_box_mode(cfg.get('box_mode'))
+    display_name = str(cfg.get('display_name') or '').strip()
+    trailer = _get_assigned_trailer(cfg)
+
+    if mode == 'customer':
+        return display_name or DEFAULT_CUSTOMER_BLE_NAME
+
+    if trailer not in (None, ''):
+        return f'TrailerSync-TR{trailer}'
+
+    return display_name or DEFAULT_FLEET_BLE_NAME
+
+
+def _current_box_config():
+    cfg = load_config()
+    mode = _normalize_box_mode(cfg.get('box_mode'))
+    return {
+        'box_mode': mode,
+        'assigned_trailer': _get_assigned_trailer(cfg),
+        'display_name': str(cfg.get('display_name') or '').strip(),
+        'ble_name': _compute_ble_name(cfg),
+        'trailer_list_enabled': mode == 'fleet',
+    }
 
 
 def enforce_bumble_only_stack():
@@ -830,9 +890,12 @@ def apply_trailer(trailer_num):
     # Persist to config
     cfg = load_config()
     cfg.update({
+        'box_mode': _normalize_box_mode(cfg.get('box_mode')),
+        'assigned_trailer': trailer_num,
         'trailer': trailer_num,
         'front_id': front_id,
-        'back_id': back_id
+        'back_id': back_id,
+        'display_name': f'TrailerSync-TR{trailer_num}',
     })
     save_config(cfg)
 
@@ -856,7 +919,11 @@ def apply_trailer(trailer_num):
 def restore_trailer_config():
     """Restore trailer config on startup from mopeka_config.json."""
     cfg = load_config()
-    trailer_num = cfg.get('trailer')
+    if not _box_mode_uses_trailer_list(cfg):
+        print('Customer mode active; skipping trailer restore', flush=True)
+        return
+
+    trailer_num = _get_assigned_trailer(cfg)
     if trailer_num is not None:
         result = apply_trailer(trailer_num)
         if result:
@@ -1066,6 +1133,12 @@ def process_config_command(cmd_str):
             _wifi_set_from_ble(cmd)
         elif op == 'WIFI_STATUS':
             _wifi_status_from_ble(cmd)
+        elif op == 'GET_BOX_CONFIG':
+            _cmd_get_box_config(request_id=request_id)
+        elif op == 'SET_BOX_MODE':
+            _cmd_set_box_mode(cmd, request_id=request_id)
+        elif op == 'SET_DISPLAY_NAME':
+            _cmd_set_display_name(cmd, request_id=request_id)
         elif op == 'GET_BMS':
             _cmd_get_bms(request_id=request_id)
         elif op == 'SET_BMS_MAC':
@@ -1105,9 +1178,12 @@ def process_config_command(cmd_str):
 
 def _current_trailer_info():
     cfg = load_config()
-    trailer_num = cfg.get('trailer')
+    mode = _normalize_box_mode(cfg.get('box_mode'))
+    trailer_num = _get_assigned_trailer(cfg)
+    if mode != 'fleet':
+        return {'box_mode': mode, 'trailer': None, 'enabled': False}
     if trailer_num is None:
-        return {'trailer': None}
+        return {'box_mode': mode, 'trailer': None, 'enabled': True}
 
     sensors = load_sensor_csv()
     trailer_sensors = [s for s in sensors if str(s.get('Trailer')) == str(trailer_num)]
@@ -1124,6 +1200,8 @@ def _current_trailer_info():
         return 0.0
 
     return {
+        'box_mode': mode,
+        'enabled': True,
         'trailer': trailer_num,
         'man': man,
         'front': {
@@ -1144,6 +1222,61 @@ def _cmd_get_trailer(*, request_id=None):
     if request_id is not None:
         payload['request_id'] = request_id
     _set_config_response_obj(payload)
+
+
+def _cmd_get_box_config(*, request_id=None):
+    global config_response_pages
+    config_response_pages = []
+    payload = {'ok': True, 'op': 'GET_BOX_CONFIG', 'box': _current_box_config()}
+    if request_id is not None:
+        payload['request_id'] = request_id
+    _set_config_response_obj(payload)
+
+
+def _cmd_set_box_mode(cmd, *, request_id=None):
+    global config_response_pages
+    mode = _normalize_box_mode(cmd.get('mode'))
+    cfg = load_config()
+    cfg['box_mode'] = mode
+    if mode == 'customer':
+        cfg['assigned_trailer'] = None
+        cfg['trailer'] = None
+        if not str(cfg.get('display_name') or '').strip():
+            cfg['display_name'] = DEFAULT_CUSTOMER_BLE_NAME
+    save_config(cfg)
+    config_response_pages = []
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'SET_BOX_MODE',
+        'request_id': request_id,
+        'box': _current_box_config(),
+    })
+    _schedule_identity_restart(f'Box mode changed to {mode}; restarting to refresh BLE identity')
+
+
+def _cmd_set_display_name(cmd, *, request_id=None):
+    global config_response_pages
+    display_name = str(cmd.get('display_name') or '').strip()
+    config_response_pages = []
+    if not display_name:
+        _set_config_response_obj({
+            'ok': False,
+            'op': 'SET_DISPLAY_NAME',
+            'request_id': request_id,
+            'error': 'display_name required',
+        })
+        return
+
+    cfg = load_config()
+    cfg['display_name'] = display_name
+    save_config(cfg)
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'SET_DISPLAY_NAME',
+        'request_id': request_id,
+        'box': _current_box_config(),
+    })
+    _schedule_identity_restart('Display name changed; restarting to refresh BLE identity')
 
 
 def _cmd_get_bms(*, request_id=None):
@@ -1196,6 +1329,16 @@ def _cmd_set_bms_mac(cmd, *, request_id=None):
 
 def _cmd_select_trailer(cmd, *, request_id=None):
     global config_response_pages
+    if not _box_mode_uses_trailer_list():
+        config_response_pages = []
+        _set_config_response_obj({
+            'ok': False,
+            'op': 'SELECT_TRAILER',
+            'request_id': request_id,
+            'error': 'Trailer selection disabled in customer mode',
+        })
+        return
+
     trailer_num = cmd.get('trailer')
     try:
         trailer_num = int(trailer_num)
@@ -1211,10 +1354,21 @@ def _cmd_select_trailer(cmd, *, request_id=None):
         return
 
     _set_config_response_obj({'ok': True, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'current': result})
+    _schedule_identity_restart(f'Trailer changed to {trailer_num}; restarting to refresh BLE identity')
 
 
 def _cmd_list_trailers(*, request_id=None):
     global config_response, config_response_pages
+    if not _box_mode_uses_trailer_list():
+        config_response_pages = []
+        _set_config_response_obj({
+            'ok': False,
+            'op': 'LIST_TRAILERS',
+            'request_id': request_id,
+            'error': 'Trailer list disabled in customer mode',
+        })
+        return
+
     sensors = load_sensor_csv()
 
     trailers = {}
@@ -1484,6 +1638,10 @@ def trailer_read_handler(connection):
 
 def trailer_write_handler(connection, value):
     """Write trailer number to select and configure sensors for that trailer."""
+    if not _box_mode_uses_trailer_list():
+        print('Trailer write rejected: customer mode', flush=True)
+        return
+
     trailer_str = value.decode('utf-8').strip()
     print(f'Trailer write: {trailer_str}', flush=True)
     try:
@@ -1495,6 +1653,9 @@ def trailer_write_handler(connection, value):
     result = apply_trailer(trailer_num)
     if result is None:
         print(f'Trailer {trailer_num} not found in sensor CSV', flush=True)
+        return
+
+    _schedule_identity_restart(f'Trailer write changed to {trailer_num}; restarting to refresh BLE identity')
     return
 
 
@@ -1883,7 +2044,8 @@ async def main():
     hci_transport = await open_hci_socket_transport(gatt_adapter_index)
 
     host = Host(hci_transport.source, hci_transport.sink)
-    device = Device(name='TrailerSync-TR2', host=host)
+    ble_name = _compute_ble_name()
+    device = Device(name=ble_name, host=host)
     ble_device = device
 
     # Create characteristics - READ for sensors
@@ -1973,12 +2135,13 @@ async def main():
 
     await device.power_on()
     print(f'Device address: {device.public_address}', flush=True)
+    print(f'BLE name: {ble_name}', flush=True)
 
     adv_data = AdvertisingData([
         (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes(SERVICE_UUID)),
     ])
     scan_response = AdvertisingData([
-        (AdvertisingData.COMPLETE_LOCAL_NAME, b'TrailerSync-TR2'),
+        (AdvertisingData.COMPLETE_LOCAL_NAME, ble_name.encode('utf-8')),
     ])
 
     await device.start_advertising(
@@ -1999,7 +2162,7 @@ async def main():
     print('  defe: Command (write)   - JSON command channel for iPad app', flush=True)
     print('  def8: History (read)    - last 5 fills', flush=True)
     print('  def9: BatchMix (write)  - JSON batch mix data from iPad', flush=True)
-    print('  defa: Trailer (r/w)     - write trailer # to configure, read for current', flush=True)
+    print('  defa: Trailer (r/w)     - fleet mode trailer selection/current trailer', flush=True)
     print('  defb: ConfigCmd (write) - JSON commands for sensor/calibration CRUD', flush=True)
     print('  defc: ConfigData (read) - response from last config command', flush=True)
     print('  deff: ConfigNotify(r/n) - last config response with request_id echo', flush=True)
