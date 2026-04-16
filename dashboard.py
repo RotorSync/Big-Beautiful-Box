@@ -175,6 +175,7 @@ mopeka2_gallons = 0
 mopeka1_quality = 0
 mopeka2_quality = 0
 mopeka_connected = False
+mopeka_enabled = True
 mopeka1_level_mm = 0.0
 mopeka2_level_mm = 0.0
 mopeka1_level_in = 0.0
@@ -1358,6 +1359,7 @@ def _build_dashboard_state_snapshot():
         "back_tank_gal": round(mopeka2_gallons, 1),
         "front_tank_quality": int(mopeka1_quality),
         "back_tank_quality": int(mopeka2_quality),
+        "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
     }
@@ -3265,6 +3267,9 @@ def socket_command_listener():
                             elif line == "MOPEKA_OFFLINE":
                                 root.after(0, _mopeka_offline)
 
+                            elif line == "MOPEKA_DISABLED":
+                                root.after(0, _mopeka_disabled)
+
                             elif line.startswith("MOPEKA:"):
                                 try:
                                     parts = line[7:].split("|")
@@ -3881,11 +3886,12 @@ root.update()
 
 def _apply_mopeka(m1g, m2g, m1q, m2q):
     """Apply mopeka values and update display (called from main thread via root.after)"""
-    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality, mopeka_connected
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality, mopeka_connected, mopeka_enabled
     mopeka1_gallons = m1g
     mopeka2_gallons = m2g
     mopeka1_quality = m1q
     mopeka2_quality = m2q
+    mopeka_enabled = True
     mopeka_connected = True
     print(f"Mopeka applied: front={m1g:.0f} back={m2g:.0f} q={m1q}/{m2q}", flush=True)
     update_mopeka_display()
@@ -3914,11 +3920,23 @@ def _mopeka_offline():
     update_mopeka_display()
 
 
+def _mopeka_disabled():
+    """Mark mopeka as intentionally disabled for this box."""
+    global mopeka_connected, mopeka_enabled
+    mopeka_enabled = False
+    mopeka_connected = False
+    print("Mopeka disabled", flush=True)
+    update_mopeka_display()
+
+
 def update_mopeka_display():
     """Draw Mopeka tank levels in top-right corner of screen"""
     canvas.delete("mopeka_display")
 
     if current_mode == "mix":
+        return
+
+    if not mopeka_enabled:
         return
     
     width = canvas.winfo_width()

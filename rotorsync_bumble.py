@@ -807,6 +807,11 @@ def _box_mode_uses_trailer_list(cfg=None):
     return _normalize_box_mode(cfg.get('box_mode')) == 'fleet'
 
 
+def _mopeka_enabled(cfg=None):
+    cfg = cfg or load_config()
+    return bool(cfg.get('mopeka_enabled', True))
+
+
 def _compute_ble_name(cfg=None):
     cfg = cfg or load_config()
     mode = _normalize_box_mode(cfg.get('box_mode'))
@@ -830,6 +835,7 @@ def _current_box_config():
         'assigned_trailer': _get_assigned_trailer(cfg),
         'display_name': str(cfg.get('display_name') or '').strip(),
         'ble_name': _compute_ble_name(cfg),
+        'mopeka_enabled': _mopeka_enabled(cfg),
         'trailer_list_enabled': mode == 'fleet',
     }
 
@@ -1166,6 +1172,8 @@ def process_config_command(cmd_str):
             _cmd_set_box_mode(cmd, request_id=request_id)
         elif op == 'SET_DISPLAY_NAME':
             _cmd_set_display_name(cmd, request_id=request_id)
+        elif op == 'SET_MOPEKA_ENABLED':
+            _cmd_set_mopeka_enabled(cmd, request_id=request_id)
         elif op == 'GET_BMS':
             _cmd_get_bms(request_id=request_id)
         elif op == 'SET_BMS_MAC':
@@ -1304,6 +1312,20 @@ def _cmd_set_display_name(cmd, *, request_id=None):
         'box': _current_box_config(),
     })
     _schedule_identity_restart('Display name changed; restarting to refresh BLE identity')
+
+
+def _cmd_set_mopeka_enabled(cmd, *, request_id=None):
+    global config_response_pages
+    cfg = load_config()
+    cfg['mopeka_enabled'] = bool(cmd.get('enabled'))
+    save_config(cfg)
+    config_response_pages = []
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'SET_MOPEKA_ENABLED',
+        'request_id': request_id,
+        'box': _current_box_config(),
+    })
 
 
 def _cmd_get_bms(*, request_id=None):
@@ -1910,54 +1932,65 @@ async def poll_dashboard_status(device, state_char):
 async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data, sensor_loop_heartbeat
 
+    cfg = load_config()
+    mopeka_enabled = _mopeka_enabled(cfg)
+
     print(f"Sensor reader started on {sensor_adapter}", flush=True)
     if BMS_ENABLED:
         print(f"Scan interval: {SCAN_INTERVAL}s, BMS every {BMS_READ_INTERVAL} cycles", flush=True)
     else:
         print(f"Scan interval: {SCAN_INTERVAL}s, BMS polling disabled", flush=True)
+    print(f"Mopeka polling {'enabled' if mopeka_enabled else 'disabled'}", flush=True)
     print(f"Auto-recovery after {MAX_CONSECUTIVE_FAILURES} failures", flush=True)
 
     cycle_count = 0
     mopeka_failures = 0
     bms_failures = 0
     last_adapter_reset = 0
+    mopeka_disabled_announced = False
 
     while True:
         sensor_loop_heartbeat = time.time()
         cycle_count += 1
         current_time = time.time()
 
-        if (mopeka_failures >= MAX_CONSECUTIVE_FAILURES or bms_failures >= MAX_CONSECUTIVE_FAILURES):
+        if ((mopeka_enabled and mopeka_failures >= MAX_CONSECUTIVE_FAILURES) or bms_failures >= MAX_CONSECUTIVE_FAILURES):
             if current_time - last_adapter_reset > ADAPTER_RESET_COOLDOWN:
                 print('Too many sensor failures, exiting for service restart', flush=True)
                 os._exit(1)
 
-        try:
-            mopeka_found = await scan_mopeka(sensor_device, current_time)
+        if mopeka_enabled:
+            try:
+                mopeka_found = await scan_mopeka(sensor_device, current_time)
 
-            if mopeka_found:
-                mopeka_failures = 0
-                m1 = sensor_data["mopeka1"]
-                m2 = sensor_data["mopeka2"]
-                m1_gal = m1.get("gallons", 0)
-                m2_gal = m2.get("gallons", 0)
-                m1_q = m1.get("quality", 0)
-                m2_q = m2.get("quality", 0)
-                m1_mm = m1.get("level_mm", 0)
-                m2_mm = m2.get("level_mm", 0)
-                m1_in = m1.get("level_in", 0)
-                m2_in = m2.get("level_in", 0)
-                send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
-                send_dashboard_command(f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
-            else:
+                if mopeka_found:
+                    mopeka_failures = 0
+                    m1 = sensor_data["mopeka1"]
+                    m2 = sensor_data["mopeka2"]
+                    m1_gal = m1.get("gallons", 0)
+                    m2_gal = m2.get("gallons", 0)
+                    m1_q = m1.get("quality", 0)
+                    m2_q = m2.get("quality", 0)
+                    m1_mm = m1.get("level_mm", 0)
+                    m2_mm = m2.get("level_mm", 0)
+                    m1_in = m1.get("level_in", 0)
+                    m2_in = m2.get("level_in", 0)
+                    send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
+                    send_dashboard_command(f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
+                else:
+                    mopeka_failures += 1
+                    if mopeka_failures > 1:
+                        print(f'Mopeka not found ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES})', flush=True)
+                        send_dashboard_command('MOPEKA_OFFLINE')
+
+            except Exception as e:
                 mopeka_failures += 1
-                if mopeka_failures > 1:
-                    print(f'Mopeka not found ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES})', flush=True)
-                    send_dashboard_command('MOPEKA_OFFLINE')
-
-        except Exception as e:
-            mopeka_failures += 1
-            print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
+                print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
+        else:
+            mopeka_failures = 0
+            if not mopeka_disabled_announced:
+                send_dashboard_command('MOPEKA_DISABLED')
+                mopeka_disabled_announced = True
 
         if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
             try:
