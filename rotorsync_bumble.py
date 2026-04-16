@@ -918,12 +918,39 @@ def apply_trailer(trailer_num):
 
 def restore_trailer_config():
     """Restore trailer config on startup from mopeka_config.json."""
+    global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX
     cfg = load_config()
-    if not _box_mode_uses_trailer_list(cfg):
-        print('Customer mode active; skipping trailer restore', flush=True)
+    front_id = str(cfg.get('front_id') or '').strip().upper()
+    back_id = str(cfg.get('back_id') or '').strip().upper()
+    trailer_num = _get_assigned_trailer(cfg)
+
+    # If no trailer is assigned, or the box is in customer mode, fall back to
+    # the explicitly stored sensor IDs. This keeps manually configured boxes
+    # working across restarts and prevents a blank trailer assignment from
+    # discarding otherwise valid Mopeka sensor settings.
+    if not _box_mode_uses_trailer_list(cfg) or trailer_num is None:
+        restored = False
+
+        if front_id and front_id != '---------------':
+            MOPEKA1_MAC_SUFFIX = front_id
+            restored = True
+
+        if back_id and back_id != '---------------':
+            MOPEKA2_MAC_SUFFIX = back_id
+            restored = True
+
+        if restored:
+            print(
+                f'Restored manual Mopeka IDs from config: '
+                f'front={MOPEKA1_MAC_SUFFIX or "-"} back={MOPEKA2_MAC_SUFFIX or "-"}',
+                flush=True,
+            )
+        elif not _box_mode_uses_trailer_list(cfg):
+            print('Customer mode active; no manual Mopeka IDs configured', flush=True)
+        else:
+            print('No trailer assigned and no manual Mopeka IDs configured', flush=True)
         return
 
-    trailer_num = _get_assigned_trailer(cfg)
     if trailer_num is not None:
         result = apply_trailer(trailer_num)
         if result:
