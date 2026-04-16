@@ -49,6 +49,8 @@ BMS_TIMEOUT = 8
 SCAN_INTERVAL = 15
 BMS_READ_INTERVAL = 20  # 20 * 15s scan interval = 5 minutes
 STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
+STARTUP_DASHBOARD_WAIT_SECONDS = 30
+STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 
 # Recovery settings
 MAX_CONSECUTIVE_FAILURES = 5
@@ -130,6 +132,9 @@ config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
 config_notify_char = None
 ble_device = None
+dashboard_ready = False
+last_dashboard_error_log = 0.0
+last_dashboard_error_message = None
 
 # Chunked config command buffer
 config_cmd_chunks = {}
@@ -151,17 +156,34 @@ def _redact_dashboard_command(cmd):
 
 def send_dashboard_command(cmd):
     """Send command to dashboard via socket"""
+    global dashboard_ready, last_dashboard_error_log, last_dashboard_error_message
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(2.0)
             s.connect((DASHBOARD_HOST, DASHBOARD_PORT))
             s.send(f'{cmd}\n'.encode())
             response = s.recv(4096).decode().strip()
+            dashboard_ready = True
             print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
             return response
     except Exception as e:
-        print(f'Dashboard command error: {e}', flush=True)
+        dashboard_ready = False
+        message = f'Dashboard command error: {e}'
+        now = time.time()
+        if message != last_dashboard_error_message or now - last_dashboard_error_log >= 10:
+            print(message, flush=True)
+            last_dashboard_error_log = now
+            last_dashboard_error_message = message
         return None
+
+
+async def wait_for_dashboard_ready(timeout=STARTUP_DASHBOARD_WAIT_SECONDS):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if query_dashboard_status():
+            return True
+        await asyncio.sleep(STARTUP_DASHBOARD_RETRY_INTERVAL)
+    return False
 
 def query_fill_history():
     """Query dashboard for last 5 fills"""
@@ -1826,7 +1848,7 @@ async def read_bms(sensor_device, current_time):
 
     try:
         connect_errors = []
-        for target in (BMS_NAME, BMS_MAC):
+        for target in (BMS_MAC, BMS_NAME):
             try:
                 connection = await sensor_device.connect(
                     target,
@@ -2191,6 +2213,14 @@ async def main():
         ],
     )
     device.add_service(service)
+    if await wait_for_dashboard_ready():
+        print('Dashboard socket is ready', flush=True)
+    else:
+        print(
+            f'Dashboard socket not ready after {STARTUP_DASHBOARD_WAIT_SECONDS}s; '
+            'continuing and relying on retry loop',
+            flush=True,
+        )
     status_task = asyncio.create_task(poll_dashboard_status(device, state_char))
 
     await device.power_on()
