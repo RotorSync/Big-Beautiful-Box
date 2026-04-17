@@ -824,6 +824,19 @@ def _get_assigned_trailer(cfg=None):
     return cfg.get('assigned_trailer', cfg.get('trailer'))
 
 
+def _compute_bms_name(cfg=None):
+    cfg = cfg or load_config()
+    explicit_name = str(cfg.get('bms_name') or '').strip()
+    if explicit_name:
+        return explicit_name
+
+    trailer = _get_assigned_trailer(cfg)
+    if trailer not in (None, ''):
+        return f'TR{trailer}-BMS'
+
+    return BMS_NAME
+
+
 def _box_mode_uses_trailer_list(cfg=None):
     cfg = cfg or load_config()
     return _normalize_box_mode(cfg.get('box_mode')) == 'fleet'
@@ -883,7 +896,7 @@ def enforce_bumble_only_stack():
 def apply_trailer(trailer_num):
     """Look up trailer in sensor CSV, set MOPEKA1/2_MAC_SUFFIX globals,
     save config, reload mopeka_converter, return trailer info dict."""
-    global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX
+    global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX, BMS_NAME
 
     sensors = load_sensor_csv()
     trailer_sensors = [s for s in sensors if str(s.get('Trailer')) == str(trailer_num)]
@@ -926,6 +939,7 @@ def apply_trailer(trailer_num):
         'display_name': f'TrailerSync-TR{trailer_num}',
     })
     save_config(cfg)
+    BMS_NAME = _compute_bms_name(cfg)
 
     # Reload mopeka_converter so offsets match new sensors
     try:
@@ -989,12 +1003,14 @@ def restore_trailer_config():
 
 def restore_bms_config():
     """Restore BMS config from mopeka_config.json."""
-    global BMS_MAC
+    global BMS_MAC, BMS_NAME
     cfg = load_config()
     saved_mac = _normalize_ble_mac(cfg.get('bms_mac'))
     if saved_mac:
         BMS_MAC = saved_mac
         print(f'Restored BMS MAC from config: {BMS_MAC}', flush=True)
+    BMS_NAME = _compute_bms_name(cfg)
+    print(f'Restored BMS name from config: {BMS_NAME}', flush=True)
 
 
 def restore_adapter_config():
@@ -1358,7 +1374,7 @@ def _cmd_get_bms(*, request_id=None):
         'op': 'GET_BMS',
         'bms': {
             'mac': BMS_MAC,
-            'name': BMS_NAME,
+            'name': _compute_bms_name(),
             'enabled': bool(BMS_ENABLED),
         },
     }
@@ -1392,7 +1408,7 @@ def _cmd_set_bms_mac(cmd, *, request_id=None):
         'request_id': request_id,
         'bms': {
             'mac': BMS_MAC,
-            'name': BMS_NAME,
+            'name': _compute_bms_name(),
             'enabled': bool(BMS_ENABLED),
         },
     })
