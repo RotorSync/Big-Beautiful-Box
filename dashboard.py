@@ -381,6 +381,7 @@ def switch_mode(new_mode):
     # Update the display
     draw_requested_number(f"{requested_gallons:.0f}", "red")
     update_mopeka_display()
+    update_bms_display()
     update_last_load_display()
 
     print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
@@ -673,13 +674,10 @@ _last_actual_color = None
 def redraw_numbers_for_batch_mix():
     """Redraw requested/actual numbers in batch mix positions (left 1/3)"""
     global requested_gallons, last_totalizer_liters
+    global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
 
     # Get current color based on state
     color = "green" if colors_are_green else "red"
-
-    # Redraw in left 1/3 position
-    canvas.delete("requested")
-    canvas.delete("actual")
 
     canvas.update()
     width = canvas.winfo_width()
@@ -692,11 +690,15 @@ def redraw_numbers_for_batch_mix():
     req_font = ("Helvetica", 90, "bold")
     req_text = f"{requested_gallons:.0f}"
 
-    for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
-        canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
-                          font=req_font, fill="white", tags="requested")
-    canvas.create_text(left_center_x, req_y, text=req_text,
-                      font=req_font, fill=color, tags="requested")
+    if req_text != _last_requested_text or color != _last_requested_color:
+        _last_requested_text = req_text
+        _last_requested_color = color
+        canvas.delete("requested")
+        for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
+            canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
+                              font=req_font, fill="white", tags="requested")
+        canvas.create_text(left_center_x, req_y, text=req_text,
+                          font=req_font, fill=color, tags="requested")
 
     # Actual number - smaller font for left panel
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -704,11 +706,15 @@ def redraw_numbers_for_batch_mix():
     act_font = ("Helvetica", 110, "bold")
     act_text = f"{actual_gallons:.1f}"
 
-    for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
-        canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
-                          font=act_font, fill="white", tags="actual")
-    canvas.create_text(left_center_x, act_y, text=act_text,
-                      font=act_font, fill=color, tags="actual")
+    if act_text != _last_actual_text or color != _last_actual_color:
+        _last_actual_text = act_text
+        _last_actual_color = color
+        canvas.delete("actual")
+        for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
+            canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
+                              font=act_font, fill="white", tags="actual")
+        canvas.create_text(left_center_x, act_y, text=act_text,
+                          font=act_font, fill=color, tags="actual")
 
 def redraw_numbers_normal():
     """Redraw requested/actual numbers in normal centered positions"""
