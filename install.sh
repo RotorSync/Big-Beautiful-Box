@@ -389,7 +389,14 @@ sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
 sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
 sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
 sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
-sudo cp -r "$SCRIPT_DIR/mopeka/"* "$OPT_DIR/mopeka/"
+for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
+    base_name="$(basename "$mopeka_file")"
+    if [ "$base_name" = "mopeka_config.json" ] && [ -f "$OPT_DIR/mopeka/mopeka_config.json" ]; then
+        log_info "Preserving existing /opt/mopeka/mopeka_config.json"
+        continue
+    fi
+    sudo cp "$mopeka_file" "$OPT_DIR/mopeka/"
+done
 sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 # Copy optional files
