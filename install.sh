@@ -269,7 +269,8 @@ sudo systemctl start ssh
 # Install Python packages used by the BLE/Rotorsync stack.
 # Rotorsync runs as a systemd service via /usr/bin/python3, so these must be
 # available to the system interpreter rather than only the pi user's site-packages.
-sudo python3 -m pip install --break-system-packages --upgrade pip
+# Do not self-upgrade distro-managed pip here. Ubuntu's deb-packaged pip does
+# not carry uninstall metadata that pip expects for a replace-in-place upgrade.
 sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble
 
 # Step 3: Install vendored IOL-HAT
