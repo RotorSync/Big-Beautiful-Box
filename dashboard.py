@@ -327,6 +327,7 @@ def switch_mode(new_mode):
     global current_mode, requested_gallons, fill_requested_gallons, mix_requested_gallons
     global mode_indicator_label, colors_are_green, serial_command_received, batch_mix_layout_active
     global thumbs_up_label, thumbs_up_animation_id, override_mode, override_enabled_time
+    global last_totalizer_liters, last_flow_rate
 
     if new_mode == current_mode:
         return  # Already in this mode
@@ -337,10 +338,16 @@ def switch_mode(new_mode):
     else:
         mix_requested_gallons = requested_gallons
 
+    current_actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    current_flow_gpm = last_flow_rate * 60 * config.LITERS_TO_GALLONS
+
     if current_mode == 'mix' and new_mode == 'fill' and override_mode:
         override_mode = False
         override_enabled_time = None
         print("Cleared override while switching from MIX to FILL")
+
+    if current_mode == 'mix' and new_mode == 'fill' and current_actual_gallons > 0 and current_flow_gpm < 10:
+        root.after(0, lambda: force_flow_reset("mix_to_fill_low_flow"))
 
     # Switch to new mode and load its preset
     current_mode = new_mode
@@ -3783,6 +3790,37 @@ flow_cycle_counter = 0
 def flow_is_active():
     """Return True when flow is currently active."""
     return last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+
+def _pulse_flow_reset_gpio():
+    global flow_reset_scheduled, flow_reset_cycle_id
+    try:
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write("pulsing gpio0\n")
+        GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
+        time.sleep(config.FLOW_RESET_DURATION)
+        GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write("done\n")
+    except Exception as e:
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(str(e) + "\n")
+    flow_reset_scheduled = False
+    flow_reset_cycle_id = None
+
+
+def force_flow_reset(reason="forced"):
+    global flow_reset_scheduled, flow_reset_cycle_id
+    if not GPIO_AVAILABLE:
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return
+    msg = f"Flow reset forced: {reason} ({last_flow_rate:.3f} L/s)"
+    print(msg)
+    log_serial_debug(msg)
+    with open("/home/pi/reset_debug.log", "a") as dbg:
+        dbg.write(msg + "\n")
+    _pulse_flow_reset_gpio()
+
 
 def pulse_flow_reset():
     global flow_reset_scheduled, flow_reset_cycle_id
