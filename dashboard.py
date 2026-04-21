@@ -2105,7 +2105,7 @@ def run_system_update():
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 return
 
-            status_text.insert(tk.END, "Refreshing BBB log rotation...\n")
+            status_text.insert(tk.END, "Refreshing deployed BBB runtime...\n")
             status_text.update()
 
             deploy_cmd = (
@@ -2113,6 +2113,12 @@ def run_system_update():
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.conf /etc/logrotate.d/bbb; "
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.service /etc/systemd/system/bbb-logrotate.service; "
                 "cp /home/pi/Big-Beautiful-Box/deploy/bbb-logrotate.timer /etc/systemd/system/bbb-logrotate.timer; "
+                "mkdir -p /opt/src /opt/mopeka; "
+                "cp /home/pi/Big-Beautiful-Box/rotorsync_bumble.py /opt/rotorsync_bumble.py; "
+                "cp /home/pi/Big-Beautiful-Box/rotorsync_watchdog.py /opt/rotorsync_watchdog.py; "
+                "cp -r /home/pi/Big-Beautiful-Box/src/. /opt/src/; "
+                "cp -r /home/pi/Big-Beautiful-Box/mopeka/. /opt/mopeka/; "
+                "chmod 755 /opt/rotorsync_bumble.py /opt/rotorsync_watchdog.py; "
                 "python3 - <<'PY'\n"
                 "from pathlib import Path\n"
                 "cfg = Path('/boot/firmware/config.txt')\n"
@@ -2143,11 +2149,11 @@ def run_system_update():
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode != 0:
-                status_text.insert(tk.END, "WARNING: Could not refresh BBB log rotation.\n")
+                status_text.insert(tk.END, "WARNING: Could not refresh deployed BBB runtime.\n")
                 if result.stderr:
                     status_text.insert(tk.END, result.stderr + "\n")
             else:
-                status_text.insert(tk.END, "BBB log rotation updated.\n")
+                status_text.insert(tk.END, "BBB runtime files updated.\n")
                 status_text.insert(tk.END, "Boot display config updated to 1080p30.\n")
             status_text.update()
 
@@ -2162,7 +2168,7 @@ def run_system_update():
             # Launch in the background because the current process will be terminated by the restart.
             restart_cmd = (
                 "sleep 1; "
-                "printf 'raspi\\n' | sudo -S systemctl restart iol_dashboard.service"
+                "printf 'raspi\n' | sudo -S systemctl restart rotorsync.service rotorsync_watchdog.service iol_dashboard.service"
             )
             subprocess.Popen(['bash', '-lc', restart_cmd])
             return
