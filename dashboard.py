@@ -326,7 +326,7 @@ def switch_mode(new_mode):
     """Switch between fill and mix modes"""
     global current_mode, requested_gallons, fill_requested_gallons, mix_requested_gallons
     global mode_indicator_label, colors_are_green, serial_command_received, batch_mix_layout_active
-    global thumbs_up_label, thumbs_up_animation_id
+    global thumbs_up_label, thumbs_up_animation_id, override_mode, override_enabled_time
 
     if new_mode == current_mode:
         return  # Already in this mode
@@ -336,6 +336,11 @@ def switch_mode(new_mode):
         fill_requested_gallons = requested_gallons
     else:
         mix_requested_gallons = requested_gallons
+
+    if current_mode == 'mix' and new_mode == 'fill' and override_mode:
+        override_mode = False
+        override_enabled_time = None
+        print("Cleared override while switching from MIX to FILL")
 
     # Switch to new mode and load its preset
     current_mode = new_mode
