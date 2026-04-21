@@ -399,10 +399,16 @@ _last_actual_color = None
 
 def update_batch_mix_overlay():
     """Update the batch mix screen layout based on mode and data"""
-    global batch_mix_layout_active, batch_mix_data
+    global batch_mix_layout_active, batch_mix_data, thumbs_up_animation_id
 
     # Only show batch mix layout in mix mode with data
     if current_mode == "mix" and batch_mix_data is not None:
+        if thumbs_up_animation_id:
+            root.after_cancel(thumbs_up_animation_id)
+            thumbs_up_animation_id = None
+        if thumbs_up_label:
+            thumbs_up_label.place_forget()
+            _set_thumbs_up_visible(False)
         if not batch_mix_layout_active:
             activate_batch_mix_layout()
         else:
@@ -411,6 +417,22 @@ def update_batch_mix_overlay():
     else:
         if batch_mix_layout_active:
             deactivate_batch_mix_layout()
+
+
+def clear_batch_mix_screen(reason="clear"):
+    """Exit the batch mix product overlay and return to the normal mix screen."""
+    global batch_mix_data, thumbs_up_animation_id
+    batch_mix_data = None
+    if thumbs_up_animation_id:
+        root.after_cancel(thumbs_up_animation_id)
+        thumbs_up_animation_id = None
+    if thumbs_up_label:
+        thumbs_up_label.place_forget()
+        _set_thumbs_up_visible(False)
+    update_batch_mix_overlay()
+    msg = f"Batch mix screen cleared: {reason}"
+    print(msg)
+    log_serial_debug(msg)
 
 def show_batchmix_error(error_msg):
     """Display a BatchMix error message on screen"""
@@ -437,6 +459,7 @@ def show_batchmix_error(error_msg):
 def activate_batch_mix_layout():
     """Switch to batch mix screen layout"""
     global batch_mix_layout_active
+    global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
 
     # Clear existing labels and redraw in new positions
     canvas.delete("labels")
@@ -474,10 +497,15 @@ def activate_batch_mix_layout():
     refresh_batch_mix_products()
     refresh_batch_mix_totals()
 
+    # Mark layout active and invalidate cached number state so the side layout is forced.
+    batch_mix_layout_active = True
+    _last_requested_text = None
+    _last_requested_color = None
+    _last_actual_text = None
+    _last_actual_color = None
+
     # Redraw the numbers in new positions
     redraw_numbers_for_batch_mix()
-
-    batch_mix_layout_active = True
 
 def refresh_batch_mix_totals():
     """Draw/update totals section at bottom of screen"""
@@ -508,8 +536,8 @@ def refresh_batch_mix_totals():
         canvas.create_text(x, bottom_y, text=value, font=("Helvetica", 44, "bold"),
                           fill="cyan", tags="totals")
         # Label below - smaller gray text
-        canvas.create_text(x, label_y, text=label, font=("Helvetica", 16),
-                          fill="gray", tags="totals")
+        canvas.create_text(x, label_y, text=label, font=("Helvetica", 24, "bold"),
+                          fill="#d0d0d0", tags="totals")
 
 def refresh_batch_mix_products():
     """Draw/update products list on canvas"""
@@ -539,8 +567,8 @@ def refresh_batch_mix_products():
         max_name_width = (products_x_end - products_x_start) // 2 - 20  # Half the products area
 
         # Start with larger font, scale down if needed
-        font_size = 28
-        while font_size >= 14:
+        font_size = 40
+        while font_size >= 20:
             test_id = canvas.create_text(0, 0, text=name,
                                         font=("Helvetica", font_size, "bold"),
                                         anchor="w", tags="temp_measure")
@@ -602,18 +630,18 @@ def refresh_batch_mix_products():
             if short_size:
                 # Draw jug size first at far right
                 jug_text_id = canvas.create_text(products_x_end - 10, y, text=short_size,
-                                  font=("Helvetica", 24, "bold"), fill="cyan",
+                                  font=("Helvetica", 30, "bold"), fill="cyan",
                                   anchor="e", tags="products")
                 # Get width of jug size text
                 bbox = canvas.bbox(jug_text_id)
                 jug_width = bbox[2] - bbox[0] if bbox else 150
                 # Draw amount to the left with some padding
                 canvas.create_text(products_x_end - 20 - jug_width, y, text=amount_text,
-                                  font=("Helvetica", 28, "bold"), fill="yellow",
+                                  font=("Helvetica", 34, "bold"), fill="yellow",
                                   anchor="e", tags="products")
             else:
                 canvas.create_text(products_x_end - 10, y, text=amount_text,
-                                  font=("Helvetica", 28, "bold"), fill="yellow",
+                                  font=("Helvetica", 34, "bold"), fill="yellow",
                                   anchor="e", tags="products")
         else:
             amount_text = f"{gallons:.1f} gal"
@@ -642,6 +670,7 @@ def refresh_batch_mix_products():
 def deactivate_batch_mix_layout():
     """Switch back to normal screen layout"""
     global batch_mix_layout_active
+    global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
 
     # Clear batch mix elements
     canvas.delete("batchmix")
@@ -659,10 +688,17 @@ def deactivate_batch_mix_layout():
     canvas.create_text(center_x, int(height * 0.45), text="Actual Gallons:",
                       font=("Helvetica", 36, "bold"), fill="white", tags="labels")
 
+    # Invalidate cached number state so normal-mode positions are redrawn.
+    _last_requested_text = None
+    _last_requested_color = None
+    _last_actual_text = None
+    _last_actual_color = None
+
+    # Leave batch-mix layout before redrawing so normal positioning is used.
+    batch_mix_layout_active = False
+
     # Redraw numbers in normal positions
     redraw_numbers_normal()
-
-    batch_mix_layout_active = False
 
 # Cache for preventing flicker - only redraw when values change
 _last_requested_text = None
@@ -1001,6 +1037,16 @@ def change_colors_to_green(from_button=False):
     with open(button_log, 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] change_colors_to_green() called with from_button={from_button}\n")
 
+    if batch_mix_layout_active:
+        with open(button_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Ignoring thumbs-up/green transition while batch mix screen is active\n")
+        if thumbs_up_animation_id:
+            root.after_cancel(thumbs_up_animation_id)
+        if thumbs_up_label:
+            thumbs_up_label.place_forget()
+            _set_thumbs_up_visible(False)
+        return
+
     # Calculate current actual gallons
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
     with open(button_log, 'a') as f:
@@ -1026,8 +1072,8 @@ def change_colors_to_green(from_button=False):
             draw_requested_number(f"{requested_gallons:.0f}", "green")
             current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
             draw_actual_number(f"{current_actual:.1f}", "green")
-            # Show big thumbs up on the right side and start animation!
-            if thumbs_up_label:
+            # Show big thumbs up on the right side and start animation, except on the batch product screen.
+            if thumbs_up_label and not batch_mix_layout_active:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
                 _set_thumbs_up_visible(True)
                 schedule_flow_reset()
@@ -1049,8 +1095,8 @@ def change_colors_to_green(from_button=False):
         if from_button:
             with open(button_log, 'a') as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
-            # Show thumbs up but DO NOT change colors to green
-            if thumbs_up_label:
+            # Show thumbs up but DO NOT change colors to green, except on the batch product screen.
+            if thumbs_up_label and not batch_mix_layout_active:
                 thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
                 _set_thumbs_up_visible(True)
                 schedule_flow_reset()
@@ -3691,8 +3737,9 @@ def serial_listener():
                                         root.after(
                                             0,
                                             lambda value=requested_gallons, is_green=colors_are_green: (
-                                                draw_requested_number(f"{value:.0f}", "green" if is_green else "red"),
-                                                update_batch_mix_overlay(),
+                                                draw_requested_number(f"{value:.0f}", "green" if is_green else "red")
+                                                if batch_mix_layout_active
+                                                else (draw_requested_number(f"{value:.0f}", "green" if is_green else "red"), update_batch_mix_overlay())
                                             ),
                                         )
                                     except ValueError as ve:
@@ -3710,14 +3757,21 @@ def serial_listener():
 
                                 elif line == 'OV':
                                     global override_enabled_time
-                                    # Check if requested gallons is 0 to trigger menu
+                                    # Check if requested gallons is 0 to trigger menu or leave batch mix screen.
                                     if requested_gallons == 0:
-                                        msg = "Serial: Menu access triggered (gallons=0, OV pressed)"
-                                        print(msg)
-                                        with open(debug_log, 'a') as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                        # Show menu in main thread
-                                        root.after(0, show_menu)
+                                        if current_mode == 'mix' and batch_mix_data is not None:
+                                            msg = "Serial: Batch mix screen exit triggered (gallons=0, OV pressed)"
+                                            print(msg)
+                                            with open(debug_log, 'a') as f:
+                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            root.after(0, lambda: clear_batch_mix_screen("serial OV at zero gallons"))
+                                        else:
+                                            msg = "Serial: Menu access triggered (gallons=0, OV pressed)"
+                                            print(msg)
+                                            with open(debug_log, 'a') as f:
+                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            # Show menu in main thread
+                                            root.after(0, show_menu)
                                     else:
                                         override_mode = not override_mode
                                         if override_mode:
