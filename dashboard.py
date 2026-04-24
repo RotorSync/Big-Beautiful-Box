@@ -3861,6 +3861,22 @@ def flow_is_active():
     """Return True when flow is currently active."""
     return last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
 
+
+def clear_auto_shutoff_state(reason=""):
+    """Clear per-cycle auto-shutoff state after a reset or new flow cycle."""
+    global last_alert_triggered, auto_shutoff_latched
+    global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+
+    last_alert_triggered = False
+    auto_shutoff_latched = False
+    last_trigger_flow_gpm = 0.0
+    last_trigger_threshold = 0.0
+    last_trigger_actual = 0.0
+    recent_flow_rates_l_per_s.clear()
+    if reason:
+        print(f"Auto-shutoff state cleared: {reason}")
+
+
 def _pulse_flow_reset_gpio():
     global flow_reset_scheduled, flow_reset_cycle_id
     try:
@@ -3889,6 +3905,7 @@ def force_flow_reset(reason="forced"):
     log_serial_debug(msg)
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write(msg + "\n")
+    clear_auto_shutoff_state(reason)
     _pulse_flow_reset_gpio()
 
 
@@ -4434,7 +4451,7 @@ def update_dashboard():
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
-    if not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
+    if is_flowing and not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
         last_alert_triggered = True
         auto_shutoff_latched = True
         last_trigger_flow_gpm = flow_rate_gpm
