@@ -78,6 +78,7 @@ import iolhat
 # Global variables
 last_totalizer_liters = 0.0
 last_flow_rate = 0.0
+previous_totalizer_liters = 0.0
 connection_error = False
 error_message = ""
 requested_gallons = config.REQUESTED_GALLONS
@@ -3076,6 +3077,7 @@ def read_flow_meter():
             # Decode the data according to Picomag format
             totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
             flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
+            detect_totalizer_reset(totalizer_liters)
 
             last_totalizer_liters = totalizer_liters
             last_flow_rate = flow_rate_l_per_s
@@ -3875,6 +3877,24 @@ def clear_auto_shutoff_state(reason=""):
     recent_flow_rates_l_per_s.clear()
     if reason:
         print(f"Auto-shutoff state cleared: {reason}")
+
+
+def detect_totalizer_reset(totalizer_liters):
+    """Treat a confirmed nonzero-to-zero totalizer drop as a new cycle boundary."""
+    global previous_totalizer_liters, flow_cycle_counter
+
+    previous_gallons = previous_totalizer_liters * config.LITERS_TO_GALLONS
+    current_gallons = totalizer_liters * config.LITERS_TO_GALLONS
+    reset_detected = previous_gallons > 0.25 and current_gallons < 0.05
+    previous_totalizer_liters = totalizer_liters
+
+    if reset_detected:
+        flow_cycle_counter += 1
+        clear_auto_shutoff_state("totalizer reset to zero")
+        print(
+            f"New fill cycle assumed from totalizer reset "
+            f"({previous_gallons:.3f} -> {current_gallons:.3f} gal)"
+        )
 
 
 def _pulse_flow_reset_gpio():
