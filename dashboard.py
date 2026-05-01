@@ -2171,6 +2171,7 @@ def run_system_update():
                 "cp /home/pi/Big-Beautiful-Box/rotorsync_watchdog.py /opt/rotorsync_watchdog.py; "
                 "cp -r /home/pi/Big-Beautiful-Box/src/. /opt/src/; "
                 "for mopeka_file in /home/pi/Big-Beautiful-Box/mopeka/*; do "
+                "[ -f \"$mopeka_file\" ] || continue; "
                 "base_name=$(basename \"$mopeka_file\"); "
                 "if [ \"$base_name\" = \"mopeka_config.json\" ] && [ -f /opt/mopeka/mopeka_config.json ]; then continue; fi; "
                 "cp \"$mopeka_file\" /opt/mopeka/; "
