@@ -390,6 +390,7 @@ sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
 sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
 sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
 for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
+    [ -f "$mopeka_file" ] || continue
     base_name="$(basename "$mopeka_file")"
     if [ "$base_name" = "mopeka_config.json" ] && [ -f "$OPT_DIR/mopeka/mopeka_config.json" ]; then
         log_info "Preserving existing /opt/mopeka/mopeka_config.json"
