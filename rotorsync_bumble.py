@@ -27,6 +27,7 @@ from bumble.gatt import Service, Characteristic, CharacteristicValue
 from bumble.core import UUID, AdvertisingData
 # Mopeka gallon conversion
 from src.mopeka_converter import mm_to_gallons, init as mopeka_init, reload as mopeka_reload
+from src.bluetooth_adapter_selection import list_bluetooth_adapters, select_adapters
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -57,6 +58,7 @@ MAX_CONSECUTIVE_FAILURES = 5
 ADAPTER_RESET_COOLDOWN = 30
 GATT_ADAPTER_CHECK_INTERVAL = 5
 SENSOR_LOOP_HEARTBEAT_TIMEOUT = 120
+SENSOR_ADAPTER_OPEN_TIMEOUT = 10
 
 # UUIDs
 SERVICE_UUID = UUID('12345678-1234-5678-1234-56789abcdef0')
@@ -276,6 +278,47 @@ def find_adapter_by_mac(mac):
             return current_hci
 
     return None
+
+
+def _format_adapter(adapter):
+    if not adapter:
+        return 'none'
+    usb_id = f"{adapter.get('vendor_id', '')}:{adapter.get('product_id', '')}"
+    desc = ' '.join(
+        part for part in (adapter.get('manufacturer'), adapter.get('product'))
+        if part
+    )
+    return f"{adapter.get('hci')} {adapter.get('mac')} {usb_id} {desc}".strip()
+
+
+def select_runtime_adapters():
+    """Resolve GATT and sensor HCI adapters by known USB chip role."""
+    global GATT_ADAPTER_MAC, SENSOR_ADAPTER_MAC
+
+    adapters = list_bluetooth_adapters()
+    if adapters:
+        print('Detected Bluetooth adapters:', flush=True)
+        for adapter in adapters:
+            print(f'  {_format_adapter(adapter)}', flush=True)
+
+    gatt_adapter, sensor_adapter, used_usb_role = select_adapters(
+        adapters,
+        GATT_ADAPTER_MAC,
+        SENSOR_ADAPTER_MAC,
+    )
+
+    if used_usb_role:
+        print('Bluetooth adapter roles selected by USB chip identity', flush=True)
+
+    if gatt_adapter and gatt_adapter.get('mac'):
+        GATT_ADAPTER_MAC = gatt_adapter['mac']
+    if sensor_adapter and sensor_adapter.get('mac'):
+        SENSOR_ADAPTER_MAC = sensor_adapter['mac']
+
+    return (
+        gatt_adapter['hci'] if gatt_adapter else None,
+        sensor_adapter['hci'] if sensor_adapter else None,
+    )
 
 
 def get_adapter_device_path(adapter):
@@ -1034,11 +1077,11 @@ def persist_adapter_config():
     cfg = load_config()
     changed = False
 
-    if _normalize_ble_mac(cfg.get('gatt_adapter_mac')) != GATT_ADAPTER_MAC:
+    if GATT_ADAPTER_MAC and _normalize_ble_mac(cfg.get('gatt_adapter_mac')) != GATT_ADAPTER_MAC:
         cfg['gatt_adapter_mac'] = GATT_ADAPTER_MAC
         changed = True
 
-    if _normalize_ble_mac(cfg.get('sensor_adapter_mac')) != SENSOR_ADAPTER_MAC:
+    if SENSOR_ADAPTER_MAC and _normalize_ble_mac(cfg.get('sensor_adapter_mac')) != SENSOR_ADAPTER_MAC:
         cfg['sensor_adapter_mac'] = SENSOR_ADAPTER_MAC
         changed = True
 
@@ -2100,9 +2143,8 @@ async def main():
     # Restore trailer config from last session
     restore_trailer_config()
 
-    # Find adapters by MAC address
-    gatt_adapter = find_adapter_by_mac(GATT_ADAPTER_MAC)
-    sensor_adapter = find_adapter_by_mac(SENSOR_ADAPTER_MAC)
+    # Find adapters by known USB chip role first, then saved MAC fallback.
+    gatt_adapter, sensor_adapter = select_runtime_adapters()
 
     if not gatt_adapter:
         print(f'ERROR: GATT adapter {GATT_ADAPTER_MAC} not found!', flush=True)
@@ -2125,10 +2167,20 @@ async def main():
     sensor_device = None
     if sensor_adapter and sensor_adapter_index is not None:
         print(f'Opening HCI socket for {sensor_adapter}...', flush=True)
-        sensor_transport = await open_hci_socket_transport(sensor_adapter_index)
-        sensor_host = Host(sensor_transport.source, sensor_transport.sink)
-        sensor_device = Device(name='TrailerSync-Sensors', host=sensor_host)
-        await sensor_device.power_on()
+        try:
+            sensor_transport = await asyncio.wait_for(
+                open_hci_socket_transport(sensor_adapter_index),
+                timeout=SENSOR_ADAPTER_OPEN_TIMEOUT,
+            )
+            sensor_host = Host(sensor_transport.source, sensor_transport.sink)
+            sensor_device = Device(name='TrailerSync-Sensors', host=sensor_host)
+            await sensor_device.power_on()
+        except Exception as e:
+            print(
+                f'WARNING: Sensor adapter {sensor_adapter} open failed; sensors disabled: {e!r}',
+                flush=True,
+            )
+            sensor_adapter = None
 
     if sensor_adapter:
         sensor_task = asyncio.create_task(read_sensors(sensor_device, sensor_adapter))
