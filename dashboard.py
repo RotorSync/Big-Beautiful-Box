@@ -4508,6 +4508,7 @@ def update_dashboard():
     # Calculate dynamic trigger threshold based on current flow rate
     smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
     flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    display_flow_rate_gpm = flow_rate_gpm if is_flowing else 0.0
     trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
@@ -4558,7 +4559,7 @@ def update_dashboard():
                               font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
         last_daily_total_text = daily_total_text
         last_daily_total_mode = current_mode
-    update_flow_rate_display(flow_rate_gpm)
+    update_flow_rate_display(display_flow_rate_gpm)
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
