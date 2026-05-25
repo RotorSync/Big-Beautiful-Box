@@ -596,11 +596,24 @@ def command_write_handler(connection, value):
 
     if command == 'set_override':
         enabled = cmd.get('enabled')
-        desired = bool(enabled)
-        current = bool(dashboard_status.get('state', {}).get('ov', False))
-        if desired != current:
-            send_dashboard_command('OV')
-            query_dashboard_status()
+        if isinstance(enabled, bool):
+            desired = enabled
+        elif isinstance(enabled, int) and enabled in (0, 1):
+            desired = bool(enabled)
+        elif isinstance(enabled, str):
+            normalized = enabled.strip().lower()
+            if normalized in ('true', '1', 'yes', 'on'):
+                desired = True
+            elif normalized in ('false', '0', 'no', 'off'):
+                desired = False
+            else:
+                print(f'Command write ignored: invalid override value {enabled!r}', flush=True)
+                return
+        else:
+            print(f'Command write ignored: invalid override value {enabled!r}', flush=True)
+            return
+        send_dashboard_command('OV:1' if desired else 'OV:0')
+        query_dashboard_status()
         return
 
     if command == 'set_batchmix':

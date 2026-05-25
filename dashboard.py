@@ -87,7 +87,10 @@ override_mode = False
 last_alert_triggered = False
 auto_shutoff_latched = False  # True once the pump-stop relay has fired for the current fill cycle
 last_successful_read_time = time.time()
+last_flow_read_was_fresh = False  # True only when latest IO-Link data changed
 was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
+new_fill_flow_started_at = None  # Time flow first exceeded the new-fill threshold
+new_fill_cycle_cleared = False  # True after prior fill state is cleared for this cycle
 colors_are_green = False  # Track if colors have been changed to green
 last_reminder_date = None  # Track the last date reminders were shown (YYYY-MM-DD format)
 reminders_mode = False  # Track if we're showing reminders
@@ -3021,9 +3024,11 @@ def _log_iol_disconnect_status(reason):
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
+    global last_flow_read_was_fresh
     global consecutive_identical_raw, last_raw_data
 
     try:
+        last_flow_read_was_fresh = False
         # Read process data from IO-Link device
         raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
 
@@ -3046,9 +3051,11 @@ def read_flow_meter():
             if connection_error and raw_data != last_raw_data:
                 print(f"Flow meter reconnected - valid data received", flush=True)
 
+            raw_data_changed = raw_data != last_raw_data
+
             # Check for stale data (byte-for-byte identical reads = meter disconnected)
             # A connected meter always has micro-fluctuations in the raw bytes
-            if raw_data == last_raw_data:
+            if not raw_data_changed:
                 consecutive_identical_raw += 1
                 if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
                     connection_error = True
@@ -3085,6 +3092,7 @@ def read_flow_meter():
             connection_error = False
             error_message = ""
             last_successful_read_time = time.time()
+            last_flow_read_was_fresh = raw_data_changed
 
             return totalizer_liters * config.LITERS_TO_GALLONS
         else:
@@ -3193,7 +3201,7 @@ def _wifi_connect(ssid, password, hidden=False):
 
 def socket_command_listener():
     """Listen for commands from rotorsync BLE server via localhost socket"""
-    global requested_gallons, override_mode, colors_are_green
+    global requested_gallons, override_mode, override_enabled_time, colors_are_green
     global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
 
     import socket as sock_module
@@ -3420,6 +3428,24 @@ def socket_command_listener():
                                 with open(debug_log, "a") as f:
                                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 root.after(0, pump_stop_relay)
+
+                            elif line in ('OV:1', 'OV:0'):
+                                override_mode = (line == 'OV:1')
+                                if override_mode:
+                                    override_enabled_time = time.time()
+                                msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'} (explicit)"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+
+                            elif line == 'OV':
+                                override_mode = not override_mode
+                                if override_mode:
+                                    override_enabled_time = time.time()
+                                msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             client.send(b"OK\n")
                 except sock_module.timeout:
@@ -4315,6 +4341,7 @@ load_thumbs_up_gif()
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
+    global new_fill_flow_started_at, new_fill_cycle_cleared
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
@@ -4354,6 +4381,17 @@ def update_dashboard():
 
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+    is_new_fill_flowing = (
+        last_flow_read_was_fresh
+        and last_flow_rate >= config.NEW_FILL_CYCLE_THRESHOLD
+    )
+    now = time.time()
+    if is_new_fill_flowing:
+        if new_fill_flow_started_at is None:
+            new_fill_flow_started_at = now
+    else:
+        new_fill_flow_started_at = None
+        new_fill_cycle_cleared = False
     if is_flowing:
         recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
@@ -4418,24 +4456,32 @@ def update_dashboard():
         colors_are_green = False
         last_alert_triggered = False
         auto_shutoff_latched = False
+        new_fill_cycle_cleared = False
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
-        # Hide thumbs up when new cycle starts
+        last_trigger_flow_gpm = 0.0
+        last_trigger_threshold = 0.0
+        last_trigger_actual = 0.0
+        recent_flow_rates_l_per_s.clear()
+        print("New fill cycle started - colors reset to red, auto-shutoff state cleared")
+
+    # Hide thumbs up and clear pending fill only after sustained high flow.
+    if (
+        new_fill_flow_started_at is not None
+        and not new_fill_cycle_cleared
+        and now - new_fill_flow_started_at >= config.NEW_FILL_CYCLE_HOLD_SECONDS
+    ):
         if thumbs_up_label:
             thumbs_up_label.place_forget()
             _set_thumbs_up_visible(False)
-        # Clear any pending fill data from previous cycle
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
-        last_trigger_flow_gpm = 0.0
-        last_trigger_threshold = 0.0
-        last_trigger_actual = 0.0
-        recent_flow_rates_l_per_s.clear()
-        print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
+        new_fill_cycle_cleared = True
+        print("Sustained high-flow fill cycle detected - thumbs up hidden, pending fill cleared")
 
     if calibration_mode and calibration_state and calibration_state.get("phase") == "settling":
         if time.time() >= calibration_state.get("settle_deadline", time.time()):
