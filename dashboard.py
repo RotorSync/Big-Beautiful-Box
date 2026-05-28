@@ -280,6 +280,8 @@ menu_arrows = []  # List of arrow label widgets
 menu_daily_label = None  # Reference to daily total label in menu
 menu_season_label = None  # Reference to season total label in menu
 menu_position_label = None  # Reference to position indicator label
+menu_highlight_refresh_pending = False  # Coalesce menu redraws so knob pulses do not stack UI work
+menu_displayed_index = None  # Last menu item whose highlight state was painted
 log_viewer_mode = False  # Track if we're in log viewer
 log_viewer_window = None  # Reference to log viewer window
 log_viewer_text = None  # Reference to log text widget
@@ -326,8 +328,6 @@ last_raw_data = None  # Previous raw bytes for stale detection
 last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
 iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
 override_enabled_time = 0  # Timestamp when override mode was last enabled
-last_ui_serial_command = None  # Last UI/menu command received from switch box
-last_ui_serial_command_time = 0.0
 iol_io_lock = threading.RLock()  # Single gate for direct IO-Link process-data calls
 flow_control_stop_event = threading.Event()
 flow_control_thread = None
@@ -3050,18 +3050,13 @@ def reboot_system():
     reboot_thread = threading.Thread(target=do_reboot, daemon=True)
     reboot_thread.start()
 
-def update_menu_highlight():
-    """Update visual highlighting of selected menu item"""
-    global menu_buttons, menu_arrows, menu_selected_index, menu_position_label
-
-    if not menu_buttons or not menu_arrows:
+def style_menu_item(index, selected):
+    """Apply selected or unselected styling to a single menu item."""
+    if index < 0 or index >= len(menu_buttons) or index >= len(menu_arrows):
         return
 
-    # Update position indicator with current selection
-    if menu_position_label:
-        menu_position_label.config(
-            text=f"Option {menu_selected_index + 1} of {len(MENU_ITEMS)}: {MENU_ITEMS[menu_selected_index]}"
-        )
+    btn = menu_buttons[index]
+    arrow = menu_arrows[index]
 
     # High-contrast unselected palette for sunlight readability.
     colors = [
@@ -3079,31 +3074,66 @@ def update_menu_highlight():
         ("#e3e3e3", "#111111"),  # Exit Menu
     ]
 
-    for i, (btn, arrow) in enumerate(zip(menu_buttons, menu_arrows)):
-        if i == menu_selected_index:
-            # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
-            btn.config(bg="#111111", fg="#ffff00",
-                      activebackground="#111111", activeforeground="#ffff00",
-                      font=("Helvetica", 28, "bold"),
-                      relief=tk.RAISED, borderwidth=6,
-                      highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
-                      width=16, height=2,
-                      wraplength=360, justify=tk.CENTER)
-            arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
-                        font=("Helvetica", 20, "bold"))
-        else:
-            # Unselected - Keep it bright enough to read in direct sun.
-            bg, fg = colors[i % len(colors)]
-            btn.config(bg=bg, fg=fg,
-                      activebackground=bg, activeforeground=fg,
-                      font=("Helvetica", 28, "bold"),
-                      relief=tk.FLAT, borderwidth=2,
-                      highlightthickness=0,
-                      highlightbackground=bg,
-                      highlightcolor=bg,
-                      width=16, height=2,
-                      wraplength=360, justify=tk.CENTER)
-            arrow.config(text="", fg="black")
+    if selected:
+        # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
+        btn.config(bg="#111111", fg="#ffff00",
+                  activebackground="#111111", activeforeground="#ffff00",
+                  font=("Helvetica", 28, "bold"),
+                  relief=tk.RAISED, borderwidth=6,
+                  highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
+                  width=16, height=2,
+                  wraplength=360, justify=tk.CENTER)
+        arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
+                    font=("Helvetica", 20, "bold"))
+    else:
+        bg, fg = colors[index % len(colors)]
+        btn.config(bg=bg, fg=fg,
+                  activebackground=bg, activeforeground=fg,
+                  font=("Helvetica", 28, "bold"),
+                  relief=tk.FLAT, borderwidth=2,
+                  highlightthickness=0,
+                  highlightbackground=bg,
+                  highlightcolor=bg,
+                  width=16, height=2,
+                  wraplength=360, justify=tk.CENTER)
+        arrow.config(text="", fg="black")
+
+def update_menu_highlight(full_refresh=False):
+    """Update visual highlighting of selected menu item."""
+    global menu_buttons, menu_arrows, menu_selected_index, menu_position_label, menu_displayed_index
+
+    if not menu_buttons or not menu_arrows:
+        return
+
+    # Update position indicator with current selection
+    if menu_position_label:
+        menu_position_label.config(
+            text=f"Option {menu_selected_index + 1} of {len(MENU_ITEMS)}: {MENU_ITEMS[menu_selected_index]}"
+        )
+
+    if full_refresh or menu_displayed_index is None:
+        for i in range(len(menu_buttons)):
+            style_menu_item(i, i == menu_selected_index)
+    else:
+        if menu_displayed_index != menu_selected_index:
+            style_menu_item(menu_displayed_index, False)
+        style_menu_item(menu_selected_index, True)
+
+    menu_displayed_index = menu_selected_index
+
+def _apply_menu_highlight_update():
+    """Run one coalesced menu highlight redraw on the Tk thread."""
+    global menu_highlight_refresh_pending
+    menu_highlight_refresh_pending = False
+    update_menu_highlight()
+
+def schedule_menu_highlight_update():
+    """Schedule at most one menu redraw while serial knob pulses are arriving."""
+    global menu_highlight_refresh_pending
+    if menu_highlight_refresh_pending:
+        return
+    menu_highlight_refresh_pending = True
+    root.after(0, _apply_menu_highlight_update)
 
 def menu_navigate_up():
     """Move selection up in menu"""
@@ -3112,7 +3142,7 @@ def menu_navigate_up():
     menu_selected_index = (menu_selected_index - 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_up: {old_index} -> {menu_selected_index}\n")
-    update_menu_highlight()
+    schedule_menu_highlight_update()
 
 def menu_navigate_down():
     """Move selection down in menu"""
@@ -3121,7 +3151,7 @@ def menu_navigate_down():
     menu_selected_index = (menu_selected_index + 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_down: {old_index} -> {menu_selected_index}\n")
-    update_menu_highlight()
+    schedule_menu_highlight_update()
 
 def menu_select():
     """Activate the currently selected menu item"""
@@ -3221,7 +3251,8 @@ def exit_to_desktop():
 
 def close_menu():
     """Close the menu and return to main dashboard"""
-    global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index
+    global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_displayed_index
+    global menu_highlight_refresh_pending
     global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
     global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
     global reset_flow_curve_cancel_handler
@@ -3229,6 +3260,8 @@ def close_menu():
     global accept_flow_curve_cancel_handler
     menu_mode = False
     menu_selected_index = 0
+    menu_displayed_index = None
+    menu_highlight_refresh_pending = False
     menu_buttons = []
     menu_arrows = []
     # Reset exit confirmation globals
@@ -3312,6 +3345,7 @@ def show_daily_reminders():
 def show_menu():
     """Display the main menu"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_position_label
+    global menu_displayed_index, menu_highlight_refresh_pending
 
     load_flow_curve_state()
 
@@ -3378,6 +3412,8 @@ def show_menu():
 
     menu_mode = True
     menu_selected_index = 0  # Start at first item
+    menu_displayed_index = None
+    menu_highlight_refresh_pending = False
     menu_buttons = []
     menu_arrows = []
 
@@ -3542,22 +3578,7 @@ def show_menu():
     instructions.pack(pady=8)
 
     # Apply initial highlight
-    update_menu_highlight()
-
-def should_debounce_ui_serial_command(line):
-    """Ignore repeated switch-box UI pulses that would double-navigate/select."""
-    global last_ui_serial_command, last_ui_serial_command_time
-
-    if line not in {'OV', '+1', '-1', 'PS'}:
-        return False
-
-    now = time.time()
-    if line == last_ui_serial_command and (now - last_ui_serial_command_time) < 0.25:
-        return True
-
-    last_ui_serial_command = line
-    last_ui_serial_command_time = now
-    return False
+    update_menu_highlight(full_refresh=True)
 
 def iol_power_cycle():
     """Power-cycle the IOL port in a background thread to trigger re-negotiation.
@@ -4428,23 +4449,6 @@ def serial_listener():
                                 log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
 
-                            ui_mode_active = any([
-                                exit_confirm_window,
-                                reset_season_confirm_window,
-                                reset_flow_curve_confirm_window,
-                                accept_flow_curve_confirm_window,
-                                reminders_mode,
-                                log_viewer_mode,
-                                fill_history_mode,
-                                self_test_mode,
-                                full_test_mode,
-                                update_mode,
-                                menu_mode,
-                            ])
-                            if ui_mode_active and should_debounce_ui_serial_command(line):
-                                log_serial_debug(f"Debounced repeated UI command: '{line}'")
-                                continue
-
                             # Handle exit confirmation dialog
                             if exit_confirm_window:
                                 if line == 'OV':
@@ -4692,13 +4696,13 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, menu_navigate_down)
+                                    menu_navigate_down()
                                 elif line == '-1':
                                     msg = "Serial: Menu navigate up"
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, menu_navigate_up)
+                                    menu_navigate_up()
                                 elif line == 'OV':
                                     msg = "Serial: Menu select"
                                     print(msg)
