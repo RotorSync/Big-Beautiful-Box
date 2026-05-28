@@ -63,11 +63,11 @@ class TestFlowThreshold:
     
     def test_calibration_points(self):
         """Test against known calibration data points."""
-        # From config: 22 GPM → 0.45 gal coast, 70 GPM → 1.92 gal coast
+        # From config: 22 GPM -> ~0.63 gal coast, 70 GPM -> ~1.98 gal coast
         # 22 GPM = 22 / 15.85 = 1.388 L/s
         threshold_22gpm = calculate_trigger_threshold(22 / config.LITERS_PER_SEC_TO_GPM)
-        # Should be close to 0.45 (within calibration tolerance)
-        assert 0.3 < threshold_22gpm < 0.6
+        # Should be close to the fitted factory curve (within calibration tolerance)
+        assert 0.5 < threshold_22gpm < 0.8
         
         # 70 GPM = 70 / 15.85 = 4.416 L/s
         threshold_70gpm = calculate_trigger_threshold(70 / config.LITERS_PER_SEC_TO_GPM)

@@ -80,27 +80,20 @@ FLOW_CONTROL_INTERVAL = 0.020  # seconds; test 50 Hz polling against ~12.7 Hz fr
 FLOW_CONTROL_PREDICTION_SECONDS = 0.0  # keep curve behavior unchanged by default
 FLOW_CONTROL_AUDIT_INTERVAL = 5.0  # seconds between flow-meter freshness summaries
 
-# Piecewise coast model derived from usable March 2026 auto-shutoff samples.
-# Low band samples:
-#   - 42.3 GPM -> 1.02 gal coast
-#   - 48.1 GPM -> 1.18 gal coast
-#   - 59.9 GPM -> 1.45 gal coast
-#   - 65.7 GPM -> 1.62 gal coast
-# High band samples:
-#   - 80.6 GPM -> 1.98 gal coast
-#   - 84.4 GPM -> 2.09 gal coast
-#   - 85.0 GPM -> 2.12 gal coast
-# Refit from the last 11 usable auto loads in fill_calibration.log:
-#   Low band (<= 70 GPM): 29.8, 36.8, 49.0, 59.0, 64.4, 65.0, 68.9
-#   High band (> 70 GPM): 73.2, 75.4, 78.8, 83.1
+# Piecewise coast model refit from 25 thumbs-up-confirmed Auto fills logged
+# after 2026-05-28 17:03 during the curve test:
+#   Low band (<= 70 GPM): 38.4, 39.5, 39.1, 47.9, 48.8, 47.1,
+#                         47.8, 58.9, 58.8, 58.8
+#   High band (> 70 GPM): 73.1, 72.6, 72.8, 72.6, 72.7, 72.2, 73.0,
+#                         86.7, 87.3, 86.6, 85.9, 85.5, 100.7, 100.6, 100.4
 # Desired threshold per run is estimated as:
 #   corrected_threshold = logged_threshold + (actual - requested)
 # so underfills reduce the threshold and overfills increase it.
 FLOW_CURVE_SPLIT_GPM = 70.0
-FLOW_CURVE_LOW_SLOPE = 0.02543409299521162
-FLOW_CURVE_LOW_INTERCEPT = -0.12819618255920154
-FLOW_CURVE_HIGH_SLOPE = 0.030867814806530995
-FLOW_CURVE_HIGH_INTERCEPT = -0.38336412435696915
+FLOW_CURVE_LOW_SLOPE = 0.028133462493840494
+FLOW_CURVE_LOW_INTERCEPT = 0.006145734423797622
+FLOW_CURVE_HIGH_SLOPE = 0.02735502035885965
+FLOW_CURVE_HIGH_INTERCEPT = 0.13052774666967393
 
 # Runtime curve learning. Factory values above remain the fallback; learned
 # values are saved outside the repo so they can be reset in the field.
