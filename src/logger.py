@@ -13,6 +13,8 @@ import os
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+import config
+
 # Default log settings
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 DEFAULT_BACKUP_COUNT = 5
@@ -84,7 +86,7 @@ def get_main_logger() -> logging.Logger:
     """Get the main dashboard logger with rotation."""
     return setup_logger(
         'dashboard',
-        log_file='/home/pi/iol_dashboard.log',
+        log_file=config.MAIN_LOG_FILE,
         level=logging.INFO,
         max_bytes=10 * 1024 * 1024,  # 10MB
         backup_count=3
@@ -95,7 +97,7 @@ def get_serial_logger() -> logging.Logger:
     """Get serial debug logger with rotation."""
     return setup_logger(
         'serial',
-        log_file='/home/pi/serial_debug.log',
+        log_file=config.SERIAL_DEBUG_LOG,
         level=logging.DEBUG,
         max_bytes=5 * 1024 * 1024,  # 5MB
         backup_count=2
@@ -106,7 +108,7 @@ def get_relay_logger() -> logging.Logger:
     """Get relay test logger with rotation."""
     return setup_logger(
         'relay',
-        log_file='/home/pi/relay_test.log',
+        log_file=config.RELAY_TEST_LOG,
         level=logging.DEBUG,
         max_bytes=5 * 1024 * 1024,  # 5MB
         backup_count=2
@@ -117,7 +119,7 @@ def get_button_logger() -> logging.Logger:
     """Get button debug logger with rotation."""
     return setup_logger(
         'button',
-        log_file='/home/pi/button_debug.log',
+        log_file=config.BUTTON_DEBUG_LOG,
         level=logging.DEBUG,
         max_bytes=5 * 1024 * 1024,  # 5MB
         backup_count=2

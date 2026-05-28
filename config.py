@@ -64,7 +64,13 @@ LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 
 # Flow-based shutoff coast calibration
 # Use a short rolling average of flow rather than a single instant sample.
-FLOW_AVERAGING_SAMPLES = 3  # 3 x 200 ms updates = ~0.6 s average
+FLOW_AVERAGING_SAMPLES = 3  # 3 samples; timing follows the active flow-control loop
+
+# Safety-critical auto-shutoff loop. Keep IO-Link reads and relay decisions out
+# of the Tk render loop so GUI timing cannot move the pump stop point.
+FLOW_CONTROL_THREAD_ENABLED = True
+FLOW_CONTROL_INTERVAL = 0.05  # seconds; 50 ms is about 0.08 gal at 100 GPM
+FLOW_CONTROL_PREDICTION_SECONDS = 0.0  # keep curve behavior unchanged by default
 
 # Piecewise coast model derived from usable March 2026 auto-shutoff samples.
 # Low band samples:
@@ -87,6 +93,15 @@ FLOW_CURVE_LOW_SLOPE = 0.02543409299521162
 FLOW_CURVE_LOW_INTERCEPT = -0.12819618255920154
 FLOW_CURVE_HIGH_SLOPE = 0.030867814806530995
 FLOW_CURVE_HIGH_INTERCEPT = -0.38336412435696915
+
+# Runtime curve learning. Factory values above remain the fallback; learned
+# values are saved outside the repo so they can be reset in the field.
+FLOW_CURVE_OVERRIDE_FILE = "/home/pi/flow_curve_override.json"
+FLOW_CURVE_SAMPLES_FILE = "/home/pi/flow_curve_samples.json"
+FLOW_CURVE_PROPOSAL_FILE = "/home/pi/flow_curve_proposal.json"
+FLOW_CURVE_LEARN_SAMPLE_COUNT = 3
+FLOW_CURVE_MAX_LEARNED_OFFSET_GAL = 0.75
+FLOW_CURVE_MAX_SAMPLE_ERROR_GAL = 5.0
 
 
 # =============================================================================
@@ -114,6 +129,8 @@ UPDATE_INTERVAL = 150         # Milliseconds between GUI updates (lower = more r
 MAIN_LOG_FILE = "/home/pi/iol_dashboard.log"
 SERIAL_DEBUG_LOG = "/home/pi/serial_debug.log"
 RELAY_TEST_LOG = "/home/pi/relay_test.log"
+BUTTON_DEBUG_LOG = "/home/pi/button_debug.log"
+FLOW_CONTROL_LOG_FILE = "/home/pi/flow_control.log"
 
 
 # =============================================================================

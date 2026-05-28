@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import logging
 
 import config
+from .calculations import calculate_trigger_threshold as calculate_shared_trigger_threshold
 
 # Try to import iolhat
 try:
@@ -196,6 +197,4 @@ def calculate_trigger_threshold(flow_rate_l_per_s: float) -> float:
     Returns:
         Gallons before target to trigger shutoff
     """
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-    predicted_coast = config.FLOW_CURVE_SLOPE * flow_rate_gpm + config.FLOW_CURVE_INTERCEPT
-    return max(predicted_coast, 0.1)
+    return calculate_shared_trigger_threshold(flow_rate_l_per_s)

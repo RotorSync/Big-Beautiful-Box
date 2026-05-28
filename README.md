@@ -184,15 +184,27 @@ Edit `config.py` to adjust:
 
 ### Flow Shutoff Curve
 
-The system predicts coast distance based on flow rate:
+The system predicts coast distance with the piecewise flow curve in `config.py`.
+The factory curve remains in the repo and is the fallback on every boot.
 
-```
-coast_gallons = 0.030625 × GPM - 0.22375
-```
+Auto-shutoff timing is handled by a dedicated flow-control thread, enabled by
+`FLOW_CONTROL_THREAD_ENABLED` in `config.py`. That thread owns normal IO-Link
+process-data reads, updates the latest flow/totalizer state, and fires the pump
+stop relay when the flow curve threshold is reached. The Tk dashboard reads the
+cached state for display so GUI rendering jitter does not move the shutoff
+decision point. `FLOW_CONTROL_INTERVAL` controls the safety loop period; the
+default is 50 ms.
 
-Calibration data:
-- 22 GPM → 0.45 gal coast
-- 70 GPM → 1.92 gal coast
+Confirmed Auto fills can also learn a conservative field correction. After the
+last three thumbs-up-confirmed Auto fills, the box saves a pending proposal to
+`/home/pi/flow_curve_proposal.json` and keeps the samples in
+`/home/pi/flow_curve_samples.json`. The learned curve shifts the factory
+intercepts by a clamped offset; it does not rewrite `config.py` and does not
+become active automatically.
+
+Use `ACCEPT CURVE` in the on-screen system menu to manually activate a pending
+proposal. Use `FACTORY CURVE` to archive learned files and immediately return to
+the factory curve.
 
 ## Installation
 

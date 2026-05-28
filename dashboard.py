@@ -93,6 +93,15 @@ if SIM_MODE:
     config.MAIN_LOG_FILE = _pi_path(config.MAIN_LOG_FILE)
     config.SERIAL_DEBUG_LOG = _pi_path(config.SERIAL_DEBUG_LOG)
     config.RELAY_TEST_LOG = _pi_path(config.RELAY_TEST_LOG)
+    config.BUTTON_DEBUG_LOG = _pi_path(config.BUTTON_DEBUG_LOG)
+    config.FLOW_CONTROL_LOG_FILE = _pi_path(config.FLOW_CONTROL_LOG_FILE)
+
+from src import flow_curve
+FLOW_CURVE_OVERRIDE_PATH = _pi_path(config.FLOW_CURVE_OVERRIDE_FILE)
+FLOW_CURVE_SAMPLES_PATH = _pi_path(config.FLOW_CURVE_SAMPLES_FILE)
+FLOW_CURVE_PROPOSAL_PATH = _pi_path(config.FLOW_CURVE_PROPOSAL_FILE)
+active_flow_curve = flow_curve.FlowCurve.factory()
+flow_curve_metadata = {"source": "factory", "reason": "startup"}
 
 # Set up rotating loggers
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
@@ -288,6 +297,12 @@ exit_cancel_handler = None  # Function to call on cancel
 reset_season_confirm_window = None  # Reference to reset season confirmation window
 reset_season_confirm_handler = None  # Function to call on confirmation
 reset_season_cancel_handler = None  # Function to call on cancel
+reset_flow_curve_confirm_window = None  # Reference to flow curve reset confirmation
+reset_flow_curve_confirm_handler = None  # Function to call on confirmation
+reset_flow_curve_cancel_handler = None  # Function to call on cancel
+accept_flow_curve_confirm_window = None  # Reference to learned curve accept confirmation
+accept_flow_curve_confirm_handler = None  # Function to call on confirmation
+accept_flow_curve_cancel_handler = None  # Function to call on cancel
 daily_total = 0.0  # Total gallons pumped today
 season_total = 0.0  # Total gallons pumped this season (until manually reset)
 last_reset_date = None  # Track last daily reset date
@@ -306,12 +321,20 @@ last_heartbeat_time = time.time()  # Last time we received OK heartbeat from swi
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
 last_raw_data = None  # Previous raw bytes for stale detection
-STALE_RAW_THRESHOLD = 25  # Identical raw reads before flagging (25 * 200ms = 5 seconds)
 last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
 iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
 override_enabled_time = 0  # Timestamp when override mode was last enabled
 last_ui_serial_command = None  # Last UI/menu command received from switch box
 last_ui_serial_command_time = 0.0
+iol_io_lock = threading.RLock()  # Single gate for direct IO-Link process-data calls
+flow_control_stop_event = threading.Event()
+flow_control_thread = None
+flow_control_was_flowing = False
+flow_control_last_tick = None
+flow_control_last_loop_time = time.time()
+flow_control_last_error_log_time = 0.0
+last_trigger_predicted_actual = 0.0
+last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
 fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
@@ -330,6 +353,8 @@ MENU_ITEMS = [
     "TANK CALIBRATION",
     "FULL TEST",
     "RESET SEASON",
+    "ACCEPT CURVE",
+    "FACTORY CURVE",
     "SELF TEST",
     "CAPTURE BUG",
     "SYSTEM UPDATE",
@@ -367,6 +392,45 @@ calibration_state = None
 batch_mix_data = None  # Cached JSON data from iPad
 batch_mix_overlay = None  # Reference to batch mix overlay frame
 
+
+def load_flow_curve_state():
+    """Load the learned curve override, or fall back to factory values."""
+    global active_flow_curve, flow_curve_metadata
+    active_flow_curve, flow_curve_metadata = flow_curve.load_curve_override(
+        FLOW_CURVE_OVERRIDE_PATH
+    )
+    status = flow_curve_status_text()
+    reason = flow_curve_metadata.get("reason", "")
+    msg = f"Loaded flow curve: {status}"
+    if reason:
+        msg = f"{msg} ({reason})"
+    print(msg)
+    log_serial_debug(msg)
+
+
+def flow_curve_status_text():
+    """Short field-readable label for the active shutoff curve."""
+    if flow_curve_metadata.get("source") == "learned":
+        learning = flow_curve_metadata.get("learning", {})
+        offset = learning.get("applied_offset_gallons")
+        if isinstance(offset, (int, float)):
+            return f"Learned {offset:+.2f} gal"
+        return "Learned"
+    return "Factory"
+
+
+def flow_curve_proposal_status_text():
+    """Short label describing whether a learned curve proposal is waiting."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        return "No pending curve"
+    learning = proposal.get("learning", {})
+    offset = learning.get("applied_offset_gallons")
+    if isinstance(offset, (int, float)):
+        return f"Pending {offset:+.2f} gal"
+    return "Pending curve"
+
+
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
     Calculate how many gallons before target to trigger shutoff based on flow rate.
@@ -378,24 +442,7 @@ def calculate_trigger_threshold(flow_rate_l_per_s):
     Returns:
         Gallons before target to trigger shutoff (predicted coast distance)
     """
-    # Convert L/s to GPM
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-
-    if flow_rate_gpm <= config.FLOW_CURVE_SPLIT_GPM:
-        predicted_coast = (
-            config.FLOW_CURVE_LOW_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_LOW_INTERCEPT
-        )
-    else:
-        predicted_coast = (
-            config.FLOW_CURVE_HIGH_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_HIGH_INTERCEPT
-        )
-
-    # Ensure we don't have negative threshold (minimum 0.1 gallon before target)
-    threshold = max(predicted_coast, 0.1)
-
-    return threshold
+    return flow_curve.calculate_trigger_threshold(flow_rate_l_per_s, active_flow_curve)
 
 
 def get_smoothed_flow_rate():
@@ -403,6 +450,56 @@ def get_smoothed_flow_rate():
     if not recent_flow_rates_l_per_s:
         return last_flow_rate
     return sum(recent_flow_rates_l_per_s) / len(recent_flow_rates_l_per_s)
+
+
+def flow_control_enabled():
+    """True when the dedicated flow-control loop owns IO-Link shutoff timing."""
+    return bool(getattr(config, "FLOW_CONTROL_THREAD_ENABLED", False))
+
+
+def flow_control_active():
+    """True when the configured flow-control thread is currently alive."""
+    return bool(
+        flow_control_enabled()
+        and flow_control_thread is not None
+        and flow_control_thread.is_alive()
+    )
+
+
+def flow_read_interval_seconds():
+    """Return the expected interval between IO-Link process-data reads."""
+    if flow_control_enabled():
+        return max(0.01, float(getattr(config, "FLOW_CONTROL_INTERVAL", 0.05)))
+    return max(0.01, config.UPDATE_INTERVAL / 1000.0)
+
+
+def stale_raw_threshold_reads():
+    """Convert the stale-data timeout into a read count for the active poll rate."""
+    return max(1, int(config.FLOW_METER_TIMEOUT / flow_read_interval_seconds()))
+
+
+def get_cached_actual_gallons():
+    """Return the latest cached totalizer reading without touching IO-Link."""
+    return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+
+def log_flow_control(message):
+    """Append a timestamped flow-control event for shutoff timing audits."""
+    try:
+        with open(config.FLOW_CONTROL_LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
+
+
+def start_pump_stop_thread(duration=config.AUTO_ALERT_DURATION):
+    """Fire pump-stop relay without blocking the caller."""
+    relay_thread = threading.Thread(
+        target=pump_stop_relay,
+        args=(duration,),
+        daemon=True,
+    )
+    relay_thread.start()
 
 def load_totals():
     """Load daily and season totals from files"""
@@ -932,6 +1029,61 @@ def add_to_totals(gallons):
     season_total += gallons
     save_totals()
 
+
+def record_flow_curve_learning_sample():
+    """Learn a conservative curve offset from confirmed Auto thumbs-up fills."""
+    calibration_log = "/home/pi/fill_calibration.log"
+    try:
+        sample, reason = flow_curve.make_confirmed_auto_sample(
+            requested_gallons=pending_fill_requested,
+            actual_gallons=pending_fill_gallons,
+            flow_gpm=pending_fill_flow_gpm,
+            threshold_gallons=pending_fill_trigger_threshold,
+            shutoff_type=pending_fill_shutoff_type,
+        )
+    except Exception as exc:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: error"
+                f" | Stage: sample | Error: {exc}\n"
+            )
+        return
+
+    if sample is None:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: skipped"
+                f" | Reason: {reason}\n"
+            )
+        return
+
+    try:
+        result = flow_curve.record_learning_sample(
+            FLOW_CURVE_SAMPLES_PATH,
+            FLOW_CURVE_PROPOSAL_PATH,
+            sample,
+        )
+    except Exception as exc:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: error"
+                f" | Stage: save | Error: {exc}\n"
+            )
+        return
+    with open(calibration_log, "a") as f:
+        f.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted"
+            f" | Samples: {result['sample_count']}/{result['required_sample_count']}"
+        )
+        if result.get("proposal_saved"):
+            learning = result["learning"]
+            f.write(
+                f" | ProposalReady: yes"
+                f" | Offset: {learning['applied_offset_gallons']:+.3f} gal"
+                f" | RawOffset: {learning['raw_offset_gallons']:+.3f} gal"
+            )
+        f.write("\n")
+
 def reset_daily_total():
     """Reset daily total and log the previous day's total"""
     global daily_total, last_reset_date
@@ -1082,6 +1234,9 @@ def record_pending_fill():
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
                 f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
                 f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
+                f" | TriggerActual: {last_trigger_actual:.3f} gal"
+                f" | TriggerPredicted: {last_trigger_predicted_actual:.3f} gal"
+                f" | TriggerLoopMs: {last_trigger_loop_dt_ms:.1f}"
                 f" | Type: {pending_fill_shutoff_type}\n"
             )
 
@@ -1089,6 +1244,7 @@ def record_pending_fill():
         add_to_totals(pending_fill_gallons)
         last_loads_gallons = [pending_fill_gallons] + last_loads_gallons[:2]
         update_last_load_display()
+        record_flow_curve_learning_sample()
         print(f"Fill recorded - Actual: {pending_fill_gallons:.3f} gal")
         print(f"Updated totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
 
@@ -1969,7 +2125,8 @@ def run_self_test():
         results_text.insert(tk.END, "3. IOL-HAT Communication: ")
         results_text.update()
         try:
-            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+            with iol_io_lock:
+                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
             if len(raw_data) >= 15 and raw_data != b'\x00' * len(raw_data):
                 results_text.insert(tk.END, "PASS (Data received)\n", "pass")
             else:
@@ -1982,7 +2139,7 @@ def run_self_test():
         results_text.insert(tk.END, "4. Flow Meter Reading: ")
         results_text.update()
         try:
-            gallons = read_flow_meter()
+            gallons = get_cached_actual_gallons() if flow_control_active() else read_flow_meter()
             if not connection_error:
                 results_text.insert(tk.END, f"PASS (Reading: {gallons:.2f} gal)\n", "pass")
             else:
@@ -2155,7 +2312,8 @@ def run_full_test():
 
         def test_iolhat():
             try:
-                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+                with iol_io_lock:
+                    raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
                 if len(raw_data) >= 15 and raw_data != b'\x00' * len(raw_data):
                     iolhat_success[0] = True
                     root.after(0, lambda: mark_tested('iolhat'))
@@ -2180,7 +2338,8 @@ def run_full_test():
 
         # Test 5: Flow Meter
         try:
-            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+            with iol_io_lock:
+                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
             if raw_data and len(raw_data) == config.DATA_LENGTH and raw_data != b'\x00' * len(raw_data):
                 root.after(0, lambda: mark_tested('flow_meter'))
             else:
@@ -2603,6 +2762,236 @@ def confirm_reset_season():
     # Start countdown
     confirm_window.after(1000, update_countdown)
 
+
+def confirm_reset_flow_curve():
+    """Confirm and reset learned flow curve override with OV/PS commands."""
+    confirm_window = tk.Toplevel()
+    confirm_window.title("Flow Curve Reset Confirmation")
+    confirm_window.attributes('-fullscreen', True)
+    confirm_window.configure(bg='black')
+
+    message = tk.Label(confirm_window, text="USE FACTORY FLOW CURVE?",
+                      font=("Helvetica", 46, "bold"), fg="orange", bg="black")
+    message.pack(expand=True, pady=40)
+
+    current_curve = tk.Label(
+        confirm_window,
+        text=f"Current Curve: {flow_curve_status_text()}",
+        font=("Helvetica", 30, "bold"),
+        fg="lime",
+        bg="black",
+    )
+    current_curve.pack(pady=16)
+
+    detail = tk.Label(
+        confirm_window,
+        text="This archives learned curve samples and reloads factory defaults.",
+        font=("Helvetica", 24, "bold"),
+        fg="white",
+        bg="black",
+        wraplength=1100,
+        justify=tk.CENTER,
+    )
+    detail.pack(pady=12)
+
+    instructions = tk.Label(confirm_window, text="Press OV to CONFIRM or PS to CANCEL",
+                          font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+    instructions.pack(pady=24)
+
+    countdown_label = tk.Label(confirm_window, text="Auto-cancel in 10 seconds",
+                             font=("Helvetica", 22), fg="white", bg="black")
+    countdown_label.pack(pady=16)
+
+    countdown = [10]
+
+    def cancel_reset():
+        global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+        global reset_flow_curve_cancel_handler
+        confirm_window.destroy()
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+
+    def confirm_reset():
+        global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+        global reset_flow_curve_cancel_handler
+        archived = flow_curve.reset_learning(
+            FLOW_CURVE_SAMPLES_PATH,
+            FLOW_CURVE_PROPOSAL_PATH,
+            FLOW_CURVE_OVERRIDE_PATH,
+        )
+        load_flow_curve_state()
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: factory reset"
+                f" | Archived: {', '.join(archived) if archived else 'none'}\n"
+            )
+        confirm_window.destroy()
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+        if menu_window:
+            close_menu()
+            show_menu()
+
+    def update_countdown():
+        countdown[0] -= 1
+        if countdown[0] <= 0:
+            cancel_reset()
+        else:
+            countdown_label.config(text=f"Auto-cancel in {countdown[0]} seconds")
+            confirm_window.after(1000, update_countdown)
+
+    confirm_window.bind('<Escape>', lambda e: cancel_reset())
+
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    reset_flow_curve_confirm_window = confirm_window
+    reset_flow_curve_confirm_handler = confirm_reset
+    reset_flow_curve_cancel_handler = cancel_reset
+
+    confirm_window.after(1000, update_countdown)
+
+
+def confirm_accept_flow_curve():
+    """Confirm and activate a pending learned flow curve proposal."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        confirm_window = tk.Toplevel()
+        confirm_window.title("No Curve Proposal")
+        confirm_window.attributes('-fullscreen', True)
+        confirm_window.configure(bg='black')
+
+        message = tk.Label(confirm_window, text="NO LEARNED CURVE READY",
+                          font=("Helvetica", 46, "bold"), fg="orange", bg="black")
+        message.pack(expand=True, pady=50)
+        detail = tk.Label(confirm_window, text="Need 3 thumbs-up confirmed Auto fills first.",
+                         font=("Helvetica", 28, "bold"), fg="white", bg="black")
+        detail.pack(pady=20)
+        instructions = tk.Label(confirm_window, text="Press OV or PS to return",
+                              font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+        instructions.pack(pady=30)
+
+        def close_notice():
+            global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+            global accept_flow_curve_cancel_handler
+            confirm_window.destroy()
+            accept_flow_curve_confirm_window = None
+            accept_flow_curve_confirm_handler = None
+            accept_flow_curve_cancel_handler = None
+
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        accept_flow_curve_confirm_window = confirm_window
+        accept_flow_curve_confirm_handler = close_notice
+        accept_flow_curve_cancel_handler = close_notice
+        confirm_window.after(8000, close_notice)
+        return
+
+    learning = proposal.get("learning", {})
+    offset = learning.get("applied_offset_gallons")
+    raw_offset = learning.get("raw_offset_gallons")
+    sample_count = proposal.get("sample_count", 0)
+
+    confirm_window = tk.Toplevel()
+    confirm_window.title("Accept Flow Curve Confirmation")
+    confirm_window.attributes('-fullscreen', True)
+    confirm_window.configure(bg='black')
+
+    message = tk.Label(confirm_window, text="ACCEPT LEARNED FLOW CURVE?",
+                      font=("Helvetica", 44, "bold"), fg="orange", bg="black")
+    message.pack(expand=True, pady=36)
+
+    detail_text = (
+        f"Samples: {sample_count} Auto fills\n"
+        f"Proposed offset: {offset:+.3f} gal\n"
+        f"Raw offset: {raw_offset:+.3f} gal"
+        if isinstance(offset, (int, float)) and isinstance(raw_offset, (int, float))
+        else f"Samples: {sample_count} Auto fills"
+    )
+    detail = tk.Label(
+        confirm_window,
+        text=detail_text,
+        font=("Helvetica", 28, "bold"),
+        fg="lime",
+        bg="black",
+        justify=tk.CENTER,
+    )
+    detail.pack(pady=16)
+
+    warning = tk.Label(
+        confirm_window,
+        text="This makes the learned curve active. Factory curve remains available.",
+        font=("Helvetica", 23, "bold"),
+        fg="white",
+        bg="black",
+        wraplength=1100,
+        justify=tk.CENTER,
+    )
+    warning.pack(pady=12)
+
+    instructions = tk.Label(confirm_window, text="Press OV to ACCEPT or PS to CANCEL",
+                          font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+    instructions.pack(pady=24)
+
+    countdown_label = tk.Label(confirm_window, text="Auto-cancel in 10 seconds",
+                             font=("Helvetica", 22), fg="white", bg="black")
+    countdown_label.pack(pady=16)
+
+    countdown = [10]
+
+    def cancel_accept():
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        confirm_window.destroy()
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
+
+    def confirm_accept():
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        try:
+            accepted = flow_curve.accept_curve_proposal(
+                FLOW_CURVE_PROPOSAL_PATH,
+                FLOW_CURVE_OVERRIDE_PATH,
+            )
+            load_flow_curve_state()
+            with open("/home/pi/fill_calibration.log", "a") as f:
+                f.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted proposal"
+                    f" | Offset: {accepted.get('learning', {}).get('applied_offset_gallons', 'unknown')}\n"
+                )
+        except Exception as exc:
+            with open("/home/pi/fill_calibration.log", "a") as f:
+                f.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accept failed"
+                    f" | Error: {exc}\n"
+                )
+        confirm_window.destroy()
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
+        if menu_window:
+            close_menu()
+            show_menu()
+
+    def update_countdown():
+        countdown[0] -= 1
+        if countdown[0] <= 0:
+            cancel_accept()
+        else:
+            countdown_label.config(text=f"Auto-cancel in {countdown[0]} seconds")
+            confirm_window.after(1000, update_countdown)
+
+    confirm_window.bind('<Escape>', lambda e: cancel_accept())
+
+    accept_flow_curve_confirm_window = confirm_window
+    accept_flow_curve_confirm_handler = confirm_accept
+    accept_flow_curve_cancel_handler = cancel_accept
+
+    confirm_window.after(1000, update_countdown)
+
 def shutdown_system():
     """Shutdown the system"""
     import subprocess
@@ -2737,18 +3126,22 @@ def menu_select():
     elif menu_selected_index == 4:
         confirm_reset_season()
     elif menu_selected_index == 5:
-        run_self_test()
+        confirm_accept_flow_curve()
     elif menu_selected_index == 6:
-        run_bug_capture()
+        confirm_reset_flow_curve()
     elif menu_selected_index == 7:
-        run_system_update()
+        run_self_test()
     elif menu_selected_index == 8:
-        shutdown_system()
+        run_bug_capture()
     elif menu_selected_index == 9:
-        reboot_system()
+        run_system_update()
     elif menu_selected_index == 10:
-        exit_to_desktop()
+        shutdown_system()
     elif menu_selected_index == 11:
+        reboot_system()
+    elif menu_selected_index == 12:
+        exit_to_desktop()
+    elif menu_selected_index == 13:
         close_menu()
 
 def exit_to_desktop():
@@ -2814,6 +3207,10 @@ def close_menu():
     """Close the menu and return to main dashboard"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index
     global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+    global accept_flow_curve_cancel_handler
     menu_mode = False
     menu_selected_index = 0
     menu_buttons = []
@@ -2822,6 +3219,12 @@ def close_menu():
     exit_confirm_window = None
     exit_confirm_handler = None
     exit_cancel_handler = None
+    reset_flow_curve_confirm_window = None
+    reset_flow_curve_confirm_handler = None
+    reset_flow_curve_cancel_handler = None
+    accept_flow_curve_confirm_window = None
+    accept_flow_curve_confirm_handler = None
+    accept_flow_curve_cancel_handler = None
     if menu_window:
         menu_window.destroy()
         menu_window = None
@@ -2894,10 +3297,16 @@ def show_menu():
     """Display the main menu"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_position_label
 
+    load_flow_curve_state()
+
     # Defensive cleanup in case any stale submenu window/mode was left behind.
     global log_viewer_mode, log_viewer_window, log_viewer_text
     global fill_history_mode, fill_history_window, fill_history_text
     global calibration_mode, calibration_window, calibration_state
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+    global accept_flow_curve_cancel_handler
 
     log_viewer_mode = False
     if log_viewer_window:
@@ -2925,6 +3334,24 @@ def show_menu():
             pass
         calibration_window = None
         calibration_state = None
+
+    if reset_flow_curve_confirm_window:
+        try:
+            reset_flow_curve_confirm_window.destroy()
+        except Exception:
+            pass
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+
+    if accept_flow_curve_confirm_window:
+        try:
+            accept_flow_curve_confirm_window.destroy()
+        except Exception:
+            pass
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
 
     if menu_window:
         try:
@@ -2991,6 +3418,14 @@ def show_menu():
                             fg="#888888", bg="#1a1a1a")
     version_label.pack()
 
+    curve_label = tk.Label(center_frame, text=f"Curve: {flow_curve_status_text()}",
+                           font=("Helvetica", 18), fg="#ffaa00", bg="#1a1a1a")
+    curve_label.pack()
+
+    proposal_label = tk.Label(center_frame, text=flow_curve_proposal_status_text(),
+                              font=("Helvetica", 16), fg="#ffd080", bg="#1a1a1a")
+    proposal_label.pack()
+
     # Right side - Totals Panel
     global menu_daily_label, menu_season_label
     right_info_frame = tk.Frame(header_frame, bg='#1a1a1a')
@@ -3034,6 +3469,8 @@ def show_menu():
         ("TANK CALIBRATION", show_tank_calibration),
         ("FULL TEST", run_full_test),
         ("RESET SEASON", lambda: confirm_reset_season()),
+        ("ACCEPT CURVE", lambda: confirm_accept_flow_curve()),
+        ("FACTORY CURVE", lambda: confirm_reset_flow_curve()),
         ("SELF TEST", run_self_test),
         ("CAPTURE BUG", run_bug_capture),
         ("SYSTEM UPDATE", run_system_update),
@@ -3117,53 +3554,54 @@ def iol_power_cycle():
     global iol_power_cycle_in_progress, last_power_cycle_time
 
     try:
-        # Check port status before power cycle
-        try:
-            pre_status = iolhat.readStatus2(config.IOL_PORT)
-            print(f"IOL power-cycle: Pre-cycle status - pdInValid={pre_status.pd_in_valid}, "
-                  f"txRate=0x{pre_status.transmission_rate:02X}, "
-                  f"error=0x{pre_status.error:02X}, power={pre_status.power}", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Pre-cycle status check failed: {e}", flush=True)
-
-        print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle", flush=True)
-
-        # Step 1: Power off
-        try:
-            iolhat.power(config.IOL_PORT, 0)
-            print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Failed to power off: {e}", flush=True)
-            return
-
-        time.sleep(1.0)
-
-        # Step 2: Power on
-        try:
-            iolhat.power(config.IOL_PORT, 1)
-            print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Failed to power on: {e}", flush=True)
-            return
-
-        # Step 3: Wait for IO-Link handshake (up to 5 seconds, polling status)
-        for attempt in range(5):
-            time.sleep(1.0)
+        with iol_io_lock:
+            # Check port status before power cycle
             try:
-                post_status = iolhat.readStatus2(config.IOL_PORT)
-                print(f"IOL power-cycle: Post-cycle check {attempt+1}/5 - "
-                      f"pdInValid={post_status.pd_in_valid}, "
-                      f"txRate=0x{post_status.transmission_rate:02X}, "
-                      f"error=0x{post_status.error:02X}", flush=True)
-                if post_status.pd_in_valid == 1 and post_status.transmission_rate != 0:
-                    print(f"IOL power-cycle: Device reconnected successfully", flush=True)
-                    try:
-                        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
-                    except:
-                        pass
-                    return
+                pre_status = iolhat.readStatus2(config.IOL_PORT)
+                print(f"IOL power-cycle: Pre-cycle status - pdInValid={pre_status.pd_in_valid}, "
+                      f"txRate=0x{pre_status.transmission_rate:02X}, "
+                      f"error=0x{pre_status.error:02X}, power={pre_status.power}", flush=True)
             except Exception as e:
-                print(f"IOL power-cycle: Post-cycle status check failed: {e}", flush=True)
+                print(f"IOL power-cycle: Pre-cycle status check failed: {e}", flush=True)
+
+            print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle", flush=True)
+
+            # Step 1: Power off
+            try:
+                iolhat.power(config.IOL_PORT, 0)
+                print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
+            except Exception as e:
+                print(f"IOL power-cycle: Failed to power off: {e}", flush=True)
+                return
+
+            time.sleep(1.0)
+
+            # Step 2: Power on
+            try:
+                iolhat.power(config.IOL_PORT, 1)
+                print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
+            except Exception as e:
+                print(f"IOL power-cycle: Failed to power on: {e}", flush=True)
+                return
+
+            # Step 3: Wait for IO-Link handshake (up to 5 seconds, polling status)
+            for attempt in range(5):
+                time.sleep(1.0)
+                try:
+                    post_status = iolhat.readStatus2(config.IOL_PORT)
+                    print(f"IOL power-cycle: Post-cycle check {attempt+1}/5 - "
+                          f"pdInValid={post_status.pd_in_valid}, "
+                          f"txRate=0x{post_status.transmission_rate:02X}, "
+                          f"error=0x{post_status.error:02X}", flush=True)
+                    if post_status.pd_in_valid == 1 and post_status.transmission_rate != 0:
+                        print(f"IOL power-cycle: Device reconnected successfully", flush=True)
+                        try:
+                            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+                        except:
+                            pass
+                        return
+                except Exception as e:
+                    print(f"IOL power-cycle: Post-cycle status check failed: {e}", flush=True)
 
         print(f"IOL power-cycle: Device did not reconnect after power cycle", flush=True)
 
@@ -3191,7 +3629,8 @@ def _try_iol_power_cycle():
 def _log_iol_disconnect_status(reason):
     """Read STATUS2 and log the hardware error byte when a disconnect is first detected."""
     try:
-        st = iolhat.readStatus2(config.IOL_PORT)
+        with iol_io_lock:
+            st = iolhat.readStatus2(config.IOL_PORT)
         print(f"IOL DISCONNECT [{reason}]: pdInValid={st.pd_in_valid}, "
               f"txRate=0x{st.transmission_rate:02X}, "
               f"cycleTime=0x{st.master_cycle_time:02X}, "
@@ -3207,8 +3646,10 @@ def read_flow_meter():
 
     try:
         last_flow_read_was_fresh = False
-        # Read process data from IO-Link device
-        raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+        # Read process data from IO-Link device. The flow-control thread is the
+        # normal owner; this lock protects occasional diagnostics from racing it.
+        with iol_io_lock:
+            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
 
         if len(raw_data) >= 15:
             if raw_data == b'\x00' * len(raw_data):
@@ -3235,11 +3676,12 @@ def read_flow_meter():
             # A connected meter always has micro-fluctuations in the raw bytes
             if not raw_data_changed:
                 consecutive_identical_raw += 1
-                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
+                stale_threshold = stale_raw_threshold_reads()
+                if consecutive_identical_raw >= stale_threshold:
                     connection_error = True
-                    stale_secs = consecutive_identical_raw * (config.UPDATE_INTERVAL / 1000.0)
+                    stale_secs = consecutive_identical_raw * flow_read_interval_seconds()
                     error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
-                    if consecutive_identical_raw == STALE_RAW_THRESHOLD:
+                    if consecutive_identical_raw == stale_threshold:
                         print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
                         _log_iol_disconnect_status("stale data")
                         try:
@@ -3249,7 +3691,7 @@ def read_flow_meter():
                     _try_iol_power_cycle()
                     return last_totalizer_liters * config.LITERS_TO_GALLONS
             else:
-                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
+                if consecutive_identical_raw >= stale_raw_threshold_reads():
                     print(f"Flow meter data flowing again", flush=True)
                 consecutive_identical_raw = 0
             last_raw_data = raw_data
@@ -3283,6 +3725,129 @@ def read_flow_meter():
         error_message = str(e)
         _try_iol_power_cycle()
         return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+
+def _flow_control_process_sample(actual, now, loop_dt_ms):
+    """Run safety-critical auto-shutoff decisions from the control loop."""
+    global flow_control_was_flowing, flow_cycle_counter, last_alert_triggered
+    global auto_shutoff_latched, last_flowing_rate_l_per_s
+    global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+
+    is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+    flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+
+    if is_flowing and not flow_control_was_flowing:
+        flow_cycle_counter += 1
+        last_alert_triggered = False
+        auto_shutoff_latched = False
+        last_trigger_flow_gpm = 0.0
+        last_trigger_threshold = 0.0
+        last_trigger_actual = 0.0
+        last_trigger_predicted_actual = 0.0
+        last_trigger_loop_dt_ms = 0.0
+        recent_flow_rates_l_per_s.clear()
+        log_flow_control(
+            f"cycle_start | actual={actual:.3f} | flow_lps={last_flow_rate:.4f}"
+        )
+
+    if is_flowing:
+        recent_flow_rates_l_per_s.append(last_flow_rate)
+        last_flowing_rate_l_per_s = last_flow_rate
+    elif flow_control_was_flowing:
+        log_flow_control(
+            f"cycle_stop | actual={actual:.3f} | auto={auto_shutoff_latched}"
+        )
+
+    flow_control_was_flowing = is_flowing
+
+    if not is_flowing or override_mode or flow_meter_disconnected or last_alert_triggered:
+        return
+
+    smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
+    flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
+    prediction_seconds = max(0.0, float(getattr(config, "FLOW_CONTROL_PREDICTION_SECONDS", 0.0)))
+    predicted_actual = actual + (smoothed_flow_rate_l_per_s * prediction_seconds * config.LITERS_TO_GALLONS)
+
+    if predicted_actual >= requested_gallons - trigger_threshold:
+        last_alert_triggered = True
+        auto_shutoff_latched = True
+        last_trigger_flow_gpm = flow_rate_gpm
+        last_trigger_threshold = trigger_threshold
+        last_trigger_actual = actual
+        last_trigger_predicted_actual = predicted_actual
+        last_trigger_loop_dt_ms = loop_dt_ms
+        log_flow_control(
+            "auto_stop"
+            f" | requested={requested_gallons:.3f}"
+            f" | actual={actual:.3f}"
+            f" | predicted={predicted_actual:.3f}"
+            f" | threshold={trigger_threshold:.3f}"
+            f" | flow_gpm={flow_rate_gpm:.1f}"
+            f" | loop_dt_ms={loop_dt_ms:.1f}"
+        )
+        print(
+            f"Auto-alert(control): Flow={flow_rate_gpm:.1f} GPM, "
+            f"threshold={trigger_threshold:.2f}gal, triggering relay for "
+            f"{config.AUTO_ALERT_DURATION}s"
+        )
+        start_pump_stop_thread(config.AUTO_ALERT_DURATION)
+
+
+def flow_control_loop():
+    """Own IO-Link flow reads and auto-shutoff timing outside the Tk loop."""
+    global flow_control_last_tick, flow_control_last_loop_time, flow_control_last_error_log_time
+
+    interval = max(0.01, float(getattr(config, "FLOW_CONTROL_INTERVAL", 0.05)))
+    next_tick = time.monotonic()
+    flow_control_last_tick = next_tick
+    flow_control_last_loop_time = time.time()
+    log_flow_control(f"thread_start | interval={interval:.3f}s")
+
+    while not flow_control_stop_event.is_set():
+        now_mono = time.monotonic()
+        loop_dt_ms = (now_mono - flow_control_last_tick) * 1000.0
+        flow_control_last_tick = now_mono
+
+        try:
+            actual = read_flow_meter()
+            flow_control_last_loop_time = time.time()
+            _flow_control_process_sample(actual, time.time(), loop_dt_ms)
+        except Exception as exc:
+            flow_control_last_loop_time = time.time()
+            now = time.time()
+            if now - flow_control_last_error_log_time > 5:
+                flow_control_last_error_log_time = now
+                log_flow_control(f"thread_error | {exc}")
+
+        next_tick += interval
+        sleep_for = next_tick - time.monotonic()
+        if sleep_for < 0:
+            next_tick = time.monotonic()
+            sleep_for = 0
+        flow_control_stop_event.wait(sleep_for)
+
+    log_flow_control("thread_stop")
+
+
+def start_flow_control_thread():
+    """Start the dedicated flow-control loop when configured."""
+    global flow_control_thread
+
+    if not flow_control_enabled():
+        log_flow_control("thread_disabled")
+        return
+    if flow_control_thread and flow_control_thread.is_alive():
+        return
+
+    flow_control_stop_event.clear()
+    flow_control_thread = threading.Thread(
+        target=flow_control_loop,
+        name="flow-control",
+        daemon=True,
+    )
+    flow_control_thread.start()
 
 
 
@@ -3685,6 +4250,8 @@ def serial_listener():
                             ui_mode_active = any([
                                 exit_confirm_window,
                                 reset_season_confirm_window,
+                                reset_flow_curve_confirm_window,
+                                accept_flow_curve_confirm_window,
                                 reminders_mode,
                                 log_viewer_mode,
                                 fill_history_mode,
@@ -3736,6 +4303,46 @@ def serial_listener():
                                 else:
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
+
+                            # Handle flow curve reset confirmation dialog
+                            elif reset_flow_curve_confirm_window:
+                                if line == 'OV':
+                                    msg = "Serial: Flow curve reset confirmation (OV - Confirm)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_confirm_handler:
+                                        root.after(0, reset_flow_curve_confirm_handler)
+                                elif line == 'PS':
+                                    msg = "Serial: Flow curve reset confirmation (PS - Cancel)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_cancel_handler:
+                                        root.after(0, reset_flow_curve_cancel_handler)
+                                else:
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
+
+                            # Handle learned flow curve accept confirmation dialog
+                            elif accept_flow_curve_confirm_window:
+                                if line == 'OV':
+                                    msg = "Serial: Flow curve accept confirmation (OV - Confirm)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_confirm_handler:
+                                        root.after(0, accept_flow_curve_confirm_handler)
+                                elif line == 'PS':
+                                    msg = "Serial: Flow curve accept confirmation (PS - Cancel)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_cancel_handler:
+                                        root.after(0, accept_flow_curve_cancel_handler)
+                                else:
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
 
                             # Handle reminders mode - dismiss on OV
                             elif reminders_mode:
@@ -4067,12 +4674,15 @@ def clear_auto_shutoff_state(reason=""):
     """Clear per-cycle auto-shutoff state after a reset or new flow cycle."""
     global last_alert_triggered, auto_shutoff_latched
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
 
     last_alert_triggered = False
     auto_shutoff_latched = False
     last_trigger_flow_gpm = 0.0
     last_trigger_threshold = 0.0
     last_trigger_actual = 0.0
+    last_trigger_predicted_actual = 0.0
+    last_trigger_loop_dt_ms = 0.0
     recent_flow_rates_l_per_s.clear()
     if reason:
         print(f"Auto-shutoff state cleared: {reason}")
@@ -4214,10 +4824,11 @@ def schedule_flow_reset():
 def initialize_iol():
     """Initialize IO-Link port"""
     try:
-        # Power on the port
-        iolhat.power(config.IOL_PORT, 1)
-        # Set LED to green
-        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+        with iol_io_lock:
+            # Power on the port
+            iolhat.power(config.IOL_PORT, 1)
+            # Set LED to green
+            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
         time.sleep(0.5)
         print(f"IO-Link Port {config.IOL_PORT+1} initialized successfully")
         return True
@@ -4627,9 +5238,15 @@ def update_dashboard():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
     global flow_cycle_counter, calibration_state, last_status_text, last_daily_total_text, last_daily_total_mode
 
-    actual = read_flow_meter()
+    control_active = flow_control_active()
+
+    if control_active:
+        actual = get_cached_actual_gallons()
+    else:
+        actual = read_flow_meter()
 
     # Use green if flag is set, otherwise red
     color = "green" if colors_are_green else "red"
@@ -4674,7 +5291,7 @@ def update_dashboard():
     else:
         new_fill_flow_started_at = None
         new_fill_cycle_cleared = False
-    if is_flowing:
+    if is_flowing and not control_active:
         recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
@@ -4734,18 +5351,21 @@ def update_dashboard():
 
     # Reset colors when new fill cycle starts
     if not was_flowing and is_flowing:
-        flow_cycle_counter += 1
         colors_are_green = False
-        last_alert_triggered = False
-        auto_shutoff_latched = False
         new_fill_cycle_cleared = False
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
-        last_trigger_flow_gpm = 0.0
-        last_trigger_threshold = 0.0
-        last_trigger_actual = 0.0
-        recent_flow_rates_l_per_s.clear()
+        if not control_active:
+            flow_cycle_counter += 1
+            last_alert_triggered = False
+            auto_shutoff_latched = False
+            last_trigger_flow_gpm = 0.0
+            last_trigger_threshold = 0.0
+            last_trigger_actual = 0.0
+            last_trigger_predicted_actual = 0.0
+            last_trigger_loop_dt_ms = 0.0
+            recent_flow_rates_l_per_s.clear()
         print("New fill cycle started - colors reset to red, auto-shutoff state cleared")
 
     # Hide thumbs up and clear pending fill only after sustained high flow.
@@ -4795,15 +5415,21 @@ def update_dashboard():
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
-    if is_flowing and not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
+    if (
+        not control_active
+        and is_flowing
+        and not override_mode
+        and not flow_meter_disconnected
+        and actual >= requested_gallons - trigger_threshold
+        and not last_alert_triggered
+    ):
         last_alert_triggered = True
         auto_shutoff_latched = True
         last_trigger_flow_gpm = flow_rate_gpm
         last_trigger_threshold = trigger_threshold
         last_trigger_actual = actual
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
-        relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
-        relay_thread.start()
+        start_pump_stop_thread(config.AUTO_ALERT_DURATION)
     # Update status label
     status_parts = []
     if connection_error:
@@ -4963,6 +5589,9 @@ def _sim_send_command(line):
         last_heartbeat_time = time.time()
         return
 
+    if _sim_handle_confirmation_command(line):
+        return
+
     if menu_mode:
         if line == "+1":
             menu_navigate_down()
@@ -5000,6 +5629,62 @@ def _sim_send_command(line):
         switch_mode("mix")
     elif line == "FILL":
         switch_mode("fill")
+
+
+def _sim_handle_confirmation_command(line):
+    """Route simulator OV/PS through the same confirmation dialogs as serial."""
+    if line not in {"OV", "PS"}:
+        return False
+
+    confirmation_pairs = [
+        (exit_confirm_window, exit_confirm_handler, exit_cancel_handler),
+        (reset_season_confirm_window, reset_season_confirm_handler, reset_season_cancel_handler),
+        (reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler, reset_flow_curve_cancel_handler),
+        (accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler, accept_flow_curve_cancel_handler),
+    ]
+    for window, confirm_handler, cancel_handler in confirmation_pairs:
+        if window:
+            handler = confirm_handler if line == "OV" else cancel_handler
+            if handler:
+                root.after(0, handler)
+            return True
+
+    if reminders_mode:
+        if line == "OV":
+            root.after(0, dismiss_reminders)
+        return True
+
+    return False
+
+
+def _sim_bind_keyboard_shortcuts(panel):
+    """Map simple keyboard keys to the simulated switch-box controls."""
+    key_commands = {
+        "p": "PS",
+        "o": "OV",
+        "Left": "-1",
+        "Right": "+1",
+    }
+
+    def handle_key(event):
+        key = event.keysym
+        command = key_commands.get(key)
+        if command is None:
+            command = key_commands.get(getattr(event, "char", "").lower())
+        if command:
+            _sim_send_command(command)
+            return "break"
+        return None
+
+    def bind_widget(widget):
+        widget.bind("<KeyPress>", handle_key)
+        for child in widget.winfo_children():
+            bind_widget(child)
+
+    bind_widget(root)
+    bind_widget(panel)
+    root.bind_all("<KeyPress>", handle_key)
+    panel.focus_force()
 
 
 def _create_sim_controls():
@@ -5107,6 +5792,7 @@ def _create_sim_controls():
 
     heartbeat_tick()
     update_status()
+    _sim_bind_keyboard_shortcuts(panel)
 
 
 # Initialize GPIO and IO-Link and start serial listener
@@ -5121,6 +5807,7 @@ else:
 # Load totals from files
 load_totals()
 load_last_load()
+load_flow_curve_state()
 today_str = time.strftime('%Y-%m-%d')
 if last_reset_date != today_str:
     print(f"Date changed since last reset ({last_reset_date} -> {today_str}) - resetting daily total on startup")
@@ -5158,6 +5845,8 @@ else:
     # Start green button monitor in background thread
     green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
     green_button_thread.start()
+
+start_flow_control_thread()
 
 def daily_total_checker():
     """Background thread to check time and reset daily total at 1:00 AM"""
@@ -5228,6 +5917,9 @@ if SIM_MODE:
 try:
     root.mainloop()
 finally:
+    flow_control_stop_event.set()
+    if flow_control_thread and flow_control_thread.is_alive():
+        flow_control_thread.join(timeout=1.0)
     # Cleanup GPIO on exit
     if GPIO_AVAILABLE:
         GPIO.cleanup()
