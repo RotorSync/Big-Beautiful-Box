@@ -5346,10 +5346,10 @@ def draw_actual_number(text, color="red"):
     # Delete old actual number
     canvas.delete("actual")
 
-    # Position: centered horizontally, 65% from top
+    # Position: centered horizontally, 68% from top
     x = _canvas_width() // 2
-    y = int(_canvas_height() * 0.65)
-    font = ("Helvetica", 280, "bold")
+    y = int(_canvas_height() * 0.68)
+    font = ("Helvetica", 310, "bold")
 
     # Draw white outline (8 positions around the text)
     for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
@@ -5406,7 +5406,7 @@ thumbs_up_frame_index = [0]  # Use list for mutable reference
 thumbs_up_label = None
 thumbs_up_animation_id = None
 thumbs_up_visible = False
-THUMBS_UP_RELX = 0.83
+THUMBS_UP_RELX = 0.88
 THUMBS_UP_RELY = 0.25
 
 def load_thumbs_up_gif():
