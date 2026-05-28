@@ -11,12 +11,55 @@ import subprocess
 import os
 import json
 import shlex
+import builtins
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
+REPO_DIR = Path(__file__).resolve().parent
+SIM_MODE = os.environ.get("BBB_SIM_MODE") == "1"
+SIM_STATE_DIR = Path(os.environ.get("BBB_SIM_STATE_DIR", REPO_DIR / ".sim-data"))
+if SIM_MODE:
+    os.environ.setdefault("BBB_SIM_STATE_DIR", str(SIM_STATE_DIR))
+SIM_GEOMETRY = os.environ.get("BBB_SIM_GEOMETRY", "1920x1080")
+SIM_PUMP_GLIDE_SECONDS = 3.0
+SIM_RENDER_SCALE = 1.0
+
+
+def _geometry_size(geometry):
+    try:
+        size = geometry.split("+", 1)[0]
+        width, height = size.lower().split("x", 1)
+        return int(width), int(height)
+    except Exception:
+        return 1920, 1080
+
+
+SIM_WINDOW_WIDTH, SIM_WINDOW_HEIGHT = _geometry_size(SIM_GEOMETRY)
+
+
+def _pi_path(path):
+    """Map Pi absolute paths into a local state directory during simulator runs."""
+    if SIM_MODE and isinstance(path, (str, os.PathLike)):
+        path_str = os.fspath(path)
+        pi_prefix = "/home/pi/"
+        if path_str.startswith(pi_prefix):
+            mapped = SIM_STATE_DIR / path_str[len(pi_prefix):]
+            mapped.parent.mkdir(parents=True, exist_ok=True)
+            return str(mapped)
+    return path
+
+
+if SIM_MODE:
+    SIM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _real_open = builtins.open
+
+    def _sim_open(file, *args, **kwargs):
+        return _real_open(_pi_path(file), *args, **kwargs)
+
+    builtins.open = _sim_open
 
 
 def _read_local_version():
@@ -46,6 +89,11 @@ VERSION = _read_local_version()
 # Import configuration
 import config
 
+if SIM_MODE:
+    config.MAIN_LOG_FILE = _pi_path(config.MAIN_LOG_FILE)
+    config.SERIAL_DEBUG_LOG = _pi_path(config.SERIAL_DEBUG_LOG)
+    config.RELAY_TEST_LOG = _pi_path(config.RELAY_TEST_LOG)
+
 # Set up rotating loggers
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
 main_logger = get_main_logger()
@@ -74,6 +122,124 @@ except ImportError:
     print("WARNING: RPi.GPIO not available, relay control disabled")
 
 import iolhat
+
+
+class _SimStatus2:
+    def __init__(self, connected=True, powered=True):
+        self.pd_in_valid = 1 if connected and powered else 0
+        self.transmission_rate = 0x02 if connected and powered else 0
+        self.master_cycle_time = 0x20
+        self.error = 0x00 if connected and powered else 0x80
+        self.power = 1 if powered else 0
+
+
+class _SimIOLHat:
+    LED_GREEN = getattr(iolhat, "LED_GREEN", 2)
+    LED_RED = getattr(iolhat, "LED_RED", 1)
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.connected = True
+        self.powered = True
+        self.totalizer_liters = 0.0
+        self.flow_rate_l_per_s = 0.0
+        self._last_tick = time.time()
+        self._flow_start_l_per_s = 0.0
+        self._flow_target_l_per_s = 0.0
+        self._transition_start = self._last_tick
+        self._transition_duration = 0.0
+        self._packet_counter = 0
+        self._led = self.LED_GREEN
+
+    def _flow_at(self, when):
+        if self._transition_duration <= 0:
+            return self._flow_target_l_per_s
+        progress = (when - self._transition_start) / self._transition_duration
+        if progress >= 1:
+            return self._flow_target_l_per_s
+        if progress <= 0:
+            return self._flow_start_l_per_s
+        return self._flow_start_l_per_s + (
+            self._flow_target_l_per_s - self._flow_start_l_per_s
+        ) * progress
+
+    def _tick(self):
+        now = time.time()
+        elapsed = max(0.0, now - self._last_tick)
+        if self.connected and self.powered and elapsed > 0:
+            start_flow = self._flow_at(self._last_tick)
+            end_flow = self._flow_at(now)
+            self.totalizer_liters += ((start_flow + end_flow) / 2.0) * elapsed
+            self.flow_rate_l_per_s = end_flow
+        else:
+            self.flow_rate_l_per_s = self._flow_at(now)
+        self._last_tick = now
+        if self._transition_duration > 0 and now >= self._transition_start + self._transition_duration:
+            self._transition_duration = 0.0
+            self._flow_start_l_per_s = self._flow_target_l_per_s
+            self.flow_rate_l_per_s = self._flow_target_l_per_s
+
+    def set_flow_gpm(self, gpm):
+        with self._lock:
+            self._tick()
+            flow_l_per_s = max(0.0, float(gpm)) / config.LITERS_PER_SEC_TO_GPM
+            self.flow_rate_l_per_s = flow_l_per_s
+            self._flow_start_l_per_s = flow_l_per_s
+            self._flow_target_l_per_s = flow_l_per_s
+            self._transition_start = time.time()
+            self._transition_duration = 0.0
+
+    def stop_pump(self, glide_seconds=3.0):
+        with self._lock:
+            self._tick()
+            now = time.time()
+            self._flow_start_l_per_s = self.flow_rate_l_per_s
+            self._flow_target_l_per_s = 0.0
+            self._transition_start = now
+            self._transition_duration = max(0.0, float(glide_seconds))
+
+    def get_flow_gpm(self):
+        with self._lock:
+            self._tick()
+            return self.flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+
+    def reset_totalizer(self):
+        with self._lock:
+            self.totalizer_liters = 0.0
+            self._last_tick = time.time()
+
+    def pd(self, port, index, data_length, callback):
+        with self._lock:
+            self._tick()
+            self._packet_counter = (self._packet_counter + 1) % 256
+            if not self.connected or not self.powered:
+                return b"\x00" * data_length
+
+            packet = (
+                b"\x00\x00\x00\x00"
+                + struct.pack(">f", abs(self.totalizer_liters))
+                + struct.pack(">f", self.flow_rate_l_per_s)
+                + bytes([self._packet_counter, 0, 0])
+            )
+            return packet[:data_length].ljust(data_length, b"\x00")
+
+    def power(self, port, status):
+        with self._lock:
+            self.powered = bool(status)
+        return 1
+
+    def led(self, port, color):
+        with self._lock:
+            self._led = color
+        return 1
+
+    def readStatus2(self, port):
+        with self._lock:
+            return _SimStatus2(self.connected, self.powered)
+
+
+if SIM_MODE:
+    iolhat = _SimIOLHat()
 
 # Global variables
 last_totalizer_liters = 0.0
@@ -442,8 +608,8 @@ def show_batchmix_error(error_msg):
     """Display a BatchMix error message on screen"""
     canvas.delete("batchmix_error")
 
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Red background box
     canvas.create_rectangle(width * 0.1, height * 0.3, width * 0.9, height * 0.5,
@@ -469,9 +635,9 @@ def activate_batch_mix_layout():
     canvas.delete("labels")
     canvas.delete("batchmix")
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Left 1/3 section - center point
     left_center_x = width // 6
@@ -520,9 +686,9 @@ def refresh_batch_mix_totals():
     if batch_mix_data is None:
         return
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Bottom 1/4 section - totals info
     bottom_y = int(height * 0.85)
@@ -552,9 +718,9 @@ def refresh_batch_mix_products():
     if batch_mix_data is None:
         return
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     products = batch_mix_data.get("products", [])
     products_x_start = width // 3 + 20
@@ -683,9 +849,9 @@ def deactivate_batch_mix_layout():
 
     # Restore normal labels
     canvas.delete("labels")
-    canvas.update()
-    center_x = canvas.winfo_width() // 2
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    center_x = _canvas_width() // 2
+    height = _canvas_height()
 
     canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:",
                       font=("Helvetica", 36, "bold"), fill="white", tags="labels")
@@ -721,9 +887,9 @@ def redraw_numbers_for_batch_mix():
     canvas.delete("requested")
     canvas.delete("actual")
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     left_center_x = width // 6
 
@@ -836,13 +1002,13 @@ def update_bms_display():
     if current_mode == "mix":
         return
 
-    title_font = ("Helvetica", 72, "bold")
-    value_font = ("Helvetica", 84, "bold")
-
     if bms_soc is None:
         value_text = "--"
     else:
         value_text = f"{int(round(bms_soc))}%"
+
+    title_font = ("Helvetica", 72, "bold")
+    value_font = ("Helvetica", 84, "bold")
 
     canvas.create_text(
         20,
@@ -883,8 +1049,8 @@ def update_flow_rate_display(flow_rate_gpm):
     if current_mode == "mix":
         return
     canvas.create_text(
-        canvas.winfo_width() - 10,
-        canvas.winfo_height() - 10,
+        _canvas_width() - 10,
+        _canvas_height() - 10,
         text=flow_text,
         font=("Helvetica", 72, "bold"),
         fill="cyan",
@@ -972,6 +1138,18 @@ def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
         f.write(f"Duration: {duration} seconds\n")
         f.write(f"GPIO_AVAILABLE: {GPIO_AVAILABLE}\n")
         f.write(f"PUMP_STOP_RELAY_PIN: {config.PUMP_STOP_RELAY_PIN}\n")
+
+    if SIM_MODE:
+        iolhat.stop_pump(SIM_PUMP_GLIDE_SECONDS)
+        msg = (
+            f"SIM relay activated: flow gliding to stop over "
+            f"{SIM_PUMP_GLIDE_SECONDS:.1f} seconds"
+        )
+        print(msg)
+        with open(relay_log, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            f.write(f"{'='*60}\n")
+        return
 
     if not GPIO_AVAILABLE:
         msg = "GPIO not available, cannot control relay"
@@ -1078,7 +1256,7 @@ def change_colors_to_green(from_button=False):
             draw_actual_number(f"{current_actual:.1f}", "green")
             # Show big thumbs up on the right side and start animation, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
+                thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
                 _set_thumbs_up_visible(True)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
@@ -1101,7 +1279,7 @@ def change_colors_to_green(from_button=False):
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
             # Show thumbs up but DO NOT change colors to green, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
+                thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
                 _set_thumbs_up_visible(True)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
@@ -3920,6 +4098,9 @@ def detect_totalizer_reset(totalizer_liters):
 
 def _pulse_flow_reset_gpio():
     global flow_reset_scheduled, flow_reset_cycle_id
+    if SIM_MODE:
+        _sim_flow_reset("gpio pulse")
+        return
     try:
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write("pulsing gpio0\n")
@@ -3935,8 +4116,29 @@ def _pulse_flow_reset_gpio():
     flow_reset_cycle_id = None
 
 
+def _sim_flow_reset(reason):
+    global flow_reset_scheduled, flow_reset_cycle_id, last_totalizer_liters
+    iolhat.reset_totalizer()
+    detect_totalizer_reset(0.0)
+    last_totalizer_liters = 0.0
+    draw_actual_number("0.0", "green" if colors_are_green else "red")
+    with open("/home/pi/reset_debug.log", "a") as dbg:
+        dbg.write(f"sim totalizer reset: {reason}\n")
+    flow_reset_scheduled = False
+    flow_reset_cycle_id = None
+
+
 def force_flow_reset(reason="forced"):
     global flow_reset_scheduled, flow_reset_cycle_id
+    if SIM_MODE:
+        msg = f"Flow reset forced: {reason} ({last_flow_rate:.3f} L/s)"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
+        clear_auto_shutoff_state(reason)
+        _sim_flow_reset(reason)
+        return
     if not GPIO_AVAILABLE:
         flow_reset_scheduled = False
         flow_reset_cycle_id = None
@@ -3954,10 +4156,6 @@ def pulse_flow_reset():
     global flow_reset_scheduled, flow_reset_cycle_id
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write("pulse called\n")
-    if not GPIO_AVAILABLE:
-        flow_reset_scheduled = False
-        flow_reset_cycle_id = None
-        return
     if flow_reset_cycle_id != flow_cycle_counter:
         msg = "Flow reset cancelled: new flow started after reset was requested"
         print(msg)
@@ -3973,6 +4171,13 @@ def pulse_flow_reset():
         log_serial_debug(msg)
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write(msg + "\n")
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return
+    if SIM_MODE:
+        _sim_flow_reset("scheduled pulse")
+        return
+    if not GPIO_AVAILABLE:
         flow_reset_scheduled = False
         flow_reset_cycle_id = None
         return
@@ -4024,23 +4229,97 @@ def initialize_iol():
 root = tk.Tk()
 root.title("Tank Dashboard")
 root.configure(bg="black")
-root.attributes("-fullscreen", True)
+if SIM_MODE:
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    SIM_RENDER_SCALE = min(
+        max(0.1, (screen_w - 24) / SIM_WINDOW_WIDTH),
+        max(0.1, (screen_h - 96) / SIM_WINDOW_HEIGHT),
+        1.0,
+    )
+    sim_display_width = max(1, int(SIM_WINDOW_WIDTH * SIM_RENDER_SCALE))
+    sim_display_height = max(1, int(SIM_WINDOW_HEIGHT * SIM_RENDER_SCALE))
+    root.geometry(f"{sim_display_width}x{sim_display_height}")
+    root.resizable(True, True)
+else:
+    root.attributes("-fullscreen", True)
 
 # Get screen dimensions
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 
 # Create ONE full-screen canvas for everything
-canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+canvas = tk.Canvas(
+    root,
+    bg="black",
+    highlightthickness=0,
+    width=sim_display_width if SIM_MODE else 0,
+    height=sim_display_height if SIM_MODE else 0,
+)
 canvas.pack(fill='both', expand=True)
+
+
+def _sim_scale_value(value):
+    if SIM_MODE and isinstance(value, (int, float)):
+        return value * SIM_RENDER_SCALE
+    return value
+
+
+def _sim_scale_args(args):
+    return tuple(_sim_scale_value(arg) for arg in args)
+
+
+def _sim_scale_font(font):
+    if not SIM_MODE or not isinstance(font, tuple) or len(font) < 2:
+        return font
+    size = font[1]
+    if not isinstance(size, int):
+        return font
+    scaled_size = max(1, int(round(abs(size) * SIM_RENDER_SCALE)))
+    return (font[0], -scaled_size, *font[2:])
+
+
+if SIM_MODE:
+    _canvas_create_text = canvas.create_text
+    _canvas_create_rectangle = canvas.create_rectangle
+    _canvas_create_line = canvas.create_line
+
+    def _sim_create_text(*args, **kwargs):
+        if "font" in kwargs:
+            kwargs["font"] = _sim_scale_font(kwargs["font"])
+        return _canvas_create_text(*_sim_scale_args(args), **kwargs)
+
+    def _sim_create_rectangle(*args, **kwargs):
+        return _canvas_create_rectangle(*_sim_scale_args(args), **kwargs)
+
+    def _sim_create_line(*args, **kwargs):
+        return _canvas_create_line(*_sim_scale_args(args), **kwargs)
+
+    canvas.create_text = _sim_create_text
+    canvas.create_rectangle = _sim_create_rectangle
+    canvas.create_line = _sim_create_line
+
+def _sync_canvas_geometry():
+    if not SIM_MODE:
+        canvas.update()
+
+
+def _canvas_width():
+    width = canvas.winfo_width()
+    return SIM_WINDOW_WIDTH if SIM_MODE else width
+
+
+def _canvas_height():
+    height = canvas.winfo_height()
+    return SIM_WINDOW_HEIGHT if SIM_MODE else height
 
 # Draw full-screen barber pole stripes
 def draw_fullscreen_stripes():
     """Draw barber pole stripes across entire screen"""
     # Get actual canvas size after it's been packed
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     stripe_height = 30
     dark_yellow = "#CC9900"
@@ -4051,7 +4330,8 @@ def draw_fullscreen_stripes():
                                fill=stripe_color, outline="", tags="stripes")
 
 # Draw stripes after window is created
-root.update()
+if not SIM_MODE:
+    root.update()
 # draw_fullscreen_stripes()  # Disabled - using solid black background
 
 
@@ -4110,7 +4390,7 @@ def update_mopeka_display():
     if not mopeka_enabled:
         return
     
-    width = canvas.winfo_width()
+    width = _canvas_width()
     x = width - 20  # 20px from right edge
     font = ("Helvetica", 72, "bold")
     
@@ -4158,8 +4438,8 @@ def draw_requested_number(text, color="red"):
     canvas.delete("requested")
 
     # Position: centered horizontally, 20% from top
-    x = canvas.winfo_width() // 2
-    y = int(canvas.winfo_height() * 0.28) + 24
+    x = _canvas_width() // 2
+    y = int(_canvas_height() * 0.28) + 24
     font = ("Helvetica", 220, "bold")
 
     # Draw white outline (8 positions around the text)
@@ -4170,9 +4450,9 @@ def draw_requested_number(text, color="red"):
     canvas.create_text(x, y, text=text, font=font, fill=color, tags="requested")
 
 # Draw text labels on canvas (centered)
-canvas.update()
-center_x = canvas.winfo_width() // 2
-height = canvas.winfo_height()
+_sync_canvas_geometry()
+center_x = _canvas_width() // 2
+height = _canvas_height()
 
 canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:", font=("Helvetica", 36, "bold"),
                   fill="white", tags="labels")
@@ -4203,8 +4483,8 @@ def draw_actual_number(text, color="red"):
     canvas.delete("actual")
 
     # Position: centered horizontally, 65% from top
-    x = canvas.winfo_width() // 2
-    y = int(canvas.winfo_height() * 0.65)
+    x = _canvas_width() // 2
+    y = int(_canvas_height() * 0.65)
     font = ("Helvetica", 280, "bold")
 
     # Draw white outline (8 positions around the text)
@@ -4262,6 +4542,8 @@ thumbs_up_frame_index = [0]  # Use list for mutable reference
 thumbs_up_label = None
 thumbs_up_animation_id = None
 thumbs_up_visible = False
+THUMBS_UP_RELX = 0.83
+THUMBS_UP_RELY = 0.25
 
 def load_thumbs_up_gif():
     """Load thumbs up image (PNG or GIF) for display"""
@@ -4546,7 +4828,7 @@ def update_dashboard():
     if status_text != last_status_text:
         canvas.delete("status")
         if status_text:
-            canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=status_text,
+            canvas.create_text(_canvas_width() // 2, _canvas_height() - 20, text=status_text,
                               font=("Helvetica", 20), fill="yellow", tags="status")
         last_status_text = status_text
 
@@ -4555,7 +4837,7 @@ def update_dashboard():
     if daily_total_text != last_daily_total_text or current_mode != last_daily_total_mode:
         canvas.delete("daily_total")
         if daily_total_text:
-            canvas.create_text(10, canvas.winfo_height() - 10, text=daily_total_text,
+            canvas.create_text(10, _canvas_height() - 10, text=daily_total_text,
                               font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
         last_daily_total_text = daily_total_text
         last_daily_total_mode = current_mode
@@ -4570,10 +4852,10 @@ def update_dashboard():
         skull_size = int(264 + 24 * pulse)  # Varies from 240pt to 288pt
 
         # Left skull
-        canvas.create_text(150, canvas.winfo_height() // 2, text="☠",
+        canvas.create_text(150, _canvas_height() // 2, text="☠",
                          font=("Helvetica", skull_size, "bold"), fill="red", tags="skull_icons")
         # Right skull
-        canvas.create_text(canvas.winfo_width() - 150, canvas.winfo_height() // 2, text="☠",
+        canvas.create_text(_canvas_width() - 150, _canvas_height() // 2, text="☠",
                          font=("Helvetica", skull_size, "bold"), fill="red", tags="skull_icons")
 
     # Draw warnings on canvas - collect all active warnings and cycle through them
@@ -4590,12 +4872,12 @@ def update_dashboard():
         block_height = 380
 
         # Calculate vertical positions for upper and lower blocks
-        upper_y = int(canvas.winfo_height() * 0.35)  # Upper blocks at 35% down screen
-        lower_y = int(canvas.winfo_height() * 0.65)  # Lower blocks at 65% down screen
+        upper_y = int(_canvas_height() * 0.35)  # Upper blocks at 35% down screen
+        lower_y = int(_canvas_height() * 0.65)  # Lower blocks at 65% down screen
 
         # Block positions (left and right sides)
         left_x = 50
-        right_x = canvas.winfo_width() - 50 - block_width
+        right_x = _canvas_width() - 50 - block_width
 
         # Draw LEFT side blocks when phase=0 (both upper and lower left)
         if phase == 0:
@@ -4634,7 +4916,7 @@ def update_dashboard():
                              fill="white", tags="caution_blocks")
 
         # Draw "MANUAL" text at center bottom
-        canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88),
+        canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                          text="MANUAL", font=("Helvetica", 90, "bold"),
                          fill="orange", tags="warning")
 
@@ -4662,10 +4944,170 @@ def update_dashboard():
                     warning_index = 0
 
                 text, font_family, font_size, color = active_warnings[warning_index]
-                canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88),
+                canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                                  text=text, font=(font_family, font_size, "bold"), fill=color, tags="warning")
 
     root.after(config.UPDATE_INTERVAL, update_dashboard)
+
+
+def _sim_send_command(line):
+    """Drive the most common switch-box commands from the simulator panel."""
+    global requested_gallons, serial_connected, override_mode, override_enabled_time
+    global colors_are_green, fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_heartbeat_time
+
+    line = str(line).strip()
+    serial_connected = True
+
+    if line == "OK":
+        last_heartbeat_time = time.time()
+        return
+
+    if menu_mode:
+        if line == "+1":
+            menu_navigate_down()
+        elif line == "-1":
+            menu_navigate_up()
+        elif line == "OV":
+            menu_select()
+        elif line == "PS":
+            close_menu()
+        return
+
+    if line in ["+1", "-1", "+10", "-10"]:
+        adjustment = int(line)
+        requested_gallons = max(0, requested_gallons + adjustment)
+        colors_are_green = False
+        if current_mode == "fill":
+            fill_requested_gallons = requested_gallons
+        else:
+            mix_requested_gallons = requested_gallons
+        save_mode_presets()
+        draw_requested_number(f"{requested_gallons:.0f}", "red")
+        update_batch_mix_overlay()
+    elif line == "PS":
+        threading.Thread(target=pump_stop_relay, daemon=True).start()
+    elif line == "OV":
+        if requested_gallons == 0:
+            show_menu()
+        else:
+            override_mode = not override_mode
+            if override_mode:
+                override_enabled_time = time.time()
+    elif line == "TU":
+        handle_thumbs_up_press("sim TU")
+    elif line == "MIX":
+        switch_mode("mix")
+    elif line == "FILL":
+        switch_mode("fill")
+
+
+def _create_sim_controls():
+    """Create a small side window for driving the dashboard without Pi hardware."""
+    global serial_connected, last_heartbeat_time
+
+    serial_connected = True
+    last_heartbeat_time = time.time()
+
+    panel = tk.Toplevel(root)
+    panel.title("BBB Simulator")
+    panel.geometry("360x560")
+    panel.configure(bg="#202020")
+
+    status_var = tk.StringVar()
+    flow_var = tk.DoubleVar(value=0)
+    connected_var = tk.BooleanVar(value=True)
+    switchbox_var = tk.BooleanVar(value=True)
+
+    def set_flow_from_slider(_value=None):
+        iolhat.set_flow_gpm(flow_var.get())
+
+    def set_flow(value):
+        flow_var.set(value)
+        iolhat.set_flow_gpm(value)
+
+    def set_iol_connected():
+        iolhat.connected = connected_var.get()
+
+    def set_switchbox_connected():
+        global serial_connected, last_heartbeat_time
+        serial_connected = switchbox_var.get()
+        if serial_connected:
+            last_heartbeat_time = time.time()
+
+    def heartbeat_tick():
+        if switchbox_var.get():
+            _sim_send_command("OK")
+        root.after(2500, heartbeat_tick)
+
+    def update_status():
+        actual_gal = iolhat.totalizer_liters * config.LITERS_TO_GALLONS
+        actual_flow_gpm = iolhat.get_flow_gpm()
+        status_var.set(
+            f"Flow: {actual_flow_gpm:.0f} GPM | Actual: {actual_gal:.1f} gal | "
+            f"IOL: {'on' if iolhat.connected else 'off'} | Switch: {'on' if switchbox_var.get() else 'off'}"
+        )
+        root.after(250, update_status)
+
+    title = ttk.Label(panel, text="BBB Simulator", font=("Helvetica", 18, "bold"))
+    title.pack(pady=(14, 6))
+
+    status = ttk.Label(panel, textvariable=status_var, wraplength=320)
+    status.pack(pady=(0, 12))
+
+    ttk.Label(panel, text="Flow Rate").pack(anchor="w", padx=16)
+    flow_scale = ttk.Scale(panel, from_=0, to=120, variable=flow_var, command=set_flow_from_slider)
+    flow_scale.pack(fill="x", padx=16, pady=(2, 10))
+
+    flow_buttons = ttk.Frame(panel)
+    flow_buttons.pack(fill="x", padx=16, pady=(0, 12))
+    for label, value in [("Stop", 0), ("45 GPM", 45), ("75 GPM", 75), ("100 GPM", 100)]:
+        ttk.Button(flow_buttons, text=label, command=lambda v=value: set_flow(v)).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+    cmd_frame = ttk.LabelFrame(panel, text="Switch Box")
+    cmd_frame.pack(fill="x", padx=16, pady=8)
+    for row in [("+1", "-1", "+10", "-10"), ("OV", "PS", "TU"), ("FILL", "MIX")]:
+        row_frame = ttk.Frame(cmd_frame)
+        row_frame.pack(fill="x", padx=6, pady=4)
+        for command in row:
+            ttk.Button(row_frame, text=command, command=lambda c=command: _sim_send_command(c)).pack(
+                side="left", expand=True, fill="x", padx=2
+            )
+
+    sensors = ttk.LabelFrame(panel, text="Sensors")
+    sensors.pack(fill="x", padx=16, pady=8)
+    ttk.Checkbutton(
+        sensors,
+        text="IO-Link connected",
+        variable=connected_var,
+        command=set_iol_connected,
+    ).pack(anchor="w", padx=8, pady=4)
+    ttk.Checkbutton(
+        sensors,
+        text="Switch box heartbeat",
+        variable=switchbox_var,
+        command=set_switchbox_connected,
+    ).pack(anchor="w", padx=8, pady=4)
+    ttk.Button(sensors, text="Reset Flow Totalizer", command=iolhat.reset_totalizer).pack(
+        fill="x", padx=8, pady=4
+    )
+    ttk.Button(
+        sensors,
+        text="Tanks Good",
+        command=lambda: (_apply_mopeka(325, 310, 3, 3), _apply_mopeka_raw(640, 610, 25.2, 24.0)),
+    ).pack(fill="x", padx=8, pady=4)
+    ttk.Button(sensors, text="Tanks Offline", command=_mopeka_offline).pack(fill="x", padx=8, pady=4)
+    ttk.Button(sensors, text="Battery 84%", command=lambda: _apply_bms(84, 13.1)).pack(
+        fill="x", padx=8, pady=4
+    )
+
+    ttk.Button(panel, text="Quit Simulator", command=root.destroy).pack(fill="x", padx=16, pady=16)
+
+    heartbeat_tick()
+    update_status()
+
 
 # Initialize GPIO and IO-Link and start serial listener
 gpio_ok = initialize_gpio()
@@ -4702,17 +5144,20 @@ draw_requested_number(f"{requested_gallons:.0f}", "red")
 update_last_load_display()
 update_bms_display()
 
-# Start serial listener in background thread (works without IOL)
-serial_thread = threading.Thread(target=serial_listener, daemon=True)
-serial_thread.start()
+if SIM_MODE:
+    root.after(100, _create_sim_controls)
+else:
+    # Start serial listener in background thread (works without IOL)
+    serial_thread = threading.Thread(target=serial_listener, daemon=True)
+    serial_thread.start()
 
-# Start socket command listener in background thread (for BLE server communication)
-socket_thread = threading.Thread(target=socket_command_listener, daemon=True)
-socket_thread.start()
+    # Start socket command listener in background thread (for BLE server communication)
+    socket_thread = threading.Thread(target=socket_command_listener, daemon=True)
+    socket_thread.start()
 
-# Start green button monitor in background thread
-green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
-green_button_thread.start()
+    # Start green button monitor in background thread
+    green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
+    green_button_thread.start()
 
 def daily_total_checker():
     """Background thread to check time and reset daily total at 1:00 AM"""
@@ -4774,6 +5219,11 @@ reminder_thread = threading.Thread(target=daily_reminder_checker, daemon=True)
 reminder_thread.start()
 
 update_dashboard()
+
+if SIM_MODE:
+    root.deiconify()
+    root.lift()
+    root.update_idletasks()
 
 try:
     root.mainloop()

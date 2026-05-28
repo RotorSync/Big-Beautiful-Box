@@ -59,7 +59,7 @@ Check for v1.2 branch or updated documentation before use with newer hardware.
 | Raspberry Pi 5 | Main controller (Ubuntu) |
 | IOL HAT | IO-Link master for flow meter (SPI) |
 | Picomag Flow Meter | IO-Link industrial flow sensor |
-| 7" HDMI Display | 1024x600 touchscreen |
+| HDMI Display | 1920x1080 @ 30 Hz field dashboard |
 | Switch Box | Pico-based pilot remote control |
 | BLE Adapters | CSR (GATT server) + Realtek (sensors) |
 
@@ -141,6 +141,37 @@ The BLE server also reads nearby sensors via a second Bluetooth adapter:
 | `iol_dashboard.service` | Main dashboard GUI |
 | `rotorsync.service` | BLE GATT server |
 | `rotorsync_watchdog.service` | BLE server monitor |
+
+### Local GUI Simulator
+
+For GUI work away from the trailer/Pi hardware, run:
+
+```bash
+./run_tk_sim_mac.sh
+```
+
+Simulator mode opens the real native Tkinter dashboard plus a control panel for
+flow rate, switch-box commands, IO-Link disconnects, tank levels, and BMS state.
+The simulator uses the same `dashboard.py` canvas code as the field box with a
+virtual 1920x1080 field coordinate system, scaled down only to fit the Mac
+screen. This keeps GUI sizing and spacing tied to the native Tk renderer instead
+of the browser mock.
+
+Simulator mode redirects `/home/pi` dashboard state and logs into `.sim-data/`
+so local GUI testing does not touch production Pi files. Production startup is
+unchanged; the simulator is enabled only by `BBB_SIM_MODE=1`.
+
+The browser workbench is secondary and should not be used as the visual
+authority for field GUI sizing:
+
+```bash
+python3 web-sim/server.py
+```
+
+Then open `http://127.0.0.1:8765/`. The browser workbench mirrors the main
+dashboard layout and provides the same basic flow, switch-box, and sensor
+controls for rough iteration only. Verify final GUI work in the native Tk
+simulator.
 
 ### Configuration
 

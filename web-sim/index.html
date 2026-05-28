@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BBB GUI Workbench</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Helvetica, Arial, sans-serif;
+      background: #151515;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      display: grid;
+      grid-template-columns: minmax(640px, 1024px) 340px;
+      min-height: 100vh;
+      background: #151515;
+      color: white;
+    }
+
+    .dashboard {
+      position: relative;
+      aspect-ratio: 1024 / 600;
+      width: min(100%, 1024px);
+      align-self: start;
+      background: #000;
+      overflow: hidden;
+      border-right: 1px solid #333;
+    }
+
+    .label {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 34px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .requested-label {
+      top: 5%;
+    }
+
+    .actual-label {
+      top: 43%;
+    }
+
+    .number {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      font-weight: 800;
+      line-height: .8;
+      color: #e00000;
+      text-shadow:
+        -5px -5px 0 #fff,
+        -5px 0 0 #fff,
+        -5px 5px 0 #fff,
+        0 -5px 0 #fff,
+        0 5px 0 #fff,
+        5px -5px 0 #fff,
+        5px 0 0 #fff,
+        5px 5px 0 #fff;
+    }
+
+    .number.good {
+      color: #00b800;
+    }
+
+    .requested {
+      top: 16%;
+      font-size: 190px;
+    }
+
+    .actual {
+      top: 51%;
+      font-size: 245px;
+    }
+
+    .tanks {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1.18;
+      text-align: right;
+      color: #ff0000;
+    }
+
+    .last-loads {
+      position: absolute;
+      left: 10px;
+      top: 18px;
+      color: #00ffff;
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1.15;
+    }
+
+    .today {
+      position: absolute;
+      left: 255px;
+      bottom: 16px;
+      color: #00ffff;
+      font-size: 32px;
+      font-weight: 800;
+      line-height: 1.05;
+    }
+
+    .soc {
+      position: absolute;
+      left: 20px;
+      top: 84%;
+      color: #00ffff;
+      font-size: 64px;
+      font-weight: 800;
+      line-height: .95;
+    }
+
+    .flow {
+      position: absolute;
+      right: 16px;
+      bottom: 48px;
+      color: #00d4ff;
+      font-size: 40px;
+      font-weight: 800;
+    }
+
+    .status {
+      position: absolute;
+      left: 50%;
+      bottom: 8px;
+      transform: translateX(-50%);
+      color: #ffff00;
+      font-size: 20px;
+      white-space: nowrap;
+    }
+
+    .warning {
+      position: absolute;
+      left: 50%;
+      top: 84%;
+      transform: translate(-50%, -50%);
+      color: #ff0000;
+      font-size: 60px;
+      font-weight: 900;
+      text-align: center;
+      white-space: pre-line;
+      animation: blink 1s steps(2, start) infinite;
+    }
+
+    .thumbs-up {
+      position: absolute;
+      top: 35%;
+      left: 85%;
+      width: var(--thumbs-width, 38%);
+      height: auto;
+      transform: translateX(-50%);
+      object-fit: contain;
+      display: none;
+      pointer-events: none;
+    }
+
+    .thumbs-up.visible {
+      display: block;
+    }
+
+    .manual-block {
+      position: absolute;
+      width: 31%;
+      height: 28%;
+      background: #e00000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      font-size: 150px;
+      font-weight: 900;
+    }
+
+    .manual .manual-block {
+      display: flex;
+    }
+
+    .manual .manual-left-top,
+    .manual.phase-b .manual-right-top,
+    .manual .manual-left-bottom,
+    .manual.phase-b .manual-right-bottom {
+      display: flex;
+    }
+
+    .manual.phase-b .manual-left-top,
+    .manual.phase-b .manual-left-bottom {
+      display: none;
+    }
+
+    .manual-left-top { left: 5%; top: 19%; }
+    .manual-left-bottom { left: 5%; top: 51%; }
+    .manual-right-top { right: 5%; top: 19%; display: none; }
+    .manual-right-bottom { right: 5%; top: 51%; display: none; }
+
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    .controls {
+      padding: 14px;
+      background: #202020;
+      border-left: 1px solid #333;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 20px;
+    }
+
+    fieldset {
+      border: 1px solid #444;
+      border-radius: 8px;
+      margin: 0 0 12px;
+      padding: 10px;
+    }
+
+    legend {
+      padding: 0 6px;
+      color: #ddd;
+      font-weight: 700;
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid #555;
+      border-radius: 6px;
+      background: #303030;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #3d3d3d;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    .stack {
+      display: grid;
+      gap: 8px;
+    }
+
+    label {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin: 8px 0;
+    }
+
+    input[type="range"] {
+      width: 100%;
+    }
+
+    .readout {
+      color: #d7d7d7;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    @media (max-width: 900px) {
+      body {
+        grid-template-columns: 1fr;
+      }
+
+      .dashboard {
+        border-right: 0;
+        border-bottom: 1px solid #333;
+      }
+
+      .controls {
+        border-left: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="dashboard" id="dashboard">
+    <div class="last-loads" id="lastLoads">Last:<br>--<br>--<br>--</div>
+    <div class="tanks" id="tanks">Tanks: No Signal</div>
+    <div class="label requested-label">Requested Gallons:</div>
+    <div class="number requested" id="requested">60</div>
+    <div class="label actual-label">Actual Gallons:</div>
+    <div class="number actual" id="actual">0.0</div>
+    <div class="today" id="today">Today:<br>0.0 gal</div>
+    <div class="soc" id="soc">SOC:<br>--</div>
+    <div class="flow" id="flowText">0 GPM</div>
+    <div class="status" id="status">IOL: Connected | Serial: Connected</div>
+    <div class="warning" id="warning"></div>
+    <img class="thumbs-up" id="thumbsUp" src="thumbs_up.png" alt="">
+    <div class="manual-block manual-left-top">!</div>
+    <div class="manual-block manual-left-bottom">!</div>
+    <div class="manual-block manual-right-top">!</div>
+    <div class="manual-block manual-right-bottom">!</div>
+  </main>
+
+  <aside class="controls">
+    <h1>BBB GUI Workbench</h1>
+    <div class="readout" id="readout"></div>
+
+    <fieldset>
+      <legend>Flow</legend>
+      <input id="flow" type="range" min="0" max="120" value="0">
+      <div class="grid">
+        <button data-flow="0">Stop</button>
+        <button data-flow="45">45</button>
+        <button data-flow="75">75</button>
+        <button data-flow="100">100</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Switch Box</legend>
+      <div class="grid">
+        <button data-cmd="+1">+1</button>
+        <button data-cmd="-1">-1</button>
+        <button data-cmd="+10">+10</button>
+        <button data-cmd="-10">-10</button>
+      </div>
+      <div class="grid three" style="margin-top: 6px;">
+        <button data-cmd="OV">OV</button>
+        <button data-cmd="PS">PS</button>
+        <button data-cmd="TU">TU</button>
+      </div>
+      <div class="grid" style="margin-top: 6px;">
+        <button data-mode="fill">FILL</button>
+        <button data-mode="mix">MIX</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Sensors</legend>
+      <label><input id="iol" type="checkbox" checked> IO-Link connected</label>
+      <label><input id="serial" type="checkbox" checked> Switch box heartbeat</label>
+      <label><input id="tanksOk" type="checkbox"> Tanks good</label>
+      <label><input id="manual" type="checkbox"> Manual override</label>
+      <label style="display: block;">
+        Thumbs size
+        <input id="thumbsSize" type="range" min="20" max="55" value="38">
+      </label>
+      <div class="stack">
+        <button id="resetScenario">Reset Scenario</button>
+        <button id="reset">Reset Flow Totalizer</button>
+        <button id="battery">Battery 84%</button>
+      </div>
+    </fieldset>
+  </aside>
+
+  <script>
+    const els = {
+      dashboard: document.getElementById("dashboard"),
+      requested: document.getElementById("requested"),
+      actual: document.getElementById("actual"),
+      today: document.getElementById("today"),
+      soc: document.getElementById("soc"),
+      flowText: document.getElementById("flowText"),
+      status: document.getElementById("status"),
+      warning: document.getElementById("warning"),
+      thumbsUp: document.getElementById("thumbsUp"),
+      tanks: document.getElementById("tanks"),
+      lastLoads: document.getElementById("lastLoads"),
+      readout: document.getElementById("readout"),
+      flow: document.getElementById("flow"),
+      iol: document.getElementById("iol"),
+      serial: document.getElementById("serial"),
+      tanksOk: document.getElementById("tanksOk"),
+      manual: document.getElementById("manual"),
+      thumbsSize: document.getElementById("thumbsSize")
+    };
+
+    let latestState = null;
+    let isSending = false;
+
+    async function postAction(payload) {
+      isSending = true;
+      try {
+        const response = await fetch("/api/action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        latestState = await response.json();
+        render(latestState);
+      } finally {
+        isSending = false;
+      }
+    }
+
+    async function pollState() {
+      if (isSending) return;
+      const response = await fetch("/api/state");
+      latestState = await response.json();
+      render(latestState);
+    }
+
+    function render(state) {
+      const good = state.colorsAreGreen;
+      els.requested.textContent = state.requestedGallons.toFixed(0);
+      els.actual.textContent = state.actualGallons.toFixed(1);
+      els.requested.classList.toggle("good", good);
+      els.actual.classList.toggle("good", good);
+      els.today.innerHTML = `Today:<br>${state.dailyTotal.toFixed(1)} gal`;
+      els.soc.innerHTML = state.mode === "mix" ? "" : `SOC:<br>${state.bmsSoc == null ? "--" : `${Math.round(state.bmsSoc)}%`}`;
+      els.flowText.textContent = `${state.flowGpm.toFixed(0)} GPM`;
+      els.tanks.textContent = state.tanksOk ? "Front: 325 gal\nBack: 310 gal" : "Tanks: No Signal";
+      els.tanks.style.whiteSpace = "pre-line";
+      els.tanks.style.color = state.tanksOk ? "#00ff00" : "#ff0000";
+      els.lastLoads.innerHTML = `Last:<br>${state.lastLoadsGallons.map(v => v.toFixed(1)).concat(["--", "--", "--"]).slice(0, 3).join("<br>")}`;
+
+      const status = [
+        `IOL: ${state.iolConnected ? "Connected" : "Device not responding"}`,
+        `Serial: ${state.serialConnected ? "Connected" : "Disconnected"}`,
+        state.overrideMode ? "OVERRIDE: ON" : ""
+      ].filter(Boolean);
+      els.status.textContent = status.join(" | ");
+
+      els.warning.textContent = state.overrideMode ? "MANUAL" : (state.warnings[0] || "");
+      els.dashboard.classList.toggle("manual", state.overrideMode);
+      els.dashboard.classList.toggle("phase-b", Math.floor(performance.now() / 500) % 2 === 1);
+      els.dashboard.style.setProperty("--thumbs-width", `${state.thumbsWidth}%`);
+      els.thumbsUp.classList.toggle("visible", state.thumbsVisible);
+      els.flow.value = state.flowGpm;
+      els.iol.checked = state.iolConnected;
+      els.serial.checked = state.serialConnected;
+      els.tanksOk.checked = state.tanksOk;
+      els.manual.checked = state.overrideMode;
+      els.thumbsSize.value = state.thumbsWidth;
+
+      const glideText = state.glideReason ? ` | Coasting: ${state.glideReason}` : "";
+      const pendingText = state.pendingFill ? ` | Pending: ${state.pendingFill.actual_gallons.toFixed(1)} gal ${state.pendingFill.shutoff_type}` : "";
+      const batteryText = state.bmsSoc == null ? "" : ` | Battery: ${Math.round(state.bmsSoc)}% / ${state.bmsVoltage.toFixed(1)}V`;
+      els.readout.textContent = `Mode: ${state.mode} | Threshold: ${state.thresholdGallons.toFixed(2)} gal | 3s coast: ${state.threeSecondCoastGallons.toFixed(2)} gal${glideText}${pendingText}${batteryText} | ${state.lastMessage || ""}`;
+    }
+
+    document.querySelectorAll("[data-flow]").forEach(button => {
+      button.addEventListener("click", () => postAction({ action: "setFlow", gpm: Number(button.dataset.flow) }));
+    });
+
+    els.flow.addEventListener("change", () => postAction({ action: "setFlow", gpm: Number(els.flow.value) }));
+
+    document.querySelectorAll("[data-cmd]").forEach(button => {
+      button.addEventListener("click", () => postAction({ action: "command", command: button.dataset.cmd }));
+    });
+
+    document.querySelectorAll("[data-mode]").forEach(button => {
+      button.addEventListener("click", () => postAction({ action: "mode", mode: button.dataset.mode }));
+    });
+
+    els.iol.addEventListener("change", () => postAction({ action: "sensor", key: "iol", value: els.iol.checked }));
+    els.serial.addEventListener("change", () => postAction({ action: "sensor", key: "serial", value: els.serial.checked }));
+    els.tanksOk.addEventListener("change", () => postAction({ action: "sensor", key: "tanks", value: els.tanksOk.checked }));
+    els.manual.addEventListener("change", () => postAction({ action: "sensor", key: "manual", value: els.manual.checked }));
+    els.thumbsSize.addEventListener("input", () => postAction({ action: "sensor", key: "thumbsWidth", value: Number(els.thumbsSize.value) }));
+    document.getElementById("resetScenario").addEventListener("click", () => postAction({ action: "resetScenario" }));
+    document.getElementById("reset").addEventListener("click", () => postAction({ action: "resetTotalizer" }));
+    document.getElementById("battery").addEventListener("click", () => postAction({ action: "battery" }));
+
+    pollState();
+    setInterval(pollState, 100);
+    setInterval(() => {
+      if (latestState) render(latestState);
+    }, 100);
+  </script>
+</body>
+</html>
