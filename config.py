@@ -36,6 +36,12 @@ SERIAL_BAUD = 115200          # Serial baud rate (must match sender device)
 # Duration settings for relay activation (in seconds)
 PUMP_STOP_DURATION = 5       # How long to hold relay on for PS (Pump Stop) command
 AUTO_ALERT_DURATION = 5      # How long to hold relay on for auto-alert
+RELAY_SLOWDOWN_CHECK_SECONDS = 2.0  # seconds after auto-stop to verify flow is slowing
+RELAY_SLOWDOWN_MIN_DROP_GPM = 10.0  # GPM drop required after relay trigger
+RELAY_SLOWDOWN_MIN_DROP_FRACTION = 0.20  # fractional drop required after relay trigger
+RELAY_SLOWDOWN_ALARM_FLASH_HZ = 20  # target full-screen flash rate
+RELAY_SLOWDOWN_ALARM_COLOR_A = "black"
+RELAY_SLOWDOWN_ALARM_COLOR_B = "white"
 
 
 # =============================================================================

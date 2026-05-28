@@ -344,6 +344,11 @@ flow_control_audit_flowing_fresh = 0
 flow_control_audit_errors = 0
 flow_control_audit_loop_ms_total = 0.0
 flow_control_audit_loop_ms_max = 0.0
+relay_slowdown_watch_active = False
+relay_slowdown_alarm_active = False
+relay_slowdown_alarm_visible = False
+relay_slowdown_trigger_time = 0.0
+relay_slowdown_trigger_flow_gpm = 0.0
 last_trigger_predicted_actual = 0.0
 last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
@@ -3749,6 +3754,7 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
 
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+    current_flow_gpm = max(0.0, last_flow_rate * config.LITERS_PER_SEC_TO_GPM)
 
     if is_flowing and not flow_control_was_flowing:
         flow_cycle_counter += 1
@@ -3774,6 +3780,7 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
         )
 
     flow_control_was_flowing = is_flowing
+    _update_relay_slowdown_watch(is_flowing, current_flow_gpm, now)
 
     if not is_flowing or override_mode or flow_meter_disconnected or last_alert_triggered:
         return
@@ -3806,7 +3813,73 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
             f"threshold={trigger_threshold:.2f}gal, triggering relay for "
             f"{config.AUTO_ALERT_DURATION}s"
         )
+        _arm_relay_slowdown_watch(flow_rate_gpm, now)
         start_pump_stop_thread(config.AUTO_ALERT_DURATION)
+
+
+def _arm_relay_slowdown_watch(flow_gpm, now):
+    """Watch for measurable flow slowdown after an auto-stop relay trigger."""
+    global relay_slowdown_watch_active, relay_slowdown_alarm_active
+    global relay_slowdown_trigger_time, relay_slowdown_trigger_flow_gpm
+
+    relay_slowdown_watch_active = True
+    relay_slowdown_alarm_active = False
+    relay_slowdown_trigger_time = now
+    relay_slowdown_trigger_flow_gpm = max(0.0, flow_gpm)
+    log_flow_control(
+        "slowdown_watch_start"
+        f" | flow_gpm={relay_slowdown_trigger_flow_gpm:.1f}"
+        f" | check_after={config.RELAY_SLOWDOWN_CHECK_SECONDS:.1f}s"
+    )
+
+
+def _clear_relay_slowdown_watch(reason):
+    """Clear post-relay slowdown watch/alarm state."""
+    global relay_slowdown_watch_active, relay_slowdown_alarm_active
+    global relay_slowdown_trigger_time, relay_slowdown_trigger_flow_gpm
+
+    if relay_slowdown_watch_active or relay_slowdown_alarm_active:
+        log_flow_control(f"slowdown_watch_clear | reason={reason}")
+    relay_slowdown_watch_active = False
+    relay_slowdown_alarm_active = False
+    relay_slowdown_trigger_time = 0.0
+    relay_slowdown_trigger_flow_gpm = 0.0
+
+
+def _update_relay_slowdown_watch(is_flowing, flow_gpm, now):
+    """Latch an alarm if flow does not drop measurably after auto-stop."""
+    global relay_slowdown_alarm_active
+
+    if not relay_slowdown_watch_active:
+        return
+
+    if not is_flowing:
+        _clear_relay_slowdown_watch("flow_stopped")
+        return
+
+    elapsed = now - relay_slowdown_trigger_time
+    if elapsed < config.RELAY_SLOWDOWN_CHECK_SECONDS:
+        return
+
+    required_drop = max(
+        config.RELAY_SLOWDOWN_MIN_DROP_GPM,
+        relay_slowdown_trigger_flow_gpm * config.RELAY_SLOWDOWN_MIN_DROP_FRACTION,
+    )
+    actual_drop = relay_slowdown_trigger_flow_gpm - max(0.0, flow_gpm)
+    if actual_drop >= required_drop:
+        _clear_relay_slowdown_watch("flow_slowed")
+        return
+
+    if not relay_slowdown_alarm_active:
+        relay_slowdown_alarm_active = True
+        log_flow_control(
+            "slowdown_alarm"
+            f" | elapsed={elapsed:.1f}s"
+            f" | trigger_flow_gpm={relay_slowdown_trigger_flow_gpm:.1f}"
+            f" | current_flow_gpm={flow_gpm:.1f}"
+            f" | drop_gpm={actual_drop:.1f}"
+            f" | required_drop_gpm={required_drop:.1f}"
+        )
 
 
 def _record_flow_control_audit(loop_dt_ms, read_ok=True):
@@ -5032,6 +5105,40 @@ def _canvas_height():
     height = canvas.winfo_height()
     return SIM_WINDOW_HEIGHT if SIM_MODE else height
 
+
+def update_relay_slowdown_alarm_flash():
+    """Flash the whole display while auto-stop relay has not slowed flow."""
+    global relay_slowdown_alarm_visible
+
+    flash_hz = max(1.0, float(getattr(config, "RELAY_SLOWDOWN_ALARM_FLASH_HZ", 30)))
+    interval_ms = max(1, int(1000 / flash_hz))
+
+    if relay_slowdown_alarm_active:
+        phase = int(time.time() * flash_hz) % 2
+        color = (
+            config.RELAY_SLOWDOWN_ALARM_COLOR_A
+            if phase == 0
+            else config.RELAY_SLOWDOWN_ALARM_COLOR_B
+        )
+        canvas.delete("relay_slowdown_alarm")
+        canvas.create_rectangle(
+            0,
+            0,
+            _canvas_width(),
+            _canvas_height(),
+            fill=color,
+            outline="",
+            tags="relay_slowdown_alarm",
+        )
+        canvas.tag_raise("relay_slowdown_alarm")
+        relay_slowdown_alarm_visible = True
+    elif relay_slowdown_alarm_visible:
+        canvas.delete("relay_slowdown_alarm")
+        relay_slowdown_alarm_visible = False
+
+    root.after(interval_ms, update_relay_slowdown_alarm_flash)
+
+
 # Draw full-screen barber pole stripes
 def draw_fullscreen_stripes():
     """Draw barber pole stripes across entire screen"""
@@ -5698,6 +5805,9 @@ def update_dashboard():
                 canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                                  text=text, font=(font_family, font_size, "bold"), fill=color, tags="warning")
 
+    if relay_slowdown_alarm_active and relay_slowdown_alarm_visible:
+        canvas.tag_raise("relay_slowdown_alarm")
+
     root.after(config.UPDATE_INTERVAL, update_dashboard)
 
 
@@ -6032,6 +6142,7 @@ total_checker_thread.start()
 reminder_thread = threading.Thread(target=daily_reminder_checker, daemon=True)
 reminder_thread.start()
 
+update_relay_slowdown_alarm_flash()
 update_dashboard()
 
 if SIM_MODE:
