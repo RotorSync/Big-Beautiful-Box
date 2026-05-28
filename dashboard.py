@@ -263,8 +263,10 @@ last_alert_triggered = False
 auto_shutoff_latched = False  # True once the pump-stop relay has fired for the current fill cycle
 last_successful_read_time = time.time()
 last_flow_read_was_fresh = False  # True only when latest IO-Link data changed
+last_fresh_flow_read_time = 0.0  # Monotonic-ish wall time of latest changed IO-Link data
 was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
 new_fill_flow_started_at = None  # Time flow first exceeded the new-fill threshold
+new_fill_last_fresh_at = None  # Last fresh high-flow sample during new-fill clearing
 new_fill_cycle_cleared = False  # True after prior fill state is cleared for this cycle
 colors_are_green = False  # Track if colors have been changed to green
 last_reminder_date = None  # Track the last date reminders were shown (YYYY-MM-DD format)
@@ -333,6 +335,15 @@ flow_control_was_flowing = False
 flow_control_last_tick = None
 flow_control_last_loop_time = time.time()
 flow_control_last_error_log_time = 0.0
+flow_control_audit_started_at = time.time()
+flow_control_audit_polls = 0
+flow_control_audit_fresh = 0
+flow_control_audit_duplicates = 0
+flow_control_audit_flowing_polls = 0
+flow_control_audit_flowing_fresh = 0
+flow_control_audit_errors = 0
+flow_control_audit_loop_ms_total = 0.0
+flow_control_audit_loop_ms_max = 0.0
 last_trigger_predicted_actual = 0.0
 last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
@@ -3641,7 +3652,7 @@ def _log_iol_disconnect_status(reason):
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
-    global last_flow_read_was_fresh
+    global last_flow_read_was_fresh, last_fresh_flow_read_time
     global consecutive_identical_raw, last_raw_data
 
     try:
@@ -3713,6 +3724,8 @@ def read_flow_meter():
             error_message = ""
             last_successful_read_time = time.time()
             last_flow_read_was_fresh = raw_data_changed
+            if raw_data_changed:
+                last_fresh_flow_read_time = last_successful_read_time
 
             return totalizer_liters * config.LITERS_TO_GALLONS
         else:
@@ -3752,8 +3765,9 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
         )
 
     if is_flowing:
-        recent_flow_rates_l_per_s.append(last_flow_rate)
-        last_flowing_rate_l_per_s = last_flow_rate
+        if last_flow_read_was_fresh:
+            recent_flow_rates_l_per_s.append(last_flow_rate)
+            last_flowing_rate_l_per_s = last_flow_rate
     elif flow_control_was_flowing:
         log_flow_control(
             f"cycle_stop | actual={actual:.3f} | auto={auto_shutoff_latched}"
@@ -3795,6 +3809,97 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
         start_pump_stop_thread(config.AUTO_ALERT_DURATION)
 
 
+def _record_flow_control_audit(loop_dt_ms, read_ok=True):
+    """Track flow-meter sample freshness without adding another IO-Link reader."""
+    global flow_control_audit_started_at, flow_control_audit_polls
+    global flow_control_audit_fresh, flow_control_audit_duplicates
+    global flow_control_audit_flowing_polls, flow_control_audit_flowing_fresh
+    global flow_control_audit_errors, flow_control_audit_loop_ms_total
+    global flow_control_audit_loop_ms_max
+
+    now = time.time()
+    flow_control_audit_polls += 1
+    flow_control_audit_loop_ms_total += loop_dt_ms
+    flow_control_audit_loop_ms_max = max(flow_control_audit_loop_ms_max, loop_dt_ms)
+
+    if read_ok:
+        is_fresh = bool(last_flow_read_was_fresh)
+        is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+        if is_fresh:
+            flow_control_audit_fresh += 1
+        else:
+            flow_control_audit_duplicates += 1
+        if is_flowing:
+            flow_control_audit_flowing_polls += 1
+            if is_fresh:
+                flow_control_audit_flowing_fresh += 1
+    else:
+        flow_control_audit_errors += 1
+
+    elapsed = now - flow_control_audit_started_at
+    audit_interval = max(1.0, float(getattr(config, "FLOW_CONTROL_AUDIT_INTERVAL", 5.0)))
+    if elapsed < audit_interval or flow_control_audit_polls <= 0:
+        return
+
+    polls = flow_control_audit_polls
+    fresh = flow_control_audit_fresh
+    duplicates = flow_control_audit_duplicates
+    flowing_polls = flow_control_audit_flowing_polls
+    flowing_fresh = flow_control_audit_flowing_fresh
+    flowing_duplicates = max(0, flowing_polls - flowing_fresh)
+    errors = flow_control_audit_errors
+    avg_loop_ms = flow_control_audit_loop_ms_total / polls
+    poll_hz = polls / elapsed
+    fresh_hz = fresh / elapsed
+    flowing_fresh_hz = flowing_fresh / elapsed
+
+    log_flow_control(
+        "audit"
+        f" | window={elapsed:.1f}s"
+        f" | polls={polls}"
+        f" | fresh={fresh}"
+        f" | dup={duplicates}"
+        f" | errors={errors}"
+        f" | poll_hz={poll_hz:.1f}"
+        f" | fresh_hz={fresh_hz:.1f}"
+        f" | flowing_polls={flowing_polls}"
+        f" | flowing_fresh={flowing_fresh}"
+        f" | flowing_dup={flowing_duplicates}"
+        f" | flowing_fresh_hz={flowing_fresh_hz:.1f}"
+        f" | loop_avg_ms={avg_loop_ms:.1f}"
+        f" | loop_max_ms={flow_control_audit_loop_ms_max:.1f}"
+    )
+
+    flow_control_audit_started_at = now
+    flow_control_audit_polls = 0
+    flow_control_audit_fresh = 0
+    flow_control_audit_duplicates = 0
+    flow_control_audit_flowing_polls = 0
+    flow_control_audit_flowing_fresh = 0
+    flow_control_audit_errors = 0
+    flow_control_audit_loop_ms_total = 0.0
+    flow_control_audit_loop_ms_max = 0.0
+
+
+def _reset_flow_control_audit(started_at=None):
+    """Start a fresh flow-meter freshness audit window."""
+    global flow_control_audit_started_at, flow_control_audit_polls
+    global flow_control_audit_fresh, flow_control_audit_duplicates
+    global flow_control_audit_flowing_polls, flow_control_audit_flowing_fresh
+    global flow_control_audit_errors, flow_control_audit_loop_ms_total
+    global flow_control_audit_loop_ms_max
+
+    flow_control_audit_started_at = started_at if started_at is not None else time.time()
+    flow_control_audit_polls = 0
+    flow_control_audit_fresh = 0
+    flow_control_audit_duplicates = 0
+    flow_control_audit_flowing_polls = 0
+    flow_control_audit_flowing_fresh = 0
+    flow_control_audit_errors = 0
+    flow_control_audit_loop_ms_total = 0.0
+    flow_control_audit_loop_ms_max = 0.0
+
+
 def flow_control_loop():
     """Own IO-Link flow reads and auto-shutoff timing outside the Tk loop."""
     global flow_control_last_tick, flow_control_last_loop_time, flow_control_last_error_log_time
@@ -3803,6 +3908,7 @@ def flow_control_loop():
     next_tick = time.monotonic()
     flow_control_last_tick = next_tick
     flow_control_last_loop_time = time.time()
+    _reset_flow_control_audit(flow_control_last_loop_time)
     log_flow_control(f"thread_start | interval={interval:.3f}s")
 
     while not flow_control_stop_event.is_set():
@@ -3813,9 +3919,11 @@ def flow_control_loop():
         try:
             actual = read_flow_meter()
             flow_control_last_loop_time = time.time()
+            _record_flow_control_audit(loop_dt_ms, read_ok=True)
             _flow_control_process_sample(actual, time.time(), loop_dt_ms)
         except Exception as exc:
             flow_control_last_loop_time = time.time()
+            _record_flow_control_audit(loop_dt_ms, read_ok=False)
             now = time.time()
             if now - flow_control_last_error_log_time > 5:
                 flow_control_last_error_log_time = now
@@ -5234,7 +5342,7 @@ load_thumbs_up_gif()
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
-    global new_fill_flow_started_at, new_fill_cycle_cleared
+    global new_fill_flow_started_at, new_fill_last_fresh_at, new_fill_cycle_cleared
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
@@ -5280,18 +5388,33 @@ def update_dashboard():
 
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
-    is_new_fill_flowing = (
-        last_flow_read_was_fresh
+    now = time.time()
+    latest_fresh_age = now - last_fresh_flow_read_time if last_fresh_flow_read_time else float("inf")
+    fresh_grace_seconds = config.NEW_FILL_CYCLE_FRESH_GRACE_SECONDS
+    has_recent_fresh_flow = latest_fresh_age <= fresh_grace_seconds
+    is_recent_fresh_new_fill_flowing = (
+        has_recent_fresh_flow
+        and not flow_meter_disconnected
+        and not connection_error
         and last_flow_rate >= config.NEW_FILL_CYCLE_THRESHOLD
     )
-    now = time.time()
-    if is_new_fill_flowing:
+    if is_recent_fresh_new_fill_flowing:
         if new_fill_flow_started_at is None:
-            new_fill_flow_started_at = now
-    else:
+            new_fill_flow_started_at = last_fresh_flow_read_time
+        new_fill_last_fresh_at = last_fresh_flow_read_time
+    elif (
+        flow_meter_disconnected
+        or connection_error
+        or last_flow_rate < config.NEW_FILL_CYCLE_THRESHOLD
+        or (
+            new_fill_last_fresh_at is not None
+            and now - new_fill_last_fresh_at > fresh_grace_seconds
+        )
+    ):
         new_fill_flow_started_at = None
+        new_fill_last_fresh_at = None
         new_fill_cycle_cleared = False
-    if is_flowing and not control_active:
+    if is_flowing and not control_active and last_flow_read_was_fresh:
         recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
@@ -5371,8 +5494,10 @@ def update_dashboard():
     # Hide thumbs up and clear pending fill only after sustained high flow.
     if (
         new_fill_flow_started_at is not None
+        and new_fill_last_fresh_at is not None
         and not new_fill_cycle_cleared
         and now - new_fill_flow_started_at >= config.NEW_FILL_CYCLE_HOLD_SECONDS
+        and now - new_fill_last_fresh_at <= config.NEW_FILL_CYCLE_FRESH_GRACE_SECONDS
     ):
         if thumbs_up_label:
             thumbs_up_label.place_forget()

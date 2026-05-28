@@ -50,6 +50,7 @@ DATA_LENGTH = 15              # Expected data length from flow meter
 FLOW_STOPPED_THRESHOLD = 0.001       # L/s - flow is considered stopped below this
 NEW_FILL_CYCLE_THRESHOLD = 0.630902  # L/s - 10 GPM; clear thumbs/pending fill above this
 NEW_FILL_CYCLE_HOLD_SECONDS = 3.0    # seconds - require sustained new-fill flow
+NEW_FILL_CYCLE_FRESH_GRACE_SECONDS = 0.25  # seconds - latest high-flow sample must be fresh/recent
 FLOW_METER_TIMEOUT = 5            # seconds - flow meter considered disconnected after this
 IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port power-cycle attempts
 
@@ -64,13 +65,14 @@ LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 
 # Flow-based shutoff coast calibration
 # Use a short rolling average of flow rather than a single instant sample.
-FLOW_AVERAGING_SAMPLES = 3  # 3 samples; timing follows the active flow-control loop
+FLOW_AVERAGING_SAMPLES = 3  # 3 fresh Picomag samples; independent of control-loop poll rate
 
 # Safety-critical auto-shutoff loop. Keep IO-Link reads and relay decisions out
 # of the Tk render loop so GUI timing cannot move the pump stop point.
 FLOW_CONTROL_THREAD_ENABLED = True
-FLOW_CONTROL_INTERVAL = 0.05  # seconds; 50 ms is about 0.08 gal at 100 GPM
+FLOW_CONTROL_INTERVAL = 0.020  # seconds; test 50 Hz polling against ~12.7 Hz fresh Picomag data
 FLOW_CONTROL_PREDICTION_SECONDS = 0.0  # keep curve behavior unchanged by default
+FLOW_CONTROL_AUDIT_INTERVAL = 5.0  # seconds between flow-meter freshness summaries
 
 # Piecewise coast model derived from usable March 2026 auto-shutoff samples.
 # Low band samples:
