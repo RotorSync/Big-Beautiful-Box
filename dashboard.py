@@ -2088,22 +2088,22 @@ def run_self_test():
     self_test_window.configure(bg='black')
 
     # Title
-    title = tk.Label(self_test_window, text="SYSTEM SELF-TEST", font=("Helvetica", 40, "bold"),
+    title = tk.Label(self_test_window, text="SYSTEM SELF-TEST", font=("Helvetica", 44, "bold"),
                      fg="cyan", bg="black")
-    title.pack(pady=20)
+    title.pack(pady=(12, 6))
 
     # Controls instruction
     controls = tk.Label(self_test_window, text="OV=EXIT TO MENU",
-                       font=("Helvetica", 22, "bold"), fg="#ffff00", bg="#0a0a0a")
+                       font=("Helvetica", 28, "bold"), fg="#ffff00", bg="#0a0a0a")
     controls.pack(pady=2)
 
     # Results frame
     results_frame = tk.Frame(self_test_window, bg='black')
-    results_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
+    results_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(8, 14))
 
-    results_text = tk.Text(results_frame, font=("Courier", 24), bg="black", fg="white",
-                           height=15, width=50)
-    results_text.pack()
+    results_text = tk.Text(results_frame, font=("Courier", 32, "bold"), bg="black", fg="white",
+                           wrap=tk.WORD, borderwidth=0, highlightthickness=0)
+    results_text.pack(fill=tk.BOTH, expand=True)
 
     def run_tests():
         results_text.insert(tk.END, "Starting self-test...\n\n")
@@ -2170,7 +2170,7 @@ def run_self_test():
         results_text.insert(tk.END, "\n=== Test Complete ===\n")
 
         # Color tags
-        results_text.tag_config("pass", foreground="red")
+        results_text.tag_config("pass", foreground="green")
         results_text.tag_config("fail", foreground="red")
         results_text.tag_config("skip", foreground="yellow")
 
