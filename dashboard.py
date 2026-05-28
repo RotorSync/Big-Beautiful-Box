@@ -679,6 +679,10 @@ _last_requested_text = None
 _last_requested_color = None
 _last_actual_text = None
 _last_actual_color = None
+_last_batch_requested_text = None
+_last_batch_requested_color = None
+_last_batch_actual_text = None
+_last_batch_actual_color = None
 
 def update_batch_mix_overlay():
     """Update the batch mix screen layout based on mode and data"""
@@ -743,6 +747,8 @@ def activate_batch_mix_layout():
     """Switch to batch mix screen layout"""
     global batch_mix_layout_active
     global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
     # Clear existing labels and redraw in new positions
     canvas.delete("labels")
@@ -786,6 +792,10 @@ def activate_batch_mix_layout():
     _last_requested_color = None
     _last_actual_text = None
     _last_actual_color = None
+    _last_batch_requested_text = None
+    _last_batch_requested_color = None
+    _last_batch_actual_text = None
+    _last_batch_actual_color = None
 
     # Redraw the numbers in new positions
     redraw_numbers_for_batch_mix()
@@ -954,6 +964,8 @@ def deactivate_batch_mix_layout():
     """Switch back to normal screen layout"""
     global batch_mix_layout_active
     global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
     # Clear batch mix elements
     canvas.delete("batchmix")
@@ -976,6 +988,10 @@ def deactivate_batch_mix_layout():
     _last_requested_color = None
     _last_actual_text = None
     _last_actual_color = None
+    _last_batch_requested_text = None
+    _last_batch_requested_color = None
+    _last_batch_actual_text = None
+    _last_batch_actual_color = None
 
     # Leave batch-mix layout before redrawing so normal positioning is used.
     batch_mix_layout_active = False
@@ -988,17 +1004,19 @@ _last_requested_text = None
 _last_requested_color = None
 _last_actual_text = None
 _last_actual_color = None
+_last_batch_requested_text = None
+_last_batch_requested_color = None
+_last_batch_actual_text = None
+_last_batch_actual_color = None
 
 def redraw_numbers_for_batch_mix():
     """Redraw requested/actual numbers in batch mix positions (left 1/3)"""
     global requested_gallons, last_totalizer_liters
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
     # Get current color based on state
     color = "green" if colors_are_green else "red"
-
-    # Redraw in left 1/3 position
-    canvas.delete("requested")
-    canvas.delete("actual")
 
     _sync_canvas_geometry()
     width = _canvas_width()
@@ -1011,11 +1029,15 @@ def redraw_numbers_for_batch_mix():
     req_font = ("Helvetica", 90, "bold")
     req_text = f"{requested_gallons:.0f}"
 
-    for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
-        canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
-                          font=req_font, fill="white", tags="requested")
-    canvas.create_text(left_center_x, req_y, text=req_text,
-                      font=req_font, fill=color, tags="requested")
+    if req_text != _last_batch_requested_text or color != _last_batch_requested_color:
+        canvas.delete("requested")
+        for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
+            canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
+                              font=req_font, fill="white", tags="requested")
+        canvas.create_text(left_center_x, req_y, text=req_text,
+                          font=req_font, fill=color, tags="requested")
+        _last_batch_requested_text = req_text
+        _last_batch_requested_color = color
 
     # Actual number - smaller font for left panel
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -1023,11 +1045,15 @@ def redraw_numbers_for_batch_mix():
     act_font = ("Helvetica", 110, "bold")
     act_text = f"{actual_gallons:.1f}"
 
-    for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
-        canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
-                          font=act_font, fill="white", tags="actual")
-    canvas.create_text(left_center_x, act_y, text=act_text,
-                      font=act_font, fill=color, tags="actual")
+    if act_text != _last_batch_actual_text or color != _last_batch_actual_color:
+        canvas.delete("actual")
+        for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
+            canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
+                              font=act_font, fill="white", tags="actual")
+        canvas.create_text(left_center_x, act_y, text=act_text,
+                          font=act_font, fill=color, tags="actual")
+        _last_batch_actual_text = act_text
+        _last_batch_actual_color = color
 
 def redraw_numbers_normal():
     """Redraw requested/actual numbers in normal centered positions"""
@@ -4267,12 +4293,17 @@ def socket_command_listener():
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
-                                    # Set mix mode requested gallons to water_needed amount (don't change regular requested_gallons)
+                                    # Store the BatchMix target as the mix preset. If we are already in
+                                    # mix mode, also update the live target used by auto-stop.
                                     water_needed = batch_mix_data.get('water_needed', 0)
                                     if water_needed > 0:
+                                        water_needed = float(water_needed)
                                         mix_requested_gallons = water_needed
+                                        save_mode_presets()
                                         # Only update display if in mix mode
                                         if current_mode == "mix":
+                                            requested_gallons = water_needed
+                                            colors_are_green = False
                                             # Show decimal if present, otherwise whole number
                                             if water_needed == int(water_needed):
                                                 req_str = f"{int(water_needed)}"
