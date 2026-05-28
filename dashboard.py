@@ -665,6 +665,7 @@ def switch_mode(new_mode):
     draw_requested_number(f"{requested_gallons:.0f}", "red")
     update_mopeka_display()
     update_last_load_display()
+    update_bms_display()
 
     print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
 
