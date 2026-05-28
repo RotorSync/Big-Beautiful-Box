@@ -1012,20 +1012,27 @@ _last_batch_requested_color = None
 _last_batch_actual_text = None
 _last_batch_actual_color = None
 
+def target_display_color(actual_gallons=None):
+    """Return the color used for requested/actual gallons on the main display."""
+    if actual_gallons is None:
+        actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    if actual_gallons > requested_gallons + config.WARNING_THRESHOLD:
+        return "red"
+    return "green" if colors_are_green else "red"
+
 def redraw_numbers_for_batch_mix():
     """Redraw requested/actual numbers in batch mix positions (left 1/3)"""
     global requested_gallons, last_totalizer_liters
     global _last_batch_requested_text, _last_batch_requested_color
     global _last_batch_actual_text, _last_batch_actual_color
 
-    # Get current color based on state
-    color = "green" if colors_are_green else "red"
-
     _sync_canvas_geometry()
     width = _canvas_width()
     height = _canvas_height()
 
     left_center_x = width // 6
+    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    color = target_display_color(actual_gallons)
 
     # Requested number - smaller font for left panel
     req_y = int(height * 0.22)
@@ -1043,7 +1050,6 @@ def redraw_numbers_for_batch_mix():
         _last_batch_requested_color = color
 
     # Actual number - smaller font for left panel
-    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
     act_y = int(height * 0.55)
     act_font = ("Helvetica", 110, "bold")
     act_text = f"{actual_gallons:.1f}"
@@ -1062,9 +1068,9 @@ def redraw_numbers_normal():
     """Redraw requested/actual numbers in normal centered positions"""
     global requested_gallons, last_totalizer_liters
 
-    color = "green" if colors_are_green else "red"
-    draw_requested_number(f"{requested_gallons:.0f}", color)
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    color = target_display_color(actual_gallons)
+    draw_requested_number(f"{requested_gallons:.0f}", color)
     draw_actual_number(f"{actual_gallons:.1f}", color)
 
 def add_to_totals(gallons):
@@ -1452,13 +1458,13 @@ def change_colors_to_green(from_button=False):
             colors_are_green = True
 
             # Change the number colors to green by redrawing
-            draw_requested_number(f"{requested_gallons:.0f}", "green")
             current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
-            draw_actual_number(f"{current_actual:.1f}", "green")
+            display_color = target_display_color(current_actual)
+            draw_requested_number(f"{requested_gallons:.0f}", display_color)
+            draw_actual_number(f"{current_actual:.1f}", display_color)
             # Show big thumbs up on the right side and start animation, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
-                _set_thumbs_up_visible(True)
+                show_thumbs_up(current_actual)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -1480,8 +1486,7 @@ def change_colors_to_green(from_button=False):
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
             # Show thumbs up but DO NOT change colors to green, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
-                _set_thumbs_up_visible(True)
+                show_thumbs_up(actual_gallons)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -4950,7 +4955,7 @@ def _sim_flow_reset(reason):
     iolhat.reset_totalizer()
     detect_totalizer_reset(0.0)
     last_totalizer_liters = 0.0
-    draw_actual_number("0.0", "green" if colors_are_green else "red")
+    draw_actual_number("0.0", target_display_color(0.0))
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write(f"sim totalizer reset: {reason}\n")
     flow_reset_scheduled = False
@@ -5402,16 +5407,61 @@ mode_indicator_label = ttk.Label(root, text="MIX", font=("Helvetica", 48, "bold"
 
 # Thumbs up animated GIF support
 thumbs_up_frames = []
+thumbs_up_frames_by_color = {}
 thumbs_up_frame_index = [0]  # Use list for mutable reference
 thumbs_up_label = None
 thumbs_up_animation_id = None
 thumbs_up_visible = False
+thumbs_up_current_color = "green"
 THUMBS_UP_RELX = 0.88
 THUMBS_UP_RELY = 0.25
+THUMBS_UP_TINTS = {
+    "green": (0, 190, 0),
+    "red": (230, 0, 0),
+}
+
+def tint_thumbs_up_image(image, rgb):
+    """Tint a transparent thumbs-up image while keeping its shading and alpha."""
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    shade = rgba.convert("L")
+    red, green, blue = rgb
+    channels = [
+        shade.point(lambda value, base=base: int(base * (0.45 + 0.55 * (value / 255.0))))
+        for base in (red, green, blue)
+    ]
+    return Image.merge("RGBA", (*channels, alpha))
+
+
+def set_thumbs_up_color(color):
+    """Switch the thumbs-up image/text to match the gallon display color."""
+    global thumbs_up_frames, thumbs_up_current_color
+
+    color = "red" if color == "red" else "green"
+    if color == thumbs_up_current_color and thumbs_up_frames:
+        return
+
+    thumbs_up_current_color = color
+    if thumbs_up_frames_by_color:
+        thumbs_up_frames = thumbs_up_frames_by_color.get(color, thumbs_up_frames)
+        thumbs_up_frame_index[0] = min(thumbs_up_frame_index[0], max(len(thumbs_up_frames) - 1, 0))
+        if thumbs_up_label and thumbs_up_frames:
+            thumbs_up_label.config(image=thumbs_up_frames[thumbs_up_frame_index[0]])
+    elif thumbs_up_label:
+        thumbs_up_label.config(foreground=color)
+
+
+def show_thumbs_up(actual_gallons=None):
+    """Show thumbs-up with the same red/green state as the gallon text."""
+    if not thumbs_up_label or batch_mix_layout_active:
+        return
+    set_thumbs_up_color(target_display_color(actual_gallons))
+    thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
+    _set_thumbs_up_visible(True)
 
 def load_thumbs_up_gif():
     """Load thumbs up image (PNG or GIF) for display"""
-    global thumbs_up_frames, thumbs_up_label
+    global thumbs_up_frames, thumbs_up_frames_by_color, thumbs_up_label
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     png_candidates = [
@@ -5424,35 +5474,40 @@ def load_thumbs_up_gif():
     ]
     
     try:
-        from PIL import Image, ImageTk
-
         png_path = next((path for path in png_candidates if os.path.exists(path)), None)
         gif_path = next((path for path in gif_candidates if os.path.exists(path)), None)
+        base_frames = []
 
         # Try PNG first
         if png_path:
             img = Image.open(png_path)
             # Resize to fit nicely on screen
             img = img.resize((533, 533), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-            thumbs_up_frames = [photo]
+            base_frames = [img]
             print(f"Loaded thumbs up from PNG: {png_path}")
         elif gif_path:
             img = Image.open(gif_path)
             # Extract all frames from GIF
-            thumbs_up_frames = []
             try:
                 while True:
                     frame = img.copy()
                     frame = frame.resize((533, 533), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(frame)
-                    thumbs_up_frames.append(photo)
+                    base_frames.append(frame)
                     img.seek(img.tell() + 1)
             except EOFError:
                 pass
-            print(f"Loaded {len(thumbs_up_frames)} frames from thumbs up GIF")
+            print(f"Loaded {len(base_frames)} frames from thumbs up GIF")
         else:
-            thumbs_up_frames = []
+            base_frames = []
+
+        thumbs_up_frames_by_color = (
+            {
+                color: [ImageTk.PhotoImage(tint_thumbs_up_image(frame, rgb)) for frame in base_frames]
+                for color, rgb in THUMBS_UP_TINTS.items()
+            }
+            if base_frames else {}
+        )
+        thumbs_up_frames = thumbs_up_frames_by_color.get(thumbs_up_current_color, [])
         
         # Create label
         if thumbs_up_frames:
@@ -5501,8 +5556,9 @@ def update_dashboard():
     else:
         actual = read_flow_meter()
 
-    # Use green if flag is set, otherwise red
-    color = "green" if colors_are_green else "red"
+    color = target_display_color(actual)
+    if thumbs_up_visible:
+        set_thumbs_up_color(color)
 
     # Debug log color being used
     button_log = "/home/pi/button_debug.log"
