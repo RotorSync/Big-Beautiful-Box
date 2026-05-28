@@ -815,7 +815,9 @@ def refresh_batch_mix_totals():
 
     # Bottom 1/4 section - totals info
     bottom_y = int(height * 0.85)
-    label_y = bottom_y + 35
+    label_y = min(height - 28, bottom_y + 62)
+    value_font = ("Helvetica", 77, "bold")
+    label_font = ("Helvetica", 42, "bold")
 
     totals_data = [
         (width * 0.12, f"{batch_mix_data.get('total_acres', 0):.1f}", "ACRES"),
@@ -826,10 +828,10 @@ def refresh_batch_mix_totals():
 
     for x, value, label in totals_data:
         # Value - large cyan text
-        canvas.create_text(x, bottom_y, text=value, font=("Helvetica", 44, "bold"),
+        canvas.create_text(x, bottom_y, text=value, font=value_font,
                           fill="cyan", tags="totals")
         # Label below - smaller gray text
-        canvas.create_text(x, label_y, text=label, font=("Helvetica", 24, "bold"),
+        canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
 
 def refresh_batch_mix_products():
@@ -850,7 +852,7 @@ def refresh_batch_mix_products():
     products_x_end = width - 20
 
     start_y = int(height * 0.14)
-    row_height = int(height * 0.09)  # Height per product row
+    row_height = int(height * 0.105)  # Height per product row
 
     for i, prod in enumerate(products[:6]):  # Max 6 products
         y = start_y + (i * row_height)
@@ -860,8 +862,8 @@ def refresh_batch_mix_products():
         max_name_width = (products_x_end - products_x_start) // 2 - 20  # Half the products area
 
         # Start with larger font, scale down if needed
-        font_size = 40
-        while font_size >= 20:
+        font_size = 48
+        while font_size >= 24:
             test_id = canvas.create_text(0, 0, text=name,
                                         font=("Helvetica", font_size, "bold"),
                                         anchor="w", tags="temp_measure")
@@ -923,23 +925,23 @@ def refresh_batch_mix_products():
             if short_size:
                 # Draw jug size first at far right
                 jug_text_id = canvas.create_text(products_x_end - 10, y, text=short_size,
-                                  font=("Helvetica", 30, "bold"), fill="cyan",
+                                  font=("Helvetica", 38, "bold"), fill="cyan",
                                   anchor="e", tags="products")
                 # Get width of jug size text
                 bbox = canvas.bbox(jug_text_id)
                 jug_width = bbox[2] - bbox[0] if bbox else 150
                 # Draw amount to the left with some padding
                 canvas.create_text(products_x_end - 20 - jug_width, y, text=amount_text,
-                                  font=("Helvetica", 34, "bold"), fill="yellow",
+                                  font=("Helvetica", 44, "bold"), fill="yellow",
                                   anchor="e", tags="products")
             else:
                 canvas.create_text(products_x_end - 10, y, text=amount_text,
-                                  font=("Helvetica", 34, "bold"), fill="yellow",
+                                  font=("Helvetica", 44, "bold"), fill="yellow",
                                   anchor="e", tags="products")
         else:
             amount_text = f"{gallons:.1f} gal"
             canvas.create_text(products_x_end - 10, y, text=amount_text,
-                              font=("Helvetica", 28, "bold"), fill="yellow",
+                              font=("Helvetica", 38, "bold"), fill="yellow",
                               anchor="e", tags="products")
 
         # Draw subtle separator line under each product (except last)
@@ -958,7 +960,7 @@ def refresh_batch_mix_products():
     # Warning to double check jug sizes
     warning_y = start_y + (min(len(products), 6) * row_height) + 40
     canvas.create_text(width * 2 // 3, warning_y, text="Double check jug size!",
-                      font=("Helvetica", 16, "italic"), fill="red", tags="products")
+                      font=("Helvetica", 56, "bold italic"), fill="red", tags="products")
 
 def deactivate_batch_mix_layout():
     """Switch back to normal screen layout"""
