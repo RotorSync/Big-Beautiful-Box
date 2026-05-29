@@ -110,19 +110,28 @@ The system runs a BLE GATT server using [Bumble](https://github.com/google/bumbl
 
 Liquid product amounts are sent in ounces only. Each liquid product entry should
 include `amount_oz`; do not send jug count or jug-size fields for liquid
-products.
+products. Dry products use `amount_lb`. Product row colors are sent in the
+parallel `field_colors` list, using either solid `#RRGGBB` strings or two-color
+striped `#RRGGBB/#RRGGBB` strings. The first color entry is shown as the
+upper-left Mix badge color. If no color is present, the badge shows
+`NO COLOR MIX` with white/gray striping.
 
 ```json
 {
   "product_count": 2,
   "products": [
     {"name": "Miravis Ace", "amount_oz": 265},
-    {"name": "Verifact", "amount_oz": 77}
+    {"name": "AMS", "amount_lb": 20}
+  ],
+  "field_colors": [
+    {"color": "#00FF00"},
+    {"color": "#FF0000/#0000FF"}
   ],
   "water_needed": 36.0,
   "total_acres": 19.3,
   "gallons_per_acre": 2.0,
-  "total_liquid": 38.7
+  "total_liquid": 38.7,
+  "timestamp": "2026-05-28T21:08:00Z"
 }
 ```
 

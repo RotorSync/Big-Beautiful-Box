@@ -28,6 +28,7 @@ from bumble.core import UUID, AdvertisingData
 # Mopeka gallon conversion
 from src.mopeka_converter import mm_to_gallons, init as mopeka_init, reload as mopeka_reload
 from src.bluetooth_adapter_selection import list_bluetooth_adapters, select_adapters
+from src.batchmix_payload import batchmix_validation_error
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -619,9 +620,7 @@ def command_write_handler(connection, value):
     if command == 'set_batchmix':
         data = cmd.get('data')
         if isinstance(data, dict):
-            send_dashboard_command(
-                f'BATCHMIX:{json.dumps(data, separators=(",", ":"))}'
-            )
+            _send_validated_batchmix(json.dumps(data, separators=(",", ":")))
         else:
             print('Command write ignored: set_batchmix missing object data', flush=True)
         return
@@ -643,6 +642,26 @@ def gallons_write_handler(connection, value):
 # Chunked data buffer for batch mix (handles large payloads)
 batchmix_chunks = {}
 batchmix_chunk_timeout = 30  # Seconds before incomplete chunks expire
+
+def _send_validated_batchmix(compact_json):
+    """Validate and forward a compact BatchMix JSON payload to the dashboard."""
+    try:
+        data = json.loads(compact_json)
+    except json.JSONDecodeError as je:
+        error_msg = f'Invalid JSON: {je}'
+        print(f'BatchMix ERROR: {error_msg}', flush=True)
+        send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+        return False
+
+    error_msg = batchmix_validation_error(data)
+    if error_msg:
+        print(f'BatchMix ERROR: {error_msg}', flush=True)
+        send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+        return False
+
+    print(f'BatchMix validated: {len(data.get("products", []))} products', flush=True)
+    send_dashboard_command(f'BATCHMIX:{compact_json}')
+    return True
 
 def batchmix_write_handler(connection, value):
     """Handle batch mix data from iPad. Supports chunked or single-write JSON.
@@ -702,25 +721,7 @@ def batchmix_write_handler(connection, value):
                     # Strip newlines for socket transmission
                     compact_json = assembled.replace('\n', '').replace('\r', '')
 
-                    # Validate the data before sending
-                    try:
-                        import json
-                        data = json.loads(compact_json)
-                        product_count = data.get('product_count', 0)
-                        products = data.get('products', [])
-                        actual_count = len(products)
-
-                        if product_count != actual_count:
-                            error_msg = f"Product count mismatch: expected {product_count}, got {actual_count}"
-                            print(f'BatchMix ERROR: {error_msg}', flush=True)
-                            send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
-                        else:
-                            print(f'BatchMix validated: {actual_count} products', flush=True)
-                            send_dashboard_command(f'BATCHMIX:{compact_json}')
-                    except json.JSONDecodeError as je:
-                        error_msg = f"Invalid JSON: {je}"
-                        print(f'BatchMix ERROR: {error_msg}', flush=True)
-                        send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+                    _send_validated_batchmix(compact_json)
 
                     # Clear buffer
                     batchmix_chunks = {}
@@ -731,25 +732,7 @@ def batchmix_write_handler(connection, value):
             # Strip newlines for socket transmission
             compact_json = data_str.replace('\n', '').replace('\r', '')
 
-            # Validate the data before sending
-            try:
-                import json
-                data = json.loads(compact_json)
-                product_count = data.get('product_count', 0)
-                products = data.get('products', [])
-                actual_count = len(products)
-
-                if product_count != actual_count:
-                    error_msg = f"Product count mismatch: expected {product_count}, got {actual_count}"
-                    print(f'BatchMix ERROR: {error_msg}', flush=True)
-                    send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
-                else:
-                    print(f'BatchMix validated: {actual_count} products', flush=True)
-                    send_dashboard_command(f'BATCHMIX:{compact_json}')
-            except json.JSONDecodeError as je:
-                error_msg = f"Invalid JSON: {je}"
-                print(f'BatchMix ERROR: {error_msg}', flush=True)
-                send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+            _send_validated_batchmix(compact_json)
 
     except Exception as e:
         print(f'BatchMix error: {e}', flush=True)

@@ -15,6 +15,7 @@ import builtins
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
+from src.batchmix_payload import parse_field_color
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
@@ -790,6 +791,8 @@ def switch_mode(new_mode):
     colors_are_green = False
     serial_command_received = False
 
+    update_mix_mode_indicator()
+
     if current_mode == 'mix':
         if thumbs_up_animation_id:
             root.after_cancel(thumbs_up_animation_id)
@@ -801,7 +804,7 @@ def switch_mode(new_mode):
     # Update mode indicator
     if mode_indicator_label:
         if current_mode == 'mix':
-            mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+            place_mix_mode_indicator()
         else:
             mode_indicator_label.place_forget()
 
@@ -838,6 +841,7 @@ def update_batch_mix_overlay():
 
     # Only show batch mix layout in mix mode with data
     if current_mode == "mix" and batch_mix_data is not None:
+        place_mix_mode_indicator()
         if thumbs_up_animation_id:
             root.after_cancel(thumbs_up_animation_id)
             thumbs_up_animation_id = None
@@ -850,6 +854,7 @@ def update_batch_mix_overlay():
             refresh_batch_mix_products()
             refresh_batch_mix_totals()
     else:
+        update_mix_mode_indicator()
         if batch_mix_layout_active:
             deactivate_batch_mix_layout()
 
@@ -910,7 +915,7 @@ def activate_batch_mix_layout():
     left_center_x = width // 6
 
     # Draw "Requested:" label on left side
-    canvas.create_text(left_center_x, int(height * 0.08), text="Requested:",
+    canvas.create_text(left_center_x, int(height * 0.13), text="Requested:",
                       font=("Helvetica", 28, "bold"), fill="white", tags="labels")
 
     # Draw "Actual:" label on left side
@@ -982,13 +987,6 @@ def refresh_batch_mix_totals():
         canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
 
-def _batch_mix_product_ounces(prod):
-    """Return product volume in ounces from the BatchMix payload."""
-    try:
-        return max(0.0, float(prod.get("amount_oz", 0)))
-    except (TypeError, ValueError):
-        return 0.0
-
 def _format_batch_mix_product_amount(ounces):
     """Format product volume as gallons and ounces for display."""
     try:
@@ -1003,6 +1001,144 @@ def _format_batch_mix_product_amount(ounces):
     if whole_gallons:
         return f"{whole_gallons} gal"
     return f"{ounces} oz"
+
+def _format_batch_mix_product_display_amount(prod):
+    """Format the product amount from the BatchMix payload."""
+    if "amount_oz" in prod:
+        return _format_batch_mix_product_amount(prod.get("amount_oz", 0))
+
+    try:
+        pounds = max(0.0, float(prod.get("amount_lb", 0)))
+    except (TypeError, ValueError):
+        pounds = 0.0
+
+    if pounds == int(pounds):
+        return f"{int(pounds)} lb"
+    return f"{pounds:.1f} lb"
+
+def _hex_to_rgb(color):
+    """Convert #RRGGBB to an RGB tuple."""
+    return tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+
+def _contrast_text_color(background):
+    """Choose black or white text for readable contrast on a hex background."""
+    red, green, blue = _hex_to_rgb(background)
+    luminance = (0.299 * red) + (0.587 * green) + (0.114 * blue)
+    return "black" if luminance >= 150 else "white"
+
+def _batch_mix_badge_color():
+    """Return optional color for the Mix mode badge."""
+    colors = batch_mix_data.get("field_colors", []) if batch_mix_data else []
+    if not isinstance(colors, list) or not colors:
+        return None
+
+    entry = colors[0]
+    if not isinstance(entry, dict):
+        return None
+
+    color = entry.get("color")
+    return parse_field_color(color)
+
+def _striped_mix_badge_image(width, height, first_color, second_color):
+    """Return a two-color striped badge image."""
+    stripe_width = 18
+    first_rgb = _hex_to_rgb(first_color)
+    second_rgb = _hex_to_rgb(second_color)
+    image = Image.new("RGB", (width, height), first_rgb)
+    pixels = image.load()
+    for x in range(width):
+        stripe_color = second_rgb if (x // stripe_width) % 2 else first_rgb
+        for y in range(height):
+            pixels[x, y] = stripe_color
+    return ImageTk.PhotoImage(image)
+
+def _no_color_mix_badge_image(width, height):
+    """Return a white/gray striped badge image for no-color BatchMix payloads."""
+    return _striped_mix_badge_image(width, height, "#FFFFFF", "#BEBEBE")
+
+def _contrast_text_color_for_pair(first_color, second_color):
+    """Choose black or white text for readable contrast on a striped background."""
+    first_rgb = _hex_to_rgb(first_color)
+    second_rgb = _hex_to_rgb(second_color)
+    blended = "#%02X%02X%02X" % tuple(
+        int((first_rgb[index] + second_rgb[index]) / 2) for index in range(3)
+    )
+    return _contrast_text_color(blended)
+
+def update_mix_mode_indicator():
+    """Update the upper-left mix badge from the active BatchMix color."""
+    label = globals().get("mode_indicator_label")
+    if not label:
+        return
+
+    if current_mode != "mix" or batch_mix_data is None:
+        label._stripe_image = None
+        label.configure(
+            text="MIX",
+            foreground="cyan",
+            background="black",
+            image="",
+            compound="none",
+        )
+        return
+
+    _sync_canvas_geometry()
+    badge_width = max(180, _canvas_width() // 3)
+    badge_height = max(54, int(_canvas_height() * 0.085))
+    color_spec = _batch_mix_badge_color()
+    if not color_spec:
+        label._stripe_image = _no_color_mix_badge_image(badge_width, badge_height)
+        label.configure(
+            text="NO COLOR MIX",
+            foreground="black",
+            background="white",
+            image=label._stripe_image,
+            compound="center",
+        )
+        return
+
+    if color_spec[0] == "stripe":
+        first_color, second_color = color_spec[1], color_spec[2]
+        label._stripe_image = _striped_mix_badge_image(
+            badge_width, badge_height, first_color, second_color
+        )
+        label.configure(
+            text="MIX",
+            foreground=_contrast_text_color_for_pair(first_color, second_color),
+            background=first_color,
+            image=label._stripe_image,
+            compound="center",
+        )
+        return
+
+    color = color_spec[1]
+    label._stripe_image = None
+    label.configure(
+        text="MIX",
+        foreground=_contrast_text_color(color),
+        background=color,
+        image="",
+        compound="none",
+    )
+
+def place_mix_mode_indicator():
+    """Place the Mix badge across the left panel up to the divider."""
+    if not mode_indicator_label:
+        return
+
+    if current_mode != "mix" or batch_mix_data is None:
+        mode_indicator_label.place_forget()
+        return
+
+    _sync_canvas_geometry()
+    update_mix_mode_indicator()
+    mode_indicator_label.place(
+        x=0,
+        y=0,
+        width=max(180, _canvas_width() // 3),
+        height=max(54, int(_canvas_height() * 0.085)),
+        anchor="nw",
+    )
 
 def refresh_batch_mix_products():
     """Draw/update products list on canvas"""
@@ -1050,7 +1186,7 @@ def refresh_batch_mix_products():
                           anchor="w", tags="products")
 
         # Amount (right side)
-        amount_text = _format_batch_mix_product_amount(_batch_mix_product_ounces(prod))
+        amount_text = _format_batch_mix_product_display_amount(prod)
         max_amount_width = (products_x_end - products_x_start) // 2 - 20
         amount_font_size = 44
         while amount_font_size >= 30:
@@ -1154,7 +1290,7 @@ def redraw_numbers_for_batch_mix():
     color = target_display_color(actual_gallons)
 
     # Requested number - smaller font for left panel
-    req_y = int(height * 0.22)
+    req_y = int(height * 0.27)
     req_font = ("Helvetica", 90, "bold")
     req_text = f"{requested_gallons:.0f}"
 
@@ -5506,8 +5642,9 @@ manual_label = ttk.Label(root, text="MANUAL", font=("Helvetica", 90, "bold"),
 # manual_label.pack_forget()
 
 # Mix Mode Indicator Label (shown in top-left corner when in mix mode)
-mode_indicator_label = ttk.Label(root, text="MIX", font=("Helvetica", 48, "bold"),
-                                 foreground="cyan", background="black")
+mode_indicator_label = tk.Label(root, text="MIX", font=("Helvetica", 38, "bold"),
+                                foreground="cyan", background="black",
+                                padx=14, pady=4, bd=0)
 # mode_indicator_label initially hidden, shown via place() when in mix mode
 
 # Thumbs up animated GIF support
@@ -6260,7 +6397,7 @@ else:
     requested_gallons = mix_requested_gallons
     # Show mode indicator if starting in mix mode
     if mode_indicator_label:
-        mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+        place_mix_mode_indicator()
 print(f"Loaded mode - Mode: {current_mode}, Requested: {requested_gallons}, Fill preset: {fill_requested_gallons}, Mix preset: {mix_requested_gallons}")
 
 # Redraw requested gallons with the loaded value
