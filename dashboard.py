@@ -780,6 +780,9 @@ def switch_mode(new_mode):
     if current_mode == 'mix' and new_mode == 'fill' and current_actual_gallons > 0 and current_flow_gpm < 10:
         root.after(0, lambda: force_flow_reset("mix_to_fill_low_flow"))
 
+    if current_mode == 'fill' and new_mode == 'mix' and current_actual_gallons > 0 and current_flow_gpm < 10:
+        root.after(0, lambda: force_flow_reset("fill_to_mix_low_flow"))
+
     # Switch to new mode and load its preset
     current_mode = new_mode
     if current_mode == 'fill':
