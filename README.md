@@ -110,24 +110,38 @@ The system runs a BLE GATT server using [Bumble](https://github.com/google/bumbl
 
 Liquid product amounts are sent in ounces only. Each liquid product entry should
 include `amount_oz`; do not send jug count or jug-size fields for liquid
-products. Dry products use `amount_lb`. Product row colors are sent in the
-parallel `field_colors` list, using either solid `#RRGGBB` strings or two-color
-striped `#RRGGBB/#RRGGBB` strings. The first color entry is shown as the
-upper-left Mix badge color. If no color is present, the badge shows
-`NO COLOR MIX` with white/gray striping.
+products. Dry products use `amount_lb`. Product rate fields are optional, but
+when sent they must include both `rate_per_acre` and `rate_unit`. Liquid rates
+use `oz/ac`; dry rates use `lb/ac`.
 
-When this BatchMix screen is active, knob adjustments change `total_acres` and
-the box scales product amounts, `total_liquid`, and `water_needed` from that
-acre change. The first knob turn snaps acres to the nearest whole acre before
-applying the step. `gallons_per_acre` remains unchanged, and `water_needed`
+Product row colors are sent in the parallel `field_colors` list, using either
+solid `#RRGGBB` strings or two-color striped `#RRGGBB/#RRGGBB` strings. The
+first color entry is shown as the upper-left Mix badge color. If no color is
+present, the badge shows `NO COLOR MIX` with white/gray striping.
+
+When this BatchMix screen is active, knob adjustments change `water_needed`.
+The box scales `total_acres`, product amounts, and `total_liquid` from that
+gallon change. If a product includes rate fields, its amount is recalculated
+from `rate_per_acre * total_acres`; otherwise the older proportional amount
+scaling is used. `gallons_per_acre` remains unchanged, and `water_needed`
 remains the pump target.
 
 ```json
 {
   "product_count": 2,
   "products": [
-    {"name": "Miravis Ace", "amount_oz": 265},
-    {"name": "AMS", "amount_lb": 20}
+    {
+      "name": "Miravis Ace",
+      "amount_oz": 265,
+      "rate_per_acre": 26.5,
+      "rate_unit": "oz/ac"
+    },
+    {
+      "name": "AMS",
+      "amount_lb": 20,
+      "rate_per_acre": 2,
+      "rate_unit": "lb/ac"
+    }
   ],
   "field_colors": [
     {"color": "#00FF00"},

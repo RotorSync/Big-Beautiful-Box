@@ -15,7 +15,10 @@ import builtins
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
-from src.batchmix_payload import parse_field_color, scaled_batchmix_payload
+from src.batchmix_payload import (
+    parse_field_color,
+    scaled_batchmix_payload_for_water,
+)
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
@@ -975,8 +978,9 @@ def refresh_batch_mix_totals():
     value_font = ("Helvetica", 77, "bold")
     label_font = ("Helvetica", 42, "bold")
 
+    acres_format = ".2f" if _batch_mix_has_product_rates() else ".1f"
     totals_data = [
-        (width * 0.12, f"{batch_mix_data.get('total_acres', 0):.1f}", "ACRES"),
+        (width * 0.12, f"{batch_mix_data.get('total_acres', 0):{acres_format}}", "ACRES"),
         (width * 0.37, f"{batch_mix_data.get('gallons_per_acre', 0):.1f}", "GAL/AC"),
         (width * 0.62, f"{batch_mix_data.get('total_liquid', 0):.1f}", "TOTAL GAL"),
         (width * 0.87, f"{batch_mix_data.get('water_needed', 0):.1f}", "WATER"),
@@ -1005,20 +1009,21 @@ def _format_batch_mix_target(value):
         return f"{int(value)}"
     return f"{value:.1f}"
 
-def adjust_batch_mix_acres(delta, source):
-    """Adjust BatchMix acres and scale all formula amounts from that change."""
+def adjust_batch_mix_gallons(delta, source):
+    """Adjust BatchMix gallons and scale all formula amounts from that change."""
     global batch_mix_data, requested_gallons, mix_requested_gallons, colors_are_green
 
     if not _batch_mix_payload_active():
         return False
 
     try:
-        old_acres = float(batch_mix_data.get("total_acres", 0))
-        new_acres = max(1.0, round(old_acres) + float(delta))
-        batch_mix_data = scaled_batchmix_payload(batch_mix_data, new_acres)
+        old_water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        water_needed = max(1.0, old_water_needed + float(delta))
+        batch_mix_data = scaled_batchmix_payload_for_water(batch_mix_data, water_needed)
         water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        new_acres = float(batch_mix_data.get("total_acres", 0))
     except Exception as exc:
-        msg = f"{source}: BatchMix acre adjust failed: {exc}"
+        msg = f"{source}: BatchMix gallon adjust failed: {exc}"
         print(msg)
         try:
             with open(debug_log, "a") as f:
@@ -1033,8 +1038,8 @@ def adjust_batch_mix_acres(delta, source):
     save_mode_presets()
 
     msg = (
-        f"{source}: Adjusted BatchMix acres by {delta:+.0f}, "
-        f"acres now {new_acres:.1f}, water target {water_needed:.1f} gal"
+        f"{source}: Adjusted BatchMix gallons by {delta:+.0f}, "
+        f"water target {water_needed:.1f} gal, acres now {new_acres:.1f}"
     )
     print(msg)
     try:
@@ -1075,6 +1080,54 @@ def _format_batch_mix_product_display_amount(prod):
     if pounds == int(pounds):
         return f"{int(pounds)} lb"
     return f"{pounds:.1f} lb"
+
+def _format_batch_mix_product_rate(prod):
+    """Format the optional product rate from the BatchMix payload."""
+    if "rate_per_acre" not in prod or "rate_unit" not in prod:
+        return ""
+
+    try:
+        rate = max(0.0, float(prod.get("rate_per_acre")))
+    except (TypeError, ValueError):
+        return ""
+
+    rate_unit = prod.get("rate_unit")
+    if not isinstance(rate_unit, str):
+        return ""
+
+    rate_unit = rate_unit.strip()
+    if rate_unit not in ("oz/ac", "lb/ac"):
+        return ""
+
+    if rate == int(rate):
+        rate_text = f"{int(rate)}"
+    else:
+        rate_text = f"{rate:.1f}"
+    return f"{rate_text}{rate_unit}"
+
+def _format_batch_mix_product_name(prod):
+    """Format product name with optional compact rate."""
+    name = prod.get("name", "Unknown")
+    return name
+
+def _batch_mix_has_product_rates():
+    products = batch_mix_data.get("products", []) if batch_mix_data else []
+    if not isinstance(products, list):
+        return False
+    return any(
+        isinstance(product, dict)
+        and "rate_per_acre" in product
+        and "rate_unit" in product
+        for product in products
+    )
+
+def _text_width(text, font, anchor="w"):
+    test_id = canvas.create_text(0, 0, text=text, font=font,
+                                anchor=anchor, tags="temp_measure")
+    bbox = canvas.bbox(test_id)
+    width = bbox[2] - bbox[0] if bbox else 0
+    canvas.delete(test_id)
+    return width
 
 def _hex_to_rgb(color):
     """Convert #RRGGBB to an RGB tuple."""
@@ -1224,18 +1277,20 @@ def refresh_batch_mix_products():
         y = start_y + (i * row_height)
 
         # Product name (left side of products area) - auto-scale to fit
-        name = prod.get("name", "Unknown")
+        name = _format_batch_mix_product_name(prod)
+        rate_text = _format_batch_mix_product_rate(prod)
+        rate_suffix = f" ({rate_text})" if rate_text else ""
         max_name_width = (products_x_end - products_x_start) // 2 - 20  # Half the products area
 
         # Start with larger font, scale down if needed
         font_size = 48
-        while font_size >= 24:
-            test_id = canvas.create_text(0, 0, text=name,
-                                        font=("Helvetica", font_size, "bold"),
-                                        anchor="w", tags="temp_measure")
-            bbox = canvas.bbox(test_id)
-            text_width = bbox[2] - bbox[0] if bbox else 0
-            canvas.delete(test_id)
+        while font_size >= 22:
+            rate_font_size = max(16, int(font_size * 0.62))
+            text_width = _text_width(name, ("Helvetica", font_size, "bold"))
+            if rate_suffix:
+                text_width += _text_width(
+                    rate_suffix, ("Helvetica", rate_font_size, "bold")
+                )
 
             if text_width <= max_name_width:
                 break
@@ -1244,6 +1299,14 @@ def refresh_batch_mix_products():
         canvas.create_text(products_x_start + 10, y, text=name,
                           font=("Helvetica", font_size, "bold"), fill="white",
                           anchor="w", tags="products")
+
+        if rate_suffix:
+            rate_font_size = max(16, int(font_size * 0.62))
+            name_width = _text_width(name, ("Helvetica", font_size, "bold"))
+            canvas.create_text(products_x_start + 10 + name_width, y,
+                              text=rate_suffix,
+                              font=("Helvetica", rate_font_size, "bold"),
+                              fill="cyan", anchor="w", tags="products")
 
         # Amount (right side)
         amount_text = _format_batch_mix_product_display_amount(prod)
@@ -4693,7 +4756,7 @@ def socket_command_listener():
                             elif line in ['+1', '-1', '+10', '-10']:
                                 try:
                                     adjustment = int(line)
-                                    if adjust_batch_mix_acres(adjustment, "Socket"):
+                                    if adjust_batch_mix_gallons(adjustment, "Socket"):
                                         continue
                                     requested_gallons += adjustment
                                     if requested_gallons < 0:
@@ -5063,7 +5126,7 @@ def serial_listener():
                                 if line in ['+1', '-1', '+10', '-10']:
                                     try:
                                         adjustment = int(line)
-                                        if adjust_batch_mix_acres(adjustment, "Serial"):
+                                        if adjust_batch_mix_gallons(adjustment, "Serial"):
                                             continue
                                         requested_gallons += adjustment
                                         # Don't allow requested gallons to go below zero
@@ -6243,7 +6306,7 @@ def _sim_send_command(line):
 
     if line in ["+1", "-1", "+10", "-10"]:
         adjustment = int(line)
-        if adjust_batch_mix_acres(adjustment, "Sim"):
+        if adjust_batch_mix_gallons(adjustment, "Sim"):
             return
         requested_gallons = max(0, requested_gallons + adjustment)
         colors_are_green = False

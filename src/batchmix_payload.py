@@ -57,6 +57,28 @@ def batchmix_validation_error(data):
         if amount <= 0:
             return f"Product {index} {amount_key} must be positive"
 
+        has_rate = "rate_per_acre" in product
+        has_rate_unit = "rate_unit" in product
+        if has_rate != has_rate_unit:
+            return f"Product {index} rate_per_acre and rate_unit must be sent together"
+
+        if has_rate:
+            try:
+                rate = float(product["rate_per_acre"])
+            except (TypeError, ValueError):
+                return f"Product {index} rate_per_acre must be numeric"
+
+            if rate <= 0:
+                return f"Product {index} rate_per_acre must be positive"
+
+            rate_unit = product.get("rate_unit")
+            if not isinstance(rate_unit, str):
+                return f"Product {index} rate_unit must be a string"
+
+            expected_rate_unit = "oz/ac" if amount_key == "amount_oz" else "lb/ac"
+            if rate_unit.strip() != expected_rate_unit:
+                return f"Product {index} rate_unit must be {expected_rate_unit}"
+
     field_colors = data.get("field_colors", [])
     if field_colors is None:
         return None
@@ -84,31 +106,62 @@ def _positive_float(value, field_name):
     return parsed
 
 
+def _nonnegative_float(value, field_name):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be nonnegative")
+    return parsed
+
+
 def _scale_numeric_field(data, key, ratio):
     if key not in data:
-        return
+        return None
     try:
         data[key] = float(data[key]) * ratio
+        return data[key]
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{key} must be numeric") from exc
 
 
-def scaled_batchmix_payload(data, new_acres):
-    """Return a copy of a BatchMix payload scaled to a new acre count."""
-    old_acres = _positive_float(data.get("total_acres"), "total_acres")
-    new_acres = _positive_float(new_acres, "new_acres")
-    ratio = new_acres / old_acres
+def _recalculate_product_amount_from_rate(product, total_acres):
+    if total_acres is None or "rate_per_acre" not in product:
+        return False
+
+    rate = _positive_float(product.get("rate_per_acre"), "rate_per_acre")
+    rate_unit = product.get("rate_unit")
+    if isinstance(rate_unit, str):
+        rate_unit = rate_unit.strip()
+    if "amount_oz" in product and rate_unit == "oz/ac":
+        product["amount_oz"] = rate * total_acres
+        return True
+    if "amount_lb" in product and rate_unit == "lb/ac":
+        product["amount_lb"] = rate * total_acres
+        return True
+    return False
+
+
+def scaled_batchmix_payload_for_water(data, new_water_needed):
+    """Return a copy of a BatchMix payload scaled to a new water target."""
+    old_water_needed = _positive_float(data.get("water_needed"), "water_needed")
+    new_water_needed = _nonnegative_float(new_water_needed, "new_water_needed")
+    ratio = new_water_needed / old_water_needed
 
     scaled = copy.deepcopy(data)
-    scaled["total_acres"] = new_acres
+    scaled["water_needed"] = new_water_needed
 
-    _scale_numeric_field(scaled, "water_needed", ratio)
+    total_acres = _scale_numeric_field(scaled, "total_acres", ratio)
     _scale_numeric_field(scaled, "total_liquid", ratio)
 
     products = scaled.get("products", [])
     if isinstance(products, list):
         for product in products:
             if not isinstance(product, dict):
+                continue
+            if _recalculate_product_amount_from_rate(product, total_acres):
                 continue
             _scale_numeric_field(product, "amount_oz", ratio)
             _scale_numeric_field(product, "amount_lb", ratio)
