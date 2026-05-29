@@ -15,7 +15,7 @@ import builtins
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
-from src.batchmix_payload import parse_field_color
+from src.batchmix_payload import parse_field_color, scaled_batchmix_payload
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
@@ -986,6 +986,63 @@ def refresh_batch_mix_totals():
         # Label below - smaller gray text
         canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
+
+def _batch_mix_payload_active():
+    """Return True when the visible BatchMix screen should own knob adjustments."""
+    return current_mode == "mix" and batch_mix_data is not None
+
+def _format_batch_mix_target(value):
+    """Format the water target for the requested-gallons display."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 0.0
+
+    if value == int(value):
+        return f"{int(value)}"
+    return f"{value:.1f}"
+
+def adjust_batch_mix_acres(delta, source):
+    """Adjust BatchMix acres and scale all formula amounts from that change."""
+    global batch_mix_data, requested_gallons, mix_requested_gallons, colors_are_green
+
+    if not _batch_mix_payload_active():
+        return False
+
+    try:
+        old_acres = float(batch_mix_data.get("total_acres", 0))
+        new_acres = max(1.0, round(old_acres) + float(delta))
+        batch_mix_data = scaled_batchmix_payload(batch_mix_data, new_acres)
+        water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+    except Exception as exc:
+        msg = f"{source}: BatchMix acre adjust failed: {exc}"
+        print(msg)
+        try:
+            with open(debug_log, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        except Exception:
+            pass
+        return True
+
+    requested_gallons = water_needed
+    mix_requested_gallons = water_needed
+    colors_are_green = False
+    save_mode_presets()
+
+    msg = (
+        f"{source}: Adjusted BatchMix acres by {delta:+.0f}, "
+        f"acres now {new_acres:.1f}, water target {water_needed:.1f} gal"
+    )
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, update_batch_mix_overlay)
+    root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
+    return True
 
 def _format_batch_mix_product_amount(ounces):
     """Format product volume as gallons and ounces for display."""
@@ -4633,6 +4690,8 @@ def socket_command_listener():
                             elif line in ['+1', '-1', '+10', '-10']:
                                 try:
                                     adjustment = int(line)
+                                    if adjust_batch_mix_acres(adjustment, "Socket"):
+                                        continue
                                     requested_gallons += adjustment
                                     if requested_gallons < 0:
                                         requested_gallons = 0
@@ -5001,6 +5060,8 @@ def serial_listener():
                                 if line in ['+1', '-1', '+10', '-10']:
                                     try:
                                         adjustment = int(line)
+                                        if adjust_batch_mix_acres(adjustment, "Serial"):
+                                            continue
                                         requested_gallons += adjustment
                                         # Don't allow requested gallons to go below zero
                                         if requested_gallons < 0:
@@ -6179,6 +6240,8 @@ def _sim_send_command(line):
 
     if line in ["+1", "-1", "+10", "-10"]:
         adjustment = int(line)
+        if adjust_batch_mix_acres(adjustment, "Sim"):
+            return
         requested_gallons = max(0, requested_gallons + adjustment)
         colors_are_green = False
         if current_mode == "fill":

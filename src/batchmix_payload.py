@@ -1,5 +1,7 @@
 """BatchMix payload validation helpers shared by runtime and tests."""
 
+import copy
+
 
 def is_hex_color(value):
     """Return True for #RRGGBB color strings."""
@@ -69,3 +71,46 @@ def batchmix_validation_error(data):
             return f"field_colors[{index}].color must be #RRGGBB or #RRGGBB/#RRGGBB"
 
     return None
+
+
+def _positive_float(value, field_name):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return parsed
+
+
+def _scale_numeric_field(data, key, ratio):
+    if key not in data:
+        return
+    try:
+        data[key] = float(data[key]) * ratio
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be numeric") from exc
+
+
+def scaled_batchmix_payload(data, new_acres):
+    """Return a copy of a BatchMix payload scaled to a new acre count."""
+    old_acres = _positive_float(data.get("total_acres"), "total_acres")
+    new_acres = _positive_float(new_acres, "new_acres")
+    ratio = new_acres / old_acres
+
+    scaled = copy.deepcopy(data)
+    scaled["total_acres"] = new_acres
+
+    _scale_numeric_field(scaled, "water_needed", ratio)
+    _scale_numeric_field(scaled, "total_liquid", ratio)
+
+    products = scaled.get("products", [])
+    if isinstance(products, list):
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            _scale_numeric_field(product, "amount_oz", ratio)
+            _scale_numeric_field(product, "amount_lb", ratio)
+
+    return scaled

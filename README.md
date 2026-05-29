@@ -116,6 +116,12 @@ striped `#RRGGBB/#RRGGBB` strings. The first color entry is shown as the
 upper-left Mix badge color. If no color is present, the badge shows
 `NO COLOR MIX` with white/gray striping.
 
+When this BatchMix screen is active, knob adjustments change `total_acres` and
+the box scales product amounts, `total_liquid`, and `water_needed` from that
+acre change. The first knob turn snaps acres to the nearest whole acre before
+applying the step. `gallons_per_acre` remains unchanged, and `water_needed`
+remains the pump target.
+
 ```json
 {
   "product_count": 2,
