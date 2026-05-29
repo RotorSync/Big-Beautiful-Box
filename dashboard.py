@@ -546,10 +546,11 @@ def _set_pump_stop_output(active, reason):
 
 
 def set_pump_stop_fault_hold(active, reason="flow meter fault"):
-    """Hold pump-stop relay high while the flow meter is unavailable."""
+    """Latch flow-meter fault status and pulse pump stop when the fault starts."""
     global pump_stop_fault_hold_active, pump_stop_fault_hold_reason
 
     reason = reason or "flow meter fault"
+    pulse_fault_stop = False
     with pump_stop_relay_lock:
         if active:
             if pump_stop_fault_hold_active:
@@ -559,26 +560,26 @@ def set_pump_stop_fault_hold(active, reason="flow meter fault"):
                 return
             pump_stop_fault_hold_active = True
             pump_stop_fault_hold_reason = reason
-            _set_pump_stop_output(True, f"fault hold active: {reason}")
-            log_flow_control(f"pump_stop_fault_hold_active | reason={reason}")
-            return
-
-        if not pump_stop_fault_hold_active:
-            return
-        previous_reason = pump_stop_fault_hold_reason
-        pump_stop_fault_hold_active = False
-        pump_stop_fault_hold_reason = ""
-        if pump_stop_pulse_count == 0:
-            _set_pump_stop_output(False, f"fault hold cleared: {previous_reason}")
+            pulse_fault_stop = True
+            log_flow_control(f"pump_stop_fault_latch_active | reason={reason}")
         else:
-            log_relay_event(
-                f"Fault hold cleared but relay remains HIGH for {pump_stop_pulse_count} active pulse(s)"
-            )
-        log_flow_control(f"pump_stop_fault_hold_cleared | reason={previous_reason}")
+            if not pump_stop_fault_hold_active:
+                return
+            previous_reason = pump_stop_fault_hold_reason
+            pump_stop_fault_hold_active = False
+            pump_stop_fault_hold_reason = ""
+            log_flow_control(f"pump_stop_fault_latch_cleared | reason={previous_reason}")
+
+    if pulse_fault_stop:
+        log_flow_control(
+            f"pump_stop_fault_momentary_stop | reason={reason}"
+            f" | duration={config.PUMP_STOP_DURATION}s"
+        )
+        start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
 
 def update_flow_meter_fault_hold(flow_meter_disconnected=None):
-    """Hold pump-stop relay whenever the flow meter is disconnected or stale."""
+    """Pulse pump stop and latch warning while the flow meter is disconnected or stale."""
     global flow_meter_reconnect_fresh_reads
     global flow_meter_reconnect_started_at, flow_meter_reconnect_last_status_check
     global flow_meter_reconnect_status_ok
@@ -600,30 +601,21 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
         now = time.time()
         required_reads = max(1, int(getattr(config, "FLOW_METER_RECONNECT_FRESH_READS", 3)))
         stable_seconds = max(0.0, float(getattr(config, "FLOW_METER_RECONNECT_STABLE_SECONDS", 10.0)))
-        if last_flow_read_was_fresh and not iol_power_cycle_in_progress:
-            if flow_meter_reconnect_started_at <= 0:
-                flow_meter_reconnect_started_at = now
-            flow_meter_reconnect_fresh_reads += 1
-            log_flow_control(
-                "flow_meter_reconnect_fresh"
-                f" | count={flow_meter_reconnect_fresh_reads}"
-                f" | required={required_reads}"
-            )
-        elif iol_power_cycle_in_progress:
+        if iol_power_cycle_in_progress:
             flow_meter_reconnect_started_at = 0.0
             flow_meter_reconnect_fresh_reads = 0
             flow_meter_reconnect_status_ok = False
-
-        if now - flow_meter_reconnect_last_status_check >= 1.0:
+        elif now - flow_meter_reconnect_last_status_check >= 1.0:
             flow_meter_reconnect_last_status_check = now
             try:
-                with iol_io_lock:
-                    st = iolhat.readStatus2(config.IOL_PORT)
-                flow_meter_reconnect_status_ok = (
-                    st.pd_in_valid == 1
-                    and st.transmission_rate != 0
-                    and st.error == 0
-                )
+                flow_meter_reconnect_status_ok, st = _read_iol_status_ok()
+                if flow_meter_reconnect_status_ok:
+                    if flow_meter_reconnect_started_at <= 0:
+                        flow_meter_reconnect_started_at = now
+                    flow_meter_reconnect_fresh_reads += 1
+                else:
+                    flow_meter_reconnect_started_at = 0.0
+                    flow_meter_reconnect_fresh_reads = 0
                 log_flow_control(
                     "flow_meter_reconnect_status"
                     f" | ok={flow_meter_reconnect_status_ok}"
@@ -633,6 +625,8 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
                 )
             except Exception as exc:
                 flow_meter_reconnect_status_ok = False
+                flow_meter_reconnect_started_at = 0.0
+                flow_meter_reconnect_fresh_reads = 0
                 log_flow_control(f"flow_meter_reconnect_status | ok=False | error={exc}")
 
         stable_elapsed = (
@@ -651,7 +645,7 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
                     f"waiting for stable flow meter recovery ({stable_elapsed:.1f}/{stable_seconds:.1f}s)",
                 )
         else:
-            set_pump_stop_fault_hold(True, "waiting for stable flow meter recovery")
+            set_pump_stop_fault_hold(True, "waiting for healthy flow meter status")
     else:
         flow_meter_reconnect_fresh_reads = 0
         flow_meter_reconnect_started_at = 0.0
@@ -1777,19 +1771,19 @@ def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
         relay_released = False
         with pump_stop_relay_lock:
             pump_stop_pulse_count = max(0, pump_stop_pulse_count - 1)
-            if pump_stop_pulse_count == 0 and not pump_stop_fault_hold_active:
+            if pump_stop_pulse_count == 0:
                 _set_pump_stop_output(False, "pulse complete")
                 relay_released = True
             else:
                 log_relay_event(
                     "Pulse complete; relay remains HIGH "
-                    f"(active_pulses={pump_stop_pulse_count}, fault_hold={pump_stop_fault_hold_active})"
+                    f"(active_pulses={pump_stop_pulse_count})"
                 )
 
         msg = (
             f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
             if relay_released
-            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH"
+            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH by active pulse"
         )
         print(msg)
         log_relay_event(msg)
@@ -4105,14 +4099,20 @@ def _try_iol_power_cycle():
 def _log_iol_disconnect_status(reason):
     """Read STATUS2 and log the hardware error byte when a disconnect is first detected."""
     try:
-        with iol_io_lock:
-            st = iolhat.readStatus2(config.IOL_PORT)
+        _, st = _read_iol_status_ok()
         print(f"IOL DISCONNECT [{reason}]: pdInValid={st.pd_in_valid}, "
               f"txRate=0x{st.transmission_rate:02X}, "
               f"cycleTime=0x{st.master_cycle_time:02X}, "
               f"error=0x{st.error:02X}, power={st.power}", flush=True)
     except Exception as e:
         print(f"IOL DISCONNECT [{reason}]: STATUS2 read failed: {e}", flush=True)
+
+def _read_iol_status_ok():
+    """Return whether IO-Link status indicates valid process data."""
+    with iol_io_lock:
+        st = iolhat.readStatus2(config.IOL_PORT)
+    ok = st.pd_in_valid == 1 and st.transmission_rate != 0 and st.error == 0
+    return ok, st
 
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
@@ -4147,25 +4147,55 @@ def read_flow_meter():
                 print(f"Flow meter reconnected - valid data received", flush=True)
 
             raw_data_changed = raw_data != last_raw_data
+            raw_flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
 
-            # Check for stale data (byte-for-byte identical reads = meter disconnected)
-            # A connected meter always has micro-fluctuations in the raw bytes
+            # Identical idle process data can be valid at zero flow. Only treat
+            # repeated identical bytes as stale if IO-Link status is unhealthy
+            # or the frozen data claims flow is still active.
             if not raw_data_changed:
                 consecutive_identical_raw += 1
                 stale_threshold = stale_raw_threshold_reads()
                 if consecutive_identical_raw >= stale_threshold:
-                    connection_error = True
-                    stale_secs = consecutive_identical_raw * flow_read_interval_seconds()
-                    error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
-                    if consecutive_identical_raw == stale_threshold:
-                        print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
-                        _log_iol_disconnect_status("stale data")
-                        try:
-                            iolhat.led(config.IOL_PORT, iolhat.LED_RED)
-                        except:
-                            pass
-                    _try_iol_power_cycle()
-                    return last_totalizer_liters * config.LITERS_TO_GALLONS
+                    try:
+                        status_ok, st = _read_iol_status_ok()
+                    except Exception:
+                        status_ok = False
+                        st = None
+
+                    if status_ok and abs(raw_flow_rate_l_per_s) < config.FLOW_STOPPED_THRESHOLD:
+                        if consecutive_identical_raw == stale_threshold:
+                            print("Flow meter identical idle data accepted with healthy IO-Link status", flush=True)
+                            log_flow_control(
+                                "flow_meter_identical_data_ok"
+                                f" | count={consecutive_identical_raw}"
+                                f" | flow_lps={raw_flow_rate_l_per_s:.6f}"
+                                f" | pdInValid={st.pd_in_valid}"
+                                f" | txRate=0x{st.transmission_rate:02X}"
+                                f" | error=0x{st.error:02X}"
+                            )
+                        consecutive_identical_raw = 0
+                    else:
+                        if st is not None and consecutive_identical_raw == stale_threshold:
+                            log_flow_control(
+                                "flow_meter_identical_data_bad_status"
+                                f" | count={consecutive_identical_raw}"
+                                f" | flow_lps={raw_flow_rate_l_per_s:.6f}"
+                                f" | pdInValid={st.pd_in_valid}"
+                                f" | txRate=0x{st.transmission_rate:02X}"
+                                f" | error=0x{st.error:02X}"
+                            )
+                        connection_error = True
+                        stale_secs = consecutive_identical_raw * flow_read_interval_seconds()
+                        error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
+                        if consecutive_identical_raw == stale_threshold:
+                            print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
+                            _log_iol_disconnect_status("stale data")
+                            try:
+                                iolhat.led(config.IOL_PORT, iolhat.LED_RED)
+                            except:
+                                pass
+                        _try_iol_power_cycle()
+                        return last_totalizer_liters * config.LITERS_TO_GALLONS
             else:
                 if consecutive_identical_raw >= stale_raw_threshold_reads():
                     print(f"Flow meter data flowing again", flush=True)
@@ -4174,7 +4204,7 @@ def read_flow_meter():
 
             # Decode the data according to Picomag format
             totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
-            flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
+            flow_rate_l_per_s = raw_flow_rate_l_per_s
             detect_totalizer_reset(totalizer_liters)
 
             last_totalizer_liters = totalizer_liters
