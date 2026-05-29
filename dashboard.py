@@ -930,11 +930,11 @@ def activate_batch_mix_layout():
 
     # Separator line above totals (bottom 1/4)
     canvas.create_line(0, int(height * 0.75), width, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
+                      fill="cyan", width=8, tags="batchmix")
 
     # Vertical separator between left and right sections
     canvas.create_line(width // 3, 0, width // 3, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
+                      fill="cyan", width=8, tags="batchmix")
 
     # Products section title (right 2/3, top area)
     products_x = width * 2 // 3
@@ -1412,9 +1412,9 @@ def redraw_numbers_for_batch_mix():
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
     color = target_display_color(actual_gallons)
 
-    # Requested number - smaller font for left panel
+    # Requested number - left panel
     req_y = int(height * 0.27)
-    req_font = ("Helvetica", 90, "bold")
+    req_font = ("Helvetica", 151, "bold")
     req_text = f"{requested_gallons:.0f}"
 
     if req_text != _last_batch_requested_text or color != _last_batch_requested_color:
@@ -1427,9 +1427,9 @@ def redraw_numbers_for_batch_mix():
         _last_batch_requested_text = req_text
         _last_batch_requested_color = color
 
-    # Actual number - smaller font for left panel
+    # Actual number - left panel
     act_y = int(height * 0.55)
-    act_font = ("Helvetica", 110, "bold")
+    act_font = ("Helvetica", 185, "bold")
     act_text = f"{actual_gallons:.1f}"
 
     if act_text != _last_batch_actual_text or color != _last_batch_actual_color:
