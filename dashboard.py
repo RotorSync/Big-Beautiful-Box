@@ -859,6 +859,7 @@ def update_batch_mix_overlay():
         else:
             refresh_batch_mix_products()
             refresh_batch_mix_totals()
+            refresh_batch_mix_tank_levels()
     else:
         update_mix_mode_indicator()
         if batch_mix_layout_active:
@@ -937,9 +938,10 @@ def activate_batch_mix_layout():
                       fill="cyan", width=8, tags="batchmix")
 
     # Products section title (right 2/3, top area)
-    products_x = width * 2 // 3
+    products_x = int(width * 0.54)
     canvas.create_text(products_x, int(height * 0.05), text="PRODUCTS",
                       font=("Helvetica", 32, "bold"), fill="lime", tags="batchmix")
+    refresh_batch_mix_tank_levels()
 
     # Draw products and totals
     refresh_batch_mix_products()
@@ -993,6 +995,44 @@ def refresh_batch_mix_totals():
         # Label below - smaller gray text
         canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
+
+def _mopeka_quality_color(q):
+    """Return display color for a Mopeka quality value."""
+    if q >= 3:
+        return "#00ff00"
+    if q >= 2:
+        return "#ffff00"
+    if q >= 1:
+        return "#ff8800"
+    return "#ff0000"
+
+def refresh_batch_mix_tank_levels():
+    """Draw small tank levels in the BatchMix product header."""
+    canvas.delete("batchmix_tanks")
+
+    if current_mode != "mix" or batch_mix_data is None or not mopeka_enabled:
+        return
+
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
+    x = width - 20
+    y = int(height * 0.05)
+    font = ("Helvetica", 28, "bold")
+
+    if not mopeka_connected:
+        canvas.create_text(x, y, text="Tanks: No Signal", font=font,
+                          fill="#ff0000", anchor="ne", tags="batchmix_tanks")
+        return
+
+    front_text = f"Front: {mopeka1_gallons:.0f} gal"
+    back_text = f"Back: {mopeka2_gallons:.0f} gal"
+    canvas.create_text(x - 220, y, text=front_text, font=font,
+                      fill=_mopeka_quality_color(mopeka1_quality),
+                      anchor="ne", tags="batchmix_tanks")
+    canvas.create_text(x, y, text=back_text, font=font,
+                      fill=_mopeka_quality_color(mopeka2_quality),
+                      anchor="ne", tags="batchmix_tanks")
 
 def _batch_mix_payload_active():
     """Return True when the visible BatchMix screen should own knob adjustments."""
@@ -1350,6 +1390,7 @@ def deactivate_batch_mix_layout():
 
     # Clear batch mix elements
     canvas.delete("batchmix")
+    canvas.delete("batchmix_tanks")
     canvas.delete("products")
     canvas.delete("totals")
 
@@ -5622,9 +5663,11 @@ def update_mopeka_display():
     canvas.delete("mopeka_display")
 
     if current_mode == "mix":
+        refresh_batch_mix_tank_levels()
         return
 
     if not mopeka_enabled:
+        canvas.delete("batchmix_tanks")
         return
     
     width = _canvas_width()
@@ -5636,21 +5679,14 @@ def update_mopeka_display():
                           fill="#ff0000", anchor="ne", tags="mopeka_display")
         return
     
-    # Quality indicator: 0=no signal, 1=weak, 2=ok, 3=good
-    def quality_color(q):
-        if q >= 3: return "#00ff00"   # green
-        if q >= 2: return "#ffff00"   # yellow
-        if q >= 1: return "#ff8800"   # orange
-        return "#ff0000"              # red (no signal)
-    
     # Front tank - top right
-    color1 = quality_color(mopeka1_quality)
+    color1 = _mopeka_quality_color(mopeka1_quality)
     label1 = f"Front: {mopeka1_gallons:.0f} gal"
     canvas.create_text(x, 40, text=label1, font=font,
                       fill=color1, anchor="ne", tags="mopeka_display")
     
     # Back tank - below front
-    color2 = quality_color(mopeka2_quality)
+    color2 = _mopeka_quality_color(mopeka2_quality)
     label2 = f"Back: {mopeka2_gallons:.0f} gal"
     canvas.create_text(x, 110, text=label2, font=font,
                       fill=color2, anchor="ne", tags="mopeka_display")
