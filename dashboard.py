@@ -349,6 +349,14 @@ relay_slowdown_alarm_active = False
 relay_slowdown_alarm_visible = False
 relay_slowdown_trigger_time = 0.0
 relay_slowdown_trigger_flow_gpm = 0.0
+pump_stop_relay_lock = threading.Lock()
+pump_stop_pulse_count = 0
+pump_stop_fault_hold_active = False
+pump_stop_fault_hold_reason = ""
+flow_meter_reconnect_fresh_reads = 0
+flow_meter_reconnect_started_at = 0.0
+flow_meter_reconnect_last_status_check = 0.0
+flow_meter_reconnect_status_ok = False
 last_trigger_predicted_actual = 0.0
 last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
@@ -506,6 +514,145 @@ def log_flow_control(message):
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
     except Exception:
         pass
+
+
+def log_relay_event(message):
+    """Append a timestamped pump-stop relay event."""
+    try:
+        with open(config.RELAY_TEST_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+    except Exception:
+        pass
+
+
+def _set_pump_stop_output(active, reason):
+    """Drive the pump-stop relay output without changing hold/pulse state."""
+    if SIM_MODE:
+        if active:
+            iolhat.stop_pump(SIM_PUMP_GLIDE_SECONDS)
+        return True
+
+    if not GPIO_AVAILABLE:
+        log_relay_event(f"ERROR: Cannot {'activate' if active else 'release'} relay ({reason}); GPIO unavailable")
+        return False
+
+    GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH if active else GPIO.LOW)
+    log_relay_event(f"Relay {'HIGH' if active else 'LOW'} ({reason})")
+    return True
+
+
+def set_pump_stop_fault_hold(active, reason="flow meter fault"):
+    """Hold pump-stop relay high while the flow meter is unavailable."""
+    global pump_stop_fault_hold_active, pump_stop_fault_hold_reason
+
+    reason = reason or "flow meter fault"
+    with pump_stop_relay_lock:
+        if active:
+            if pump_stop_fault_hold_active:
+                if pump_stop_fault_hold_reason != reason:
+                    pump_stop_fault_hold_reason = reason
+                    log_flow_control(f"pump_stop_fault_hold_reason | reason={reason}")
+                return
+            pump_stop_fault_hold_active = True
+            pump_stop_fault_hold_reason = reason
+            _set_pump_stop_output(True, f"fault hold active: {reason}")
+            log_flow_control(f"pump_stop_fault_hold_active | reason={reason}")
+            return
+
+        if not pump_stop_fault_hold_active:
+            return
+        previous_reason = pump_stop_fault_hold_reason
+        pump_stop_fault_hold_active = False
+        pump_stop_fault_hold_reason = ""
+        if pump_stop_pulse_count == 0:
+            _set_pump_stop_output(False, f"fault hold cleared: {previous_reason}")
+        else:
+            log_relay_event(
+                f"Fault hold cleared but relay remains HIGH for {pump_stop_pulse_count} active pulse(s)"
+            )
+        log_flow_control(f"pump_stop_fault_hold_cleared | reason={previous_reason}")
+
+
+def update_flow_meter_fault_hold(flow_meter_disconnected=None):
+    """Hold pump-stop relay whenever the flow meter is disconnected or stale."""
+    global flow_meter_reconnect_fresh_reads
+    global flow_meter_reconnect_started_at, flow_meter_reconnect_last_status_check
+    global flow_meter_reconnect_status_ok
+
+    if flow_meter_disconnected is None:
+        flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+
+    if connection_error:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        set_pump_stop_fault_hold(True, error_message or "flow meter connection error")
+    elif flow_meter_disconnected:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        set_pump_stop_fault_hold(True, "flow meter read timeout")
+    elif pump_stop_fault_hold_active:
+        now = time.time()
+        required_reads = max(1, int(getattr(config, "FLOW_METER_RECONNECT_FRESH_READS", 3)))
+        stable_seconds = max(0.0, float(getattr(config, "FLOW_METER_RECONNECT_STABLE_SECONDS", 10.0)))
+        if last_flow_read_was_fresh and not iol_power_cycle_in_progress:
+            if flow_meter_reconnect_started_at <= 0:
+                flow_meter_reconnect_started_at = now
+            flow_meter_reconnect_fresh_reads += 1
+            log_flow_control(
+                "flow_meter_reconnect_fresh"
+                f" | count={flow_meter_reconnect_fresh_reads}"
+                f" | required={required_reads}"
+            )
+        elif iol_power_cycle_in_progress:
+            flow_meter_reconnect_started_at = 0.0
+            flow_meter_reconnect_fresh_reads = 0
+            flow_meter_reconnect_status_ok = False
+
+        if now - flow_meter_reconnect_last_status_check >= 1.0:
+            flow_meter_reconnect_last_status_check = now
+            try:
+                with iol_io_lock:
+                    st = iolhat.readStatus2(config.IOL_PORT)
+                flow_meter_reconnect_status_ok = (
+                    st.pd_in_valid == 1
+                    and st.transmission_rate != 0
+                    and st.error == 0
+                )
+                log_flow_control(
+                    "flow_meter_reconnect_status"
+                    f" | ok={flow_meter_reconnect_status_ok}"
+                    f" | pdInValid={st.pd_in_valid}"
+                    f" | txRate=0x{st.transmission_rate:02X}"
+                    f" | error=0x{st.error:02X}"
+                )
+            except Exception as exc:
+                flow_meter_reconnect_status_ok = False
+                log_flow_control(f"flow_meter_reconnect_status | ok=False | error={exc}")
+
+        stable_elapsed = (
+            now - flow_meter_reconnect_started_at
+            if flow_meter_reconnect_started_at > 0 else 0.0
+        )
+        if flow_meter_reconnect_fresh_reads >= required_reads:
+            if flow_meter_reconnect_status_ok and stable_elapsed >= stable_seconds:
+                flow_meter_reconnect_fresh_reads = 0
+                flow_meter_reconnect_started_at = 0.0
+                flow_meter_reconnect_status_ok = False
+                set_pump_stop_fault_hold(False)
+            else:
+                set_pump_stop_fault_hold(
+                    True,
+                    f"waiting for stable flow meter recovery ({stable_elapsed:.1f}/{stable_seconds:.1f}s)",
+                )
+        else:
+            set_pump_stop_fault_hold(True, "waiting for stable flow meter recovery")
+    else:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        set_pump_stop_fault_hold(False)
 
 
 def start_pump_stop_thread(duration=config.AUTO_ALERT_DURATION):
@@ -835,6 +982,28 @@ def refresh_batch_mix_totals():
         canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
 
+def _batch_mix_product_ounces(prod):
+    """Return product volume in ounces from the BatchMix payload."""
+    try:
+        return max(0.0, float(prod.get("amount_oz", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+def _format_batch_mix_product_amount(ounces):
+    """Format product volume as gallons and ounces for display."""
+    try:
+        total_ounces = int(round(max(0.0, float(ounces))))
+    except (TypeError, ValueError):
+        total_ounces = 0
+
+    whole_gallons, ounces = divmod(total_ounces, 128)
+
+    if whole_gallons and ounces:
+        return f"{whole_gallons} gal {ounces} oz"
+    if whole_gallons:
+        return f"{whole_gallons} gal"
+    return f"{ounces} oz"
+
 def refresh_batch_mix_products():
     """Draw/update products list on canvas"""
     global batch_mix_data
@@ -881,69 +1050,24 @@ def refresh_batch_mix_products():
                           anchor="w", tags="products")
 
         # Amount (right side)
-        gallons = prod.get("gallons", 0)
-        jugs = prod.get("jugs", 0)
-        jug_size = prod.get("jug_size", "")
+        amount_text = _format_batch_mix_product_amount(_batch_mix_product_ounces(prod))
+        max_amount_width = (products_x_end - products_x_start) // 2 - 20
+        amount_font_size = 44
+        while amount_font_size >= 30:
+            test_id = canvas.create_text(0, 0, text=amount_text,
+                                        font=("Helvetica", amount_font_size, "bold"),
+                                        anchor="e", tags="temp_measure")
+            bbox = canvas.bbox(test_id)
+            text_width = bbox[2] - bbox[0] if bbox else 0
+            canvas.delete(test_id)
 
-        if jugs > 0 and jug_size:
-            # Parse jug size to get gallons (e.g., "2.5 gal jug" -> 2.5)
-            try:
-                jug_gallons = float(jug_size.split()[0])
-            except Exception:
-                jug_gallons = 2.5  # default
-            oz_per_jug = jug_gallons * 128
+            if text_width <= max_amount_width:
+                break
+            amount_font_size -= 2
 
-            # Short jug size for display (e.g., "(2.5g Jug)")
-            short_size = f"({jug_gallons:.1f}g Jug)"
-
-            whole_jugs = int(jugs)
-            fraction = jugs - whole_jugs
-
-            # Check if close to half (within 0.02)
-            if abs(fraction - 0.5) < 0.02:
-                if whole_jugs == 0:
-                    amount_text = "1/2 jug"
-                else:
-                    amount_text = f"{whole_jugs} 1/2 jugs"
-            elif fraction < 0.02:
-                # Close to whole number
-                if whole_jugs == 1:
-                    amount_text = "1 jug"
-                else:
-                    amount_text = f"{whole_jugs} jugs"
-            else:
-                # Has extra oz
-                extra_oz = fraction * oz_per_jug
-                if whole_jugs == 0:
-                    amount_text = f"{extra_oz:.0f} oz"
-                    short_size = ""  # No jug size for oz-only
-                elif whole_jugs == 1:
-                    amount_text = f"1 jug + {extra_oz:.0f} oz"
-                else:
-                    amount_text = f"{whole_jugs} jugs + {extra_oz:.0f} oz"
-
-            # Draw amount in yellow, jug size in cyan (two separate texts)
-            if short_size:
-                # Draw jug size first at far right
-                jug_text_id = canvas.create_text(products_x_end - 10, y, text=short_size,
-                                  font=("Helvetica", 38, "bold"), fill="cyan",
-                                  anchor="e", tags="products")
-                # Get width of jug size text
-                bbox = canvas.bbox(jug_text_id)
-                jug_width = bbox[2] - bbox[0] if bbox else 150
-                # Draw amount to the left with some padding
-                canvas.create_text(products_x_end - 20 - jug_width, y, text=amount_text,
-                                  font=("Helvetica", 44, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-            else:
-                canvas.create_text(products_x_end - 10, y, text=amount_text,
-                                  font=("Helvetica", 44, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-        else:
-            amount_text = f"{gallons:.1f} gal"
-            canvas.create_text(products_x_end - 10, y, text=amount_text,
-                              font=("Helvetica", 38, "bold"), fill="yellow",
-                              anchor="e", tags="products")
+        canvas.create_text(products_x_end - 10, y, text=amount_text,
+                          font=("Helvetica", amount_font_size, "bold"), fill="yellow",
+                          anchor="e", tags="products")
 
         # Draw subtle separator line under each product (except last)
         if i < min(len(products), 6) - 1:
@@ -957,11 +1081,6 @@ def refresh_batch_mix_products():
         easy_y = start_y + (min(len(products), 6) * row_height) + 10
         canvas.create_text(width * 2 // 3, easy_y, text="EASY MIX",
                           font=("Helvetica", 22, "bold"), fill="lime", tags="products")
-
-    # Warning to double check jug sizes
-    warning_y = start_y + (min(len(products), 6) * row_height) + 40
-    canvas.create_text(width * 2 // 3, warning_y, text="Double check jug size!",
-                      font=("Helvetica", 56, "bold italic"), fill="red", tags="products")
 
 def deactivate_batch_mix_layout():
     """Switch back to normal screen layout"""
@@ -1336,70 +1455,56 @@ def handle_thumbs_up_press(source):
 
 def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
-    relay_log = config.RELAY_TEST_LOG
-
-    # Log function entry
-    with open(relay_log, 'a') as f:
-        f.write(f"\n{'='*60}\n")
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - pump_stop_relay() CALLED\n")
-        f.write(f"Duration: {duration} seconds\n")
-        f.write(f"GPIO_AVAILABLE: {GPIO_AVAILABLE}\n")
-        f.write(f"PUMP_STOP_RELAY_PIN: {config.PUMP_STOP_RELAY_PIN}\n")
-
-    if SIM_MODE:
-        iolhat.stop_pump(SIM_PUMP_GLIDE_SECONDS)
-        msg = (
-            f"SIM relay activated: flow gliding to stop over "
-            f"{SIM_PUMP_GLIDE_SECONDS:.1f} seconds"
-        )
-        print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-            f.write(f"{'='*60}\n")
-        return
-
-    if not GPIO_AVAILABLE:
-        msg = "GPIO not available, cannot control relay"
-        print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - ERROR: {msg}\n")
-        return
+    global pump_stop_pulse_count
 
     try:
-        # GPIO already initialized during startup - just control the output
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - About to set GPIO {config.PUMP_STOP_RELAY_PIN} HIGH\n")
+        log_relay_event("")
+        log_relay_event("=" * 60)
+        log_relay_event(
+            f"pump_stop_relay() CALLED | duration={duration} | "
+            f"GPIO_AVAILABLE={GPIO_AVAILABLE} | pin={config.PUMP_STOP_RELAY_PIN}"
+        )
 
-        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH)
+        with pump_stop_relay_lock:
+            pump_stop_pulse_count += 1
+            _set_pump_stop_output(True, f"pulse start {duration}s")
 
         msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to HIGH\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleeping for {duration} seconds...\n")
-
+        log_relay_event(msg)
         time.sleep(duration)
 
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleep complete, about to set GPIO {config.PUMP_STOP_RELAY_PIN} LOW\n")
+        relay_released = False
+        with pump_stop_relay_lock:
+            pump_stop_pulse_count = max(0, pump_stop_pulse_count - 1)
+            if pump_stop_pulse_count == 0 and not pump_stop_fault_hold_active:
+                _set_pump_stop_output(False, "pulse complete")
+                relay_released = True
+            else:
+                log_relay_event(
+                    "Pulse complete; relay remains HIGH "
+                    f"(active_pulses={pump_stop_pulse_count}, fault_hold={pump_stop_fault_hold_active})"
+                )
 
-        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
-
-        msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
+        msg = (
+            f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
+            if relay_released
+            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH"
+        )
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to LOW\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-            f.write(f"{'='*60}\n")
+        log_relay_event(msg)
+        log_relay_event("=" * 60)
     except Exception as e:
         msg = f"Error controlling relay: {e}"
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - EXCEPTION: {msg}\n")
-            import traceback
-            f.write(traceback.format_exc())
-            f.write(f"{'='*60}\n")
+        log_relay_event(f"EXCEPTION: {msg}")
+        import traceback
+        try:
+            with open(config.RELAY_TEST_LOG, 'a') as f:
+                f.write(traceback.format_exc())
+                f.write(f"{'='*60}\n")
+        except Exception:
+            pass
 
 
 def get_ip_address():
@@ -4046,10 +4151,12 @@ def flow_control_loop():
 
         try:
             actual = read_flow_meter()
+            update_flow_meter_fault_hold()
             flow_control_last_loop_time = time.time()
             _record_flow_control_audit(loop_dt_ms, read_ok=True)
             _flow_control_process_sample(actual, time.time(), loop_dt_ms)
         except Exception as exc:
+            set_pump_stop_fault_hold(True, f"flow control read exception: {exc}")
             flow_control_last_loop_time = time.time()
             _record_flow_control_audit(loop_dt_ms, read_ok=False)
             now = time.time()
@@ -4411,7 +4518,7 @@ def socket_command_listener():
                                 print(msg)
                                 with open(debug_log, "a") as f:
                                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                root.after(0, pump_stop_relay)
+                                start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                             elif line in ('OV:1', 'OV:0'):
                                 override_mode = (line == 'OV:1')
@@ -4793,9 +4900,7 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    # Run relay in separate thread to not block serial listener
-                                    relay_thread = threading.Thread(target=pump_stop_relay, daemon=True)
-                                    relay_thread.start()
+                                    start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                                 elif line == 'OV':
                                     global override_enabled_time
@@ -5573,6 +5678,7 @@ def update_dashboard():
 
     # Check if flow meter has timed out (no successful reads in X seconds)
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+    update_flow_meter_fault_hold(flow_meter_disconnected)
 
     # Check if heartbeat has timed out (no OK message in 11 seconds)
     heartbeat_timeout = (time.time() - last_heartbeat_time) > 11
@@ -5758,7 +5864,9 @@ def update_dashboard():
         start_pump_stop_thread(config.AUTO_ALERT_DURATION)
     # Update status label
     status_parts = []
-    if connection_error:
+    if pump_stop_fault_hold_active:
+        status_parts.append(f"IOL: {pump_stop_fault_hold_reason[:30]}")
+    elif connection_error:
         status_parts.append(f"IOL: {error_message[:30]}")
     else:
         status_parts.append("IOL: Connected")

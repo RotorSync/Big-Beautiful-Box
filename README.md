@@ -108,6 +108,24 @@ The system runs a BLE GATT server using [Bumble](https://github.com/google/bumbl
 
 ### BatchMix Format
 
+Liquid product amounts are sent in ounces only. Each liquid product entry should
+include `amount_oz`; do not send jug count or jug-size fields for liquid
+products.
+
+```json
+{
+  "product_count": 2,
+  "products": [
+    {"name": "Miravis Ace", "amount_oz": 265},
+    {"name": "Verifact", "amount_oz": 77}
+  ],
+  "water_needed": 36.0,
+  "total_acres": 19.3,
+  "gallons_per_acre": 2.0,
+  "total_liquid": 38.7
+}
+```
+
 For large payloads, BatchMix supports chunked writes:
 ```
 CHUNK:1/3:{"product_count":2,"products":[...

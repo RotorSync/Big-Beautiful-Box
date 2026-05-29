@@ -58,6 +58,8 @@ NEW_FILL_CYCLE_THRESHOLD = 0.630902  # L/s - 10 GPM; clear thumbs/pending fill a
 NEW_FILL_CYCLE_HOLD_SECONDS = 3.0    # seconds - require sustained new-fill flow
 NEW_FILL_CYCLE_FRESH_GRACE_SECONDS = 0.25  # seconds - latest high-flow sample must be fresh/recent
 FLOW_METER_TIMEOUT = 5            # seconds - flow meter considered disconnected after this
+FLOW_METER_RECONNECT_FRESH_READS = 3  # fresh changed reads required before releasing fail-closed relay hold
+FLOW_METER_RECONNECT_STABLE_SECONDS = 10.0  # continuous healthy time before releasing fail-closed relay hold
 IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port power-cycle attempts
 
 
