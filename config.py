@@ -60,6 +60,7 @@ NEW_FILL_CYCLE_FRESH_GRACE_SECONDS = 0.25  # seconds - latest high-flow sample m
 FLOW_METER_TIMEOUT = 5            # seconds - flow meter considered disconnected after this
 FLOW_METER_RECONNECT_FRESH_READS = 3  # healthy status checks required before clearing flow-meter fault latch
 FLOW_METER_RECONNECT_STABLE_SECONDS = 10.0  # continuous healthy time before clearing flow-meter fault latch
+IOL_STARTUP_WARNING_GRACE_SECONDS = 15.0  # hide startup-only IO-Link warnings while the port settles
 IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port power-cycle attempts
 
 

@@ -89,6 +89,7 @@ def _read_git_ref_version(git_ref):
 
 
 VERSION = _read_local_version()
+PROGRAM_STARTED_AT = time.time()
 
 # Import configuration
 import config
@@ -663,6 +664,16 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
         flow_meter_reconnect_status_ok = False
         flow_meter_reconnect_fault_reason = ""
         set_pump_stop_fault_hold(False)
+
+
+def _suppress_startup_iol_warning(flow_meter_disconnected=False):
+    """Keep startup IO-Link settling quiet on-screen without changing relay safety."""
+    grace_seconds = max(0.0, float(getattr(config, "IOL_STARTUP_WARNING_GRACE_SECONDS", 0.0)))
+    if grace_seconds <= 0.0 or time.time() - PROGRAM_STARTED_AT > grace_seconds:
+        return False
+    if last_flow_rate >= config.FLOW_STOPPED_THRESHOLD:
+        return False
+    return bool(pump_stop_fault_hold_active or connection_error or flow_meter_disconnected)
 
 
 def start_pump_stop_thread(duration=config.AUTO_ALERT_DURATION):
@@ -6223,9 +6234,13 @@ def update_dashboard():
         last_trigger_actual = actual
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
         start_pump_stop_thread(config.AUTO_ALERT_DURATION)
+    startup_iol_warning_suppressed = _suppress_startup_iol_warning(flow_meter_disconnected)
+
     # Update status label
     status_parts = []
-    if pump_stop_fault_hold_active:
+    if startup_iol_warning_suppressed:
+        status_parts.append("IOL: Starting")
+    elif pump_stop_fault_hold_active:
         status_parts.append(f"IOL: {pump_stop_fault_hold_reason[:30]}")
     elif connection_error:
         status_parts.append(f"IOL: {error_message[:30]}")
@@ -6267,7 +6282,7 @@ def update_dashboard():
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
     canvas.delete("skull_icons")
-    if flow_meter_disconnected:
+    if flow_meter_disconnected and not startup_iol_warning_suppressed:
         import math
         pulse = math.sin(time.time() * 2 * math.pi)  # -1 to 1, completes cycle every 1 second
         skull_size = int(264 + 24 * pulse)  # Varies from 240pt to 288pt
@@ -6340,7 +6355,7 @@ def update_dashboard():
         canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                          text="MANUAL", font=("Helvetica", 90, "bold"),
                          fill="orange", tags="warning")
-        if pump_stop_fault_hold_active:
+        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
             canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.15),
                              text=f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
                              font=("Helvetica", 72, "bold"),
@@ -6350,7 +6365,7 @@ def update_dashboard():
         # Build list of active warnings (in priority order) - only when NOT in override mode
         active_warnings = []
 
-        if pump_stop_fault_hold_active:
+        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
             active_warnings.append((
                 f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
                 "Helvetica",
@@ -6361,7 +6376,7 @@ def update_dashboard():
         if heartbeat_disconnected:
             active_warnings.append(("SWITCH BOX\nDISCONNECTED", "Helvetica", 60, "red"))
 
-        if flow_meter_disconnected:
+        if flow_meter_disconnected and not startup_iol_warning_suppressed:
             active_warnings.append(("☠ FLOW METER ☠\nDISCONNECTED", "Helvetica", 60, "red"))
 
         if actual > requested_gallons + config.WARNING_THRESHOLD:
