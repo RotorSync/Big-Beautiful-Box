@@ -361,6 +361,7 @@ flow_meter_reconnect_fresh_reads = 0
 flow_meter_reconnect_started_at = 0.0
 flow_meter_reconnect_last_status_check = 0.0
 flow_meter_reconnect_status_ok = False
+flow_meter_reconnect_fault_reason = ""
 last_trigger_predicted_actual = 0.0
 last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
@@ -582,7 +583,7 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
     """Pulse pump stop and latch warning while the flow meter is disconnected or stale."""
     global flow_meter_reconnect_fresh_reads
     global flow_meter_reconnect_started_at, flow_meter_reconnect_last_status_check
-    global flow_meter_reconnect_status_ok
+    global flow_meter_reconnect_status_ok, flow_meter_reconnect_fault_reason
 
     if flow_meter_disconnected is None:
         flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
@@ -591,11 +592,13 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
         flow_meter_reconnect_fresh_reads = 0
         flow_meter_reconnect_started_at = 0.0
         flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
         set_pump_stop_fault_hold(True, error_message or "flow meter connection error")
     elif flow_meter_disconnected:
         flow_meter_reconnect_fresh_reads = 0
         flow_meter_reconnect_started_at = 0.0
         flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
         set_pump_stop_fault_hold(True, "flow meter read timeout")
     elif pump_stop_fault_hold_active:
         now = time.time()
@@ -605,6 +608,7 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
             flow_meter_reconnect_started_at = 0.0
             flow_meter_reconnect_fresh_reads = 0
             flow_meter_reconnect_status_ok = False
+            flow_meter_reconnect_fault_reason = ""
         elif now - flow_meter_reconnect_last_status_check >= 1.0:
             flow_meter_reconnect_last_status_check = now
             try:
@@ -613,20 +617,24 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
                     if flow_meter_reconnect_started_at <= 0:
                         flow_meter_reconnect_started_at = now
                     flow_meter_reconnect_fresh_reads += 1
+                    flow_meter_reconnect_fault_reason = ""
                 else:
                     flow_meter_reconnect_started_at = 0.0
                     flow_meter_reconnect_fresh_reads = 0
+                    flow_meter_reconnect_fault_reason = _describe_iol_status_fault(st)
                 log_flow_control(
                     "flow_meter_reconnect_status"
                     f" | ok={flow_meter_reconnect_status_ok}"
                     f" | pdInValid={st.pd_in_valid}"
                     f" | txRate=0x{st.transmission_rate:02X}"
                     f" | error=0x{st.error:02X}"
+                    f" | reason={flow_meter_reconnect_fault_reason or 'healthy'}"
                 )
             except Exception as exc:
                 flow_meter_reconnect_status_ok = False
                 flow_meter_reconnect_started_at = 0.0
                 flow_meter_reconnect_fresh_reads = 0
+                flow_meter_reconnect_fault_reason = "flow meter status read failed"
                 log_flow_control(f"flow_meter_reconnect_status | ok=False | error={exc}")
 
         stable_elapsed = (
@@ -645,11 +653,15 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
                     f"waiting for stable flow meter recovery ({stable_elapsed:.1f}/{stable_seconds:.1f}s)",
                 )
         else:
-            set_pump_stop_fault_hold(True, "waiting for healthy flow meter status")
+            set_pump_stop_fault_hold(
+                True,
+                flow_meter_reconnect_fault_reason or "waiting for healthy flow meter status",
+            )
     else:
         flow_meter_reconnect_fresh_reads = 0
         flow_meter_reconnect_started_at = 0.0
         flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
         set_pump_stop_fault_hold(False)
 
 
@@ -4114,6 +4126,25 @@ def _read_iol_status_ok():
     ok = st.pd_in_valid == 1 and st.transmission_rate != 0 and st.error == 0
     return ok, st
 
+
+def _describe_iol_status_fault(st):
+    """Return a field-friendly reason for an unhealthy IO-Link status."""
+    status_error = getattr(st, "error", 0)
+    if status_error & 0x02:
+        return "LOW VOLTAGE: check 24V"
+    if status_error & 0x04:
+        return "IO-Link current limit"
+    if status_error & 0x01:
+        return "IO-Link CQ fault"
+    if getattr(st, "power", 0) != 1:
+        return "IO-Link port power off"
+    if getattr(st, "pd_in_valid", 0) != 1:
+        return "flow meter data invalid"
+    if getattr(st, "transmission_rate", 0) == 0:
+        return "flow meter no COM"
+    return "waiting for healthy flow meter status"
+
+
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
@@ -6309,10 +6340,23 @@ def update_dashboard():
         canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                          text="MANUAL", font=("Helvetica", 90, "bold"),
                          fill="orange", tags="warning")
+        if pump_stop_fault_hold_active:
+            canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.15),
+                             text=f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
+                             font=("Helvetica", 72, "bold"),
+                             fill="red", tags="warning")
 
     else:
         # Build list of active warnings (in priority order) - only when NOT in override mode
         active_warnings = []
+
+        if pump_stop_fault_hold_active:
+            active_warnings.append((
+                f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
+                "Helvetica",
+                72,
+                "red",
+            ))
 
         if heartbeat_disconnected:
             active_warnings.append(("SWITCH BOX\nDISCONNECTED", "Helvetica", 60, "red"))
