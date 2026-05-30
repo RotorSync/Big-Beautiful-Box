@@ -84,6 +84,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MOPEKA_DIR = os.path.join(SCRIPT_DIR, 'mopeka')
 SENSOR_CSV_PATH = os.path.join(MOPEKA_DIR, 'mopeka-sensor-details.csv')
 CALIBRATION_CSV_PATH = os.path.join(MOPEKA_DIR, 'calibration-points-1070gal-tank.csv')
+CALIBRATION_PROFILE_DIR = os.path.join(MOPEKA_DIR, 'calibrations')
 MOPEKA_CONFIG_PATH = os.path.join(MOPEKA_DIR, 'mopeka_config.json')
 WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
@@ -109,6 +110,8 @@ dashboard_status = {
 }
 
 sensor_loop_heartbeat = 0.0
+calibration_mtime_snapshot = None
+last_calibration_reload_check = 0.0
 
 
 def _encode_ble_state_payload(state):
@@ -796,11 +799,42 @@ def save_sensor_csv(sensors):
             writer.writerow(row)
 
 
-def load_calibration_csv():
+def _safe_calibration_profile_key(value):
+    key = str(value or '').strip().lower().replace('_', '-')
+    return ''.join(ch for ch in key if ch.isalnum() or ch == '-')
+
+
+def _calibration_profile_key_for_box_tank(tank):
+    cfg = load_config()
+    mode = _normalize_box_mode(cfg.get('box_mode'))
+    trailer = _get_assigned_trailer(cfg)
+    tank = str(tank or '').strip().lower()
+    tank = 'back' if tank.startswith('back') else 'front'
+
+    if mode == 'fleet' and trailer not in (None, ''):
+        return _safe_calibration_profile_key(f'trailer-{trailer}-{tank}')
+    return f'customer-{tank}'
+
+
+def _calibration_csv_path_for_cmd(cmd=None):
+    cmd = cmd or {}
+    profile = cmd.get('profile')
+    if not profile and cmd.get('tank'):
+        profile = _calibration_profile_key_for_box_tank(cmd.get('tank'))
+
+    profile = _safe_calibration_profile_key(profile)
+    if profile:
+        os.makedirs(CALIBRATION_PROFILE_DIR, exist_ok=True)
+        return os.path.join(CALIBRATION_PROFILE_DIR, f'{profile}.csv'), profile
+
+    return CALIBRATION_CSV_PATH, ''
+
+
+def load_calibration_csv(path=CALIBRATION_CSV_PATH):
     """Load calibration CSV. Standard header, no preamble."""
     points = []
     try:
-        with open(CALIBRATION_CSV_PATH, 'r', newline='') as f:
+        with open(path, 'r', newline='') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 points.append({
@@ -809,18 +843,55 @@ def load_calibration_csv():
                     'tank_size': float(row['Tank Size (gal)'])
                 })
     except FileNotFoundError:
-        print(f'Calibration CSV not found: {CALIBRATION_CSV_PATH}', flush=True)
+        print(f'Calibration CSV not found: {path}', flush=True)
     return points
 
 
-def save_calibration_csv(points):
+def save_calibration_csv(points, path=CALIBRATION_CSV_PATH):
     """Write calibration points back to CSV, sorted descending by tank level."""
     points.sort(key=lambda p: p['tank_level_in'], reverse=True)
-    with open(CALIBRATION_CSV_PATH, 'w', newline='') as f:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Tank Level (in)', 'Gallons', 'Tank Size (gal)'])
         for p in points:
             writer.writerow([p['tank_level_in'], p['gallons'], p['tank_size']])
+
+
+def _calibration_file_mtimes():
+    paths = [CALIBRATION_CSV_PATH]
+    if os.path.isdir(CALIBRATION_PROFILE_DIR):
+        for name in sorted(os.listdir(CALIBRATION_PROFILE_DIR)):
+            if name.lower().endswith('.csv'):
+                paths.append(os.path.join(CALIBRATION_PROFILE_DIR, name))
+
+    mtimes = {}
+    for path in paths:
+        try:
+            mtimes[path] = os.path.getmtime(path)
+        except FileNotFoundError:
+            mtimes[path] = None
+    return mtimes
+
+
+def reload_converter_if_calibration_changed(force=False):
+    """Reload Mopeka conversion when dashboard-applied profiles change."""
+    global calibration_mtime_snapshot, last_calibration_reload_check
+
+    now = time.time()
+    if not force and now - last_calibration_reload_check < 5.0:
+        return
+
+    last_calibration_reload_check = now
+    current = _calibration_file_mtimes()
+    if calibration_mtime_snapshot is None:
+        calibration_mtime_snapshot = current
+        return
+
+    if current != calibration_mtime_snapshot:
+        calibration_mtime_snapshot = current
+        print('Calibration files changed; reloading Mopeka converter', flush=True)
+        _reload_converter()
 
 
 def load_config():
@@ -1270,7 +1341,7 @@ def process_config_command(cmd_str):
         elif op == 'DELETE_SENSOR':
             _cmd_delete_sensor(cmd, request_id=request_id)
         elif op == 'LIST_CALIBRATION':
-            _cmd_list_calibration(request_id=request_id)
+            _cmd_list_calibration(cmd, request_id=request_id)
         elif op == 'ADD_CALIBRATION':
             _cmd_add_calibration(cmd, request_id=request_id)
         elif op == 'UPDATE_CALIBRATION':
@@ -1634,9 +1705,10 @@ def _cmd_delete_sensor(cmd, *, request_id=None):
     _set_config_response_obj({'ok': True, 'op': 'DELETE_SENSOR', 'request_id': request_id, 'id': sensor_id})
 
 
-def _cmd_list_calibration(*, request_id=None):
+def _cmd_list_calibration(cmd=None, *, request_id=None):
     global config_response, config_response_pages
-    points = load_calibration_csv()
+    path, profile = _calibration_csv_path_for_cmd(cmd or {})
+    points = load_calibration_csv(path)
 
     items = []
     for i, p in enumerate(points):
@@ -1663,18 +1735,24 @@ def _cmd_add_calibration(cmd, *, request_id=None):
         _set_config_response_obj({'ok': False, 'op': 'ADD_CALIBRATION', 'request_id': request_id, 'error': 'Required: tank_level_in, gallons'})
         return
 
-    points = load_calibration_csv()
+    path, profile = _calibration_csv_path_for_cmd(cmd)
+    points = load_calibration_csv(path)
     new_point = {
         'tank_level_in': float(data['tank_level_in']),
         'gallons': float(data['gallons']),
         'tank_size': float(data.get('tank_size', 1070.0))
     }
     points.append(new_point)
-    save_calibration_csv(points)
+    save_calibration_csv(points, path)
     _reload_converter()
 
     config_response_pages = []
-    _set_config_response_obj({'ok': True, 'op': 'ADD_CALIBRATION', 'request_id': request_id})
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'ADD_CALIBRATION',
+        'request_id': request_id,
+        'profile': profile or None,
+    })
 
 
 def _cmd_update_calibration(cmd, *, request_id=None):
@@ -1686,7 +1764,8 @@ def _cmd_update_calibration(cmd, *, request_id=None):
         _set_config_response_obj({'ok': False, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'error': 'Required: index, data'})
         return
 
-    points = load_calibration_csv()
+    path, profile = _calibration_csv_path_for_cmd(cmd)
+    points = load_calibration_csv(path)
     if index < 0 or index >= len(points):
         config_response_pages = []
         _set_config_response_obj({'ok': False, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'error': f'Index {index} out of range (0-{len(points)-1})'})
@@ -1696,11 +1775,17 @@ def _cmd_update_calibration(cmd, *, request_id=None):
         if key in data:
             points[index][key] = float(data[key])
 
-    save_calibration_csv(points)
+    save_calibration_csv(points, path)
     _reload_converter()
 
     config_response_pages = []
-    _set_config_response_obj({'ok': True, 'op': 'UPDATE_CALIBRATION', 'request_id': request_id, 'index': index})
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'UPDATE_CALIBRATION',
+        'request_id': request_id,
+        'index': index,
+        'profile': profile or None,
+    })
 
 
 def _cmd_delete_calibration(cmd, *, request_id=None):
@@ -1711,18 +1796,25 @@ def _cmd_delete_calibration(cmd, *, request_id=None):
         _set_config_response_obj({'ok': False, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'error': 'Required: index'})
         return
 
-    points = load_calibration_csv()
+    path, profile = _calibration_csv_path_for_cmd(cmd)
+    points = load_calibration_csv(path)
     if index < 0 or index >= len(points):
         config_response_pages = []
         _set_config_response_obj({'ok': False, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'error': f'Index {index} out of range (0-{len(points)-1})'})
         return
 
     points.pop(index)
-    save_calibration_csv(points)
+    save_calibration_csv(points, path)
     _reload_converter()
 
     config_response_pages = []
-    _set_config_response_obj({'ok': True, 'op': 'DELETE_CALIBRATION', 'request_id': request_id, 'index': index})
+    _set_config_response_obj({
+        'ok': True,
+        'op': 'DELETE_CALIBRATION',
+        'request_id': request_id,
+        'index': index,
+        'profile': profile or None,
+    })
 
 
 def _cmd_page(cmd, *, request_id=None):
@@ -2030,6 +2122,7 @@ async def read_sensors(sensor_device, sensor_adapter):
         sensor_loop_heartbeat = time.time()
         cycle_count += 1
         current_time = time.time()
+        reload_converter_if_calibration_changed()
 
         if ((mopeka_enabled and mopeka_failures >= MAX_CONSECUTIVE_FAILURES) or bms_failures >= MAX_CONSECUTIVE_FAILURES):
             if current_time - last_adapter_reset > ADAPTER_RESET_COOLDOWN:
@@ -2129,6 +2222,7 @@ async def main():
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
+    reload_converter_if_calibration_changed(force=True)
 
     # Restore adapter config from last session
     restore_adapter_config()

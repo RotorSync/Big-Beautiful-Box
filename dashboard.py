@@ -10,6 +10,7 @@ import threading
 import subprocess
 import os
 import json
+import csv
 import shlex
 import builtins
 from collections import deque
@@ -2168,6 +2169,8 @@ def _default_calibration_state():
         "last_step_actual": 0.0,
         "reading": None,
         "return_phase": None,
+        "profile_path": "",
+        "profile_error": "",
     }
 
 
@@ -2196,6 +2199,40 @@ def _calibration_points_path():
 
 def _calibration_runs_path():
     return "/home/pi/tank_calibration_runs.json"
+
+
+def _mopeka_config_path():
+    return "/opt/mopeka/mopeka_config.json"
+
+
+def _mopeka_calibration_dir():
+    return "/opt/mopeka/calibrations"
+
+
+def _safe_calibration_profile_key(value):
+    key = str(value or "").strip().lower().replace("_", "-")
+    return "".join(ch for ch in key if ch.isalnum() or ch == "-")
+
+
+def _current_tank_calibration_profile_key(tank):
+    try:
+        with open(_mopeka_config_path(), "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+    mode = str(cfg.get("box_mode") or "fleet").strip().lower()
+    trailer = cfg.get("assigned_trailer", cfg.get("trailer"))
+    tank = "back" if tank == "back" else "front"
+
+    if mode != "customer" and trailer not in (None, ""):
+        return _safe_calibration_profile_key(f"trailer-{trailer}-{tank}")
+    return f"customer-{tank}"
+
+
+def _current_tank_calibration_profile_path(tank):
+    profile_key = _current_tank_calibration_profile_key(tank)
+    return os.path.join(_mopeka_calibration_dir(), f"{profile_key}.csv")
 
 
 def _build_dashboard_state_snapshot():
@@ -2279,6 +2316,53 @@ def _save_calibration_run():
             )
 
 
+def _append_calibration_point(actual_gallons, step_target_gallons=None):
+    reading = calibration_state.get("reading") or _selected_tank_reading()
+    calibration_state["points"].append({
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "step_target_gallons": (
+            actual_gallons if step_target_gallons is None else step_target_gallons
+        ),
+        "actual_total_gallons": actual_gallons,
+        "level_mm": reading["level_mm"],
+        "level_in": reading["level_in"],
+        "display_gallons": reading["gallons"],
+        "quality": reading["quality"],
+    })
+
+
+def _apply_tank_calibration_profile():
+    if not calibration_state or len(calibration_state.get("points", [])) < 2:
+        raise ValueError("Need at least empty plus one fill point")
+
+    tank = calibration_state["tank"]
+    profile_path = _current_tank_calibration_profile_path(tank)
+    os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+
+    if os.path.exists(profile_path):
+        backup_path = f"{profile_path}.backup-{time.strftime('%Y%m%d_%H%M%S')}"
+        with open(profile_path, "r") as src, open(backup_path, "w") as dst:
+            dst.write(src.read())
+
+    rows = []
+    for point in calibration_state["points"]:
+        rows.append({
+            "tank_level_in": float(point["level_in"]),
+            "gallons": float(point["actual_total_gallons"]),
+            "tank_size": float(calibration_state["total_capacity"]),
+        })
+    rows.sort(key=lambda row: row["tank_level_in"], reverse=True)
+
+    tmp_path = f"{profile_path}.tmp"
+    with open(tmp_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Tank Level (in)", "Gallons", "Tank Size (gal)"])
+        for row in rows:
+            writer.writerow([row["tank_level_in"], row["gallons"], row["tank_size"]])
+    os.replace(tmp_path, profile_path)
+    return profile_path
+
+
 def _refresh_calibration_window():
     if not calibration_window or not calibration_state:
         return
@@ -2338,10 +2422,26 @@ def _refresh_calibration_window():
         footer = "OV = SAVE/NEXT   +1 = REREAD   -1 = WAIT 2 MORE MIN   PS = ABORT"
         hint = "Confirm the Mopeka reading before continuing."
     elif phase == "complete":
+        profile_path = _current_tank_calibration_profile_path(calibration_state["tank"])
         body = (
             f"{tank_label} Tank Calibration Complete\n\n"
             f"Saved {len(calibration_state['points'])} calibration points\n"
-            f"through {calibration_state['target_capacity']} gallons."
+            f"through {calibration_state['target_capacity']} gallons.\n\n"
+            "Apply this as the live tank curve?"
+        )
+        footer = "OV = APPLY PROFILE   PS = RETURN"
+        hint = profile_path
+    elif phase == "applied":
+        body = (
+            f"{tank_label} Tank Calibration Applied\n\n"
+            "RotorSync will reload the curve automatically."
+        )
+        footer = "OV = RETURN TO MENU"
+        hint = calibration_state.get("profile_path") or _current_tank_calibration_profile_path(calibration_state["tank"])
+    elif phase == "apply_error":
+        body = (
+            f"{tank_label} Tank Calibration Apply Failed\n\n"
+            f"{calibration_state.get('profile_error', 'Unknown error')}"
         )
         footer = "OV = RETURN TO MENU"
         hint = _calibration_points_path()
@@ -2473,20 +2573,18 @@ def calibration_confirm():
     elif phase == "set_target":
         calibration_state["phase"] = "confirm_empty"
     elif phase == "confirm_empty":
+        calibration_state["points"] = []
+        calibration_state["reading"] = _selected_tank_reading()
+        _append_calibration_point(0.0, 0)
+        calibration_state["reading"] = None
         calibration_state["current_step"] = calibration_state["step_size"]
         switch_mode("fill")
         _calibration_prepare_next_step()
     elif phase == "review":
-        reading = calibration_state.get("reading") or _selected_tank_reading()
-        calibration_state["points"].append({
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "step_target_gallons": calibration_state["current_step"],
-            "actual_total_gallons": calibration_state["last_step_actual"],
-            "level_mm": reading["level_mm"],
-            "level_in": reading["level_in"],
-            "display_gallons": reading["gallons"],
-            "quality": reading["quality"],
-        })
+        _append_calibration_point(
+            calibration_state["last_step_actual"],
+            calibration_state["current_step"],
+        )
         next_step = calibration_state["current_step"] + calibration_state["step_size"]
         if next_step <= calibration_state["target_capacity"]:
             calibration_state["current_step"] = next_step
@@ -2494,10 +2592,18 @@ def calibration_confirm():
             return
         _save_calibration_run()
         calibration_state["phase"] = "complete"
+    elif phase == "complete":
+        try:
+            calibration_state["profile_path"] = _apply_tank_calibration_profile()
+            calibration_state["profile_error"] = ""
+            calibration_state["phase"] = "applied"
+        except Exception as exc:
+            calibration_state["profile_error"] = str(exc)
+            calibration_state["phase"] = "apply_error"
     elif phase == "abort_confirm":
         _close_calibration_window(return_to_menu=True)
         return
-    elif phase == "complete":
+    elif phase in ("applied", "apply_error"):
         _close_calibration_window(return_to_menu=True)
         return
 
@@ -2512,6 +2618,9 @@ def calibration_cancel():
     if phase == "choose_tank":
         calibration_state["return_phase"] = "choose_tank"
         calibration_state["phase"] = "abort_confirm"
+        return
+    if phase in ("complete", "applied", "apply_error"):
+        _close_calibration_window(return_to_menu=True)
         return
     if phase == "set_total":
         calibration_state["phase"] = "choose_tank"
