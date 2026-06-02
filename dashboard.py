@@ -288,6 +288,8 @@ menu_season_label = None  # Reference to season total label in menu
 menu_position_label = None  # Reference to position indicator label
 menu_highlight_refresh_pending = False  # Coalesce menu redraws so knob pulses do not stack UI work
 menu_displayed_index = None  # Last menu item whose highlight state was painted
+menu_ov_guard_until = 0.0  # Suppress OV contact/repeat bounce after screen changes
+MENU_OV_GUARD_SECONDS = 2.5
 log_viewer_mode = False  # Track if we're in log viewer
 log_viewer_window = None  # Reference to log viewer window
 log_viewer_text = None  # Reference to log text widget
@@ -2065,6 +2067,7 @@ def close_log_viewer():
         log_viewer_window.destroy()
         log_viewer_window = None
         log_viewer_text = None
+    arm_menu_ov_guard()
     show_menu()
 
 def show_fill_history():
@@ -2152,6 +2155,7 @@ def close_fill_history():
         fill_history_window.destroy()
         fill_history_window = None
         fill_history_text = None
+    arm_menu_ov_guard()
     show_menu()
 
 
@@ -2406,8 +2410,10 @@ def _refresh_calibration_window():
     elif phase == "settling":
         remaining = max(0, int(calibration_state["settle_deadline"] - time.time()))
         body = (
-            f"{tank_label} Tank\n\n{calibration_state['current_step']} gal reached.\n\n"
-            f"Waiting for Mopeka to settle...\n{remaining} sec remaining"
+            f"{tank_label} Tank\n"
+            f"{calibration_state['current_step']} gal reached.\n"
+            "Waiting for Mopeka to settle\n"
+            f"{remaining} sec remaining"
         )
         footer = "PS = ABORT"
         hint = "Do not disturb the tank during the settle period."
@@ -2453,8 +2459,14 @@ def _refresh_calibration_window():
         footer = "OV = YES, ABORT   PS = NO, GO BACK"
         hint = "Use OV to exit the calibration workflow."
 
+    body_font_size = 54
+    if phase in ("wait_for_fill", "settling", "review", "complete", "applied", "apply_error", "abort_confirm"):
+        body_font_size = 46
+    elif phase in ("set_total", "set_target"):
+        body_font_size = 58
+
     calibration_title_label.config(text=title)
-    calibration_body_label.config(text=body)
+    calibration_body_label.config(text=body, font=("Helvetica", body_font_size, "bold"))
     calibration_footer_label.config(text=footer)
     calibration_hint_label.config(text=hint)
 
@@ -2509,33 +2521,40 @@ def show_tank_calibration():
     calibration_window.configure(bg='black')
 
     calibration_title_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 72, "bold"), fg="cyan", bg="black"
+        calibration_window, text="", font=("Helvetica", 40, "bold"), fg="cyan", bg="black"
     )
-    calibration_title_label.pack(pady=24)
+    calibration_title_label.pack(pady=(10, 2))
 
     calibration_body_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 120, "bold"),
+        font=("Helvetica", 54, "bold"),
         fg="white",
         bg="black",
         justify=tk.CENTER,
+        wraplength=760,
     )
-    calibration_body_label.pack(expand=True, padx=40, pady=30)
+    calibration_body_label.pack(expand=True, fill=tk.BOTH, padx=20, pady=6)
 
     calibration_hint_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 44, "bold"), fg="#ffff99", bg="black"
+        calibration_window,
+        text="",
+        font=("Helvetica", 24, "bold"),
+        fg="#ffff99",
+        bg="black",
+        wraplength=760,
     )
-    calibration_hint_label.pack(pady=14)
+    calibration_hint_label.pack(pady=(2, 4))
 
     calibration_footer_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 44, "bold"),
+        font=("Helvetica", 26, "bold"),
         fg="#00ffff",
         bg="#0a0a0a",
+        wraplength=760,
     )
-    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=14, ipady=12)
+    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8), ipady=6)
 
     _refresh_calibration_window()
 
@@ -2750,6 +2769,7 @@ def close_self_test():
     if self_test_window:
         self_test_window.destroy()
         self_test_window = None
+    arm_menu_ov_guard()
 
 def run_full_test():
     """Run comprehensive interactive full system test"""
@@ -2949,6 +2969,7 @@ def close_full_test():
     if full_test_window:
         full_test_window.destroy()
         full_test_window = None
+    arm_menu_ov_guard()
 
 def check_wifi_status():
     """Check if WiFi is connected and return status string"""
@@ -3273,6 +3294,7 @@ def close_update():
     if update_window:
         update_window.destroy()
         update_window = None
+    arm_menu_ov_guard()
 
 def confirm_reset_season():
     """Confirm and reset season total with OV/PS commands"""
@@ -3699,6 +3721,28 @@ def schedule_menu_highlight_update():
         return
     menu_highlight_refresh_pending = True
     root.after(0, _apply_menu_highlight_update)
+
+
+def arm_menu_ov_guard():
+    """Ignore repeated OV messages from the same press after a screen change."""
+    global menu_ov_guard_until
+    menu_ov_guard_until = time.time() + MENU_OV_GUARD_SECONDS
+
+
+def should_ignore_menu_ov_bounce(line, source):
+    global menu_ov_guard_until
+    if line != "OV":
+        menu_ov_guard_until = 0.0
+        return False
+    if time.time() >= menu_ov_guard_until:
+        return False
+    msg = f"{source}: Ignored OV bounce after menu select"
+    print(msg)
+    log_serial_debug(msg)
+    with open(debug_log, 'a') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    return True
+
 
 def menu_navigate_up():
     """Move selection up in menu"""
@@ -4831,7 +4875,7 @@ def socket_command_listener():
                                 root.after(0, lambda: switch_mode("mix"))
 
                             elif line == "RESET":
-                                root.after(0, pulse_flow_reset)
+                                root.after(0, lambda: force_flow_reset("socket_reset"))
 
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
@@ -5077,6 +5121,9 @@ def serial_listener():
                                 last_heartbeat_time = time.time()
                                 log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
+
+                            if should_ignore_menu_ov_bounce(line, "Serial"):
+                                continue
 
                             # Handle exit confirmation dialog
                             if exit_confirm_window:
@@ -5337,6 +5384,7 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    arm_menu_ov_guard()
                                     root.after(0, menu_select)
                                 else:
                                     with open(debug_log, 'a') as f:
@@ -5403,6 +5451,7 @@ def serial_listener():
                                             with open(debug_log, 'a') as f:
                                                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             # Show menu in main thread
+                                            arm_menu_ov_guard()
                                             root.after(0, show_menu)
                                     else:
                                         override_mode = not override_mode
@@ -6524,6 +6573,9 @@ def _sim_send_command(line):
         last_heartbeat_time = time.time()
         return
 
+    if should_ignore_menu_ov_bounce(line, "Sim"):
+        return
+
     if _sim_handle_confirmation_command(line):
         return
 
@@ -6533,6 +6585,7 @@ def _sim_send_command(line):
         elif line == "-1":
             menu_navigate_up()
         elif line == "OV":
+            arm_menu_ov_guard()
             menu_select()
         elif line == "PS":
             close_menu()
@@ -6555,6 +6608,7 @@ def _sim_send_command(line):
         threading.Thread(target=pump_stop_relay, daemon=True).start()
     elif line == "OV":
         if requested_gallons == 0:
+            arm_menu_ov_guard()
             show_menu()
         else:
             override_mode = not override_mode
