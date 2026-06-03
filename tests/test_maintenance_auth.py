@@ -250,6 +250,53 @@ def test_apply_allows_latest_verified_bbb_master_update(bumble_module, monkeypat
     assert bumble_module._read_update_meta(newer_id)['status'] == 'applied'
 
 
+def test_service_restart_uses_transient_unit_and_restarts_rotorsync_last(
+    bumble_module,
+    monkeypatch,
+):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(('run', cmd, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(bumble_module.subprocess, 'run', fake_run)
+
+    bumble_module._schedule_service_restart()
+
+    assert calls
+    kind, cmd, kwargs = calls[0]
+    assert kind == 'run'
+    assert cmd[:2] == ['systemd-run', '--unit=bbb-post-update-restart']
+    restart_cmd = cmd[-1]
+    assert 'systemctl restart iol_dashboard.service rotorsync_watchdog.service' in restart_cmd
+    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorsync.service')
+    assert kwargs['check'] is True
+
+
+def test_service_restart_fallback_still_restarts_rotorsync_last(
+    bumble_module,
+    monkeypatch,
+):
+    popen_calls = []
+
+    def fail_run(*_args, **_kwargs):
+        raise RuntimeError('systemd-run unavailable')
+
+    def fake_popen(cmd):
+        popen_calls.append(cmd)
+
+    monkeypatch.setattr(bumble_module.subprocess, 'run', fail_run)
+    monkeypatch.setattr(bumble_module.subprocess, 'Popen', fake_popen)
+
+    bumble_module._schedule_service_restart()
+
+    assert popen_calls
+    restart_cmd = popen_calls[0][-1]
+    assert 'systemctl restart iol_dashboard.service rotorsync_watchdog.service' in restart_cmd
+    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorsync.service')
+
+
 class CapturingBleDevice:
     def __init__(self):
         self.notifications = []

@@ -1287,8 +1287,30 @@ def _apply_tar_update(update_id, artifact_path):
 
 
 def _schedule_service_restart():
-    restart_cmd = 'sleep 1; systemctl restart rotorsync.service rotorsync_watchdog.service iol_dashboard.service'
-    subprocess.Popen(['bash', '-lc', restart_cmd])
+    restart_cmd = (
+        'sleep 1; '
+        'systemctl restart iol_dashboard.service rotorsync_watchdog.service; '
+        'systemctl restart rotorsync.service'
+    )
+    try:
+        subprocess.run(
+            [
+                'systemd-run',
+                '--unit=bbb-post-update-restart',
+                '--description=Restart BBB services after maintenance update',
+                '--on-active=1s',
+                '/bin/bash',
+                '-lc',
+                restart_cmd,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        print(f'systemd-run restart scheduling failed; using fallback: {e}', flush=True)
+        subprocess.Popen(['bash', '-lc', restart_cmd])
 
 
 def _handle_update_apply(frame):
