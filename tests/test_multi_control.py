@@ -274,30 +274,33 @@ def test_state_payload_stays_compact_with_curve_labels(bumble_module):
     assert len(json.dumps(payload, separators=(',', ':'))) < 160
 
 
-def test_live_telemetry_payload_only_includes_actual_and_flow(bumble_module):
-    payload = json.loads(bumble_module._encode_live_telemetry_payload(12.3456, 78.901))
+def test_live_telemetry_payload_includes_requested_actual_and_flow(bumble_module):
+    payload = json.loads(bumble_module._encode_live_telemetry_payload(10.0, 12.3456, 78.901))
 
     assert payload == {
+        'req': 10.0,
         'act': 12.346,
         'flow': 78.9,
     }
-    assert len(json.dumps(payload, separators=(',', ':'))) < 32
+    assert len(json.dumps(payload, separators=(',', ':'))) < 45
 
 
 def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monkeypatch):
     monkeypatch.setattr(
         bumble_module,
         'send_dashboard_command',
-        lambda cmd: 'LIVE:{"act":4.321,"flow":65.5}' if cmd == 'LIVE_TELEMETRY' else None,
+        lambda cmd: 'LIVE:{"req":12.0,"act":4.321,"flow":65.5}' if cmd == 'LIVE_TELEMETRY' else None,
     )
 
     read_value = bumble_module.make_live_telemetry_read_handler()
     payload = json.loads(read_value(connection('iphone')).decode('utf-8'))
 
     assert payload == {
+        'req': 12.0,
         'act': 4.321,
         'flow': 65.5,
     }
+    assert bumble_module.dashboard_status['requested'] == 12.0
     assert bumble_module.dashboard_status['actual'] == 4.321
 
 

@@ -210,9 +210,10 @@ def _encode_ble_state_payload(state):
     return json.dumps(compact, separators=(',', ':'))
 
 
-def _encode_live_telemetry_payload(actual, flow):
+def _encode_live_telemetry_payload(requested, actual, flow):
     return json.dumps(
         {
+            'req': round(float(requested), 3),
             'act': round(float(actual), 3),
             'flow': round(float(flow), 2),
         },
@@ -314,6 +315,7 @@ def query_dashboard_status():
             dashboard_status['state'] = state
             dashboard_status['state_json'] = _encode_ble_state_payload(state)
             dashboard_status['live_json'] = _encode_live_telemetry_payload(
+                state.get('requested_gal', 0.0),
                 state.get('actual_gal', 0.0),
                 state.get('flow_gpm', 0.0),
             )
@@ -345,6 +347,7 @@ def query_dashboard_status():
                 dashboard_status['state']
             )
             dashboard_status['live_json'] = _encode_live_telemetry_payload(
+                dashboard_status['requested'],
                 dashboard_status['actual'],
                 0.0,
             )
@@ -362,24 +365,28 @@ def query_live_telemetry():
         try:
             payload = response.split(':', 1)[1]
             live = json.loads(payload)
+            requested = float(live.get('req', dashboard_status.get('requested', 0.0)))
             actual = float(live.get('act', 0.0))
             flow = float(live.get('flow', 0.0))
+            dashboard_status['requested'] = requested
             dashboard_status['actual'] = actual
             state = dashboard_status.get('state') or {}
             if isinstance(state, dict):
+                state['requested_gal'] = requested
                 state['actual_gal'] = actual
                 state['flow_gpm'] = flow
                 dashboard_status['state'] = state
-            dashboard_status['live_json'] = _encode_live_telemetry_payload(actual, flow)
+            dashboard_status['live_json'] = _encode_live_telemetry_payload(requested, actual, flow)
             dashboard_status['last_update'] = time.time()
             return True
         except Exception as e:
             print(f'Live telemetry parse error: {e}', flush=True)
 
     state = dashboard_status.get('state') or {}
+    requested = state.get('requested_gal', dashboard_status.get('requested', 0.0))
     actual = state.get('actual_gal', dashboard_status.get('actual', 0.0))
     flow = state.get('flow_gpm', 0.0)
-    dashboard_status['live_json'] = _encode_live_telemetry_payload(actual, flow)
+    dashboard_status['live_json'] = _encode_live_telemetry_payload(requested, actual, flow)
     return False
 
 

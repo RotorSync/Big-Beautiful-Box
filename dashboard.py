@@ -5006,6 +5006,7 @@ def socket_command_listener():
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
                                 flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
                                 payload = {
+                                    "req": round(requested_gallons, 3),
                                     "act": round(actual, 3),
                                     "flow": round(flow_gpm, 2),
                                 }
