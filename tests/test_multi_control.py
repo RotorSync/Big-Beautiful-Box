@@ -26,6 +26,21 @@ def connection(peer):
     return types.SimpleNamespace(peer_address=peer)
 
 
+class FakeGattDevice:
+    def __init__(self):
+        self.advertising = False
+        self.public_address = 'AA:BB:CC:DD:EE:FF'
+        self.listeners = {}
+        self.start_calls = []
+
+    def on(self, event, callback):
+        self.listeners[event] = callback
+
+    async def start_advertising(self, **kwargs):
+        self.start_calls.append(kwargs)
+        self.advertising = True
+
+
 async def stop_worker(module):
     if module.control_command_worker_task:
         module.control_command_worker_task.cancel()
@@ -141,3 +156,57 @@ def test_config_responses_are_isolated_by_ble_peer(bumble_module):
         'request_id': 'phone-1',
         'op': 'NO_SUCH_OP',
     }
+
+
+def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monkeypatch):
+    persisted = []
+    device = FakeGattDevice()
+
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda name, address: persisted.append((name, address)),
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+        device.listeners['connection'](connection('iphone'))
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+    assert device.start_calls == [
+        {
+            'advertising_data': b'adv',
+            'scan_response_data': b'scan',
+            'auto_restart': True,
+        }
+    ]
+    assert persisted == [('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF')]
+
+
+def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):
+    class RejectingDevice(FakeGattDevice):
+        async def start_advertising(self, **kwargs):
+            self.start_calls.append(kwargs)
+            raise RuntimeError('command disallowed')
+
+    async def run():
+        result = await bumble_module.resume_gatt_advertising_after_connection(
+            RejectingDevice(),
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+            delay=0,
+        )
+        assert result is False
+
+    asyncio.run(run())
