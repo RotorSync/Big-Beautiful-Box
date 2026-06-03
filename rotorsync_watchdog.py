@@ -6,6 +6,7 @@ Tracks the Bumble-owned GATT adapter by sysfs device path so the watchdog does
 not touch the live controller with hciconfig while it is in use.
 """
 import logging
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -14,8 +15,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 CHECK_INTERVAL = 10
 FAIL_THRESHOLD = 2
+GATT_CLIENT_STALE_SECONDS = 120
+GATT_CLIENT_RESTART_COOLDOWN_SECONDS = 600
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'
 GATT_DEVICE_PATH_FILE = Path('/home/pi/rotorsync_gatt_device_path')
+GATT_ADVERTISING_READY_FILE = Path('/home/pi/rotorsync_gatt_advertising_ready.json')
+GATT_CLIENT_SEEN_FILE = Path('/home/pi/rotorsync_gatt_client_seen')
 
 last_known_hci = None
 
@@ -74,6 +79,40 @@ def read_expected_device_path():
         return None
 
 
+def read_timestamp_file(path):
+    """Read a plain or JSON timestamp written by rotorsync_bumble."""
+    try:
+        text = path.read_text(encoding='utf-8').strip()
+        if not text:
+            return None
+        if text.startswith('{'):
+            payload = json.loads(text)
+            return float(payload.get('timestamp'))
+        return float(text)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logging.error(f'Timestamp read error for {path}: {e}')
+        return None
+
+
+def stale_gatt_client_reason(now, advertising_started_at, client_seen_at):
+    """Return a restart reason when advertising is ready but no client is reading it."""
+    if not advertising_started_at:
+        return None
+
+    if client_seen_at and client_seen_at >= advertising_started_at:
+        stale_seconds = now - client_seen_at
+        if stale_seconds > GATT_CLIENT_STALE_SECONDS:
+            return f'no GATT client reads for {stale_seconds:.0f}s'
+        return None
+
+    age_seconds = now - advertising_started_at
+    if age_seconds > GATT_CLIENT_STALE_SECONDS:
+        return f'no GATT client reads since advertising started {age_seconds:.0f}s ago'
+    return None
+
+
 def restart_rotorsync():
     """Restart the rotorsync service."""
     logging.warning('Restarting rotorsync service...')
@@ -93,6 +132,7 @@ def main():
     logging.info(f'Check interval: {CHECK_INTERVAL}s, Fail threshold: {FAIL_THRESHOLD}')
 
     consecutive_failures = 0
+    last_gatt_client_restart_at = 0
     time.sleep(30)
 
     expected_device_path = read_expected_device_path()
@@ -116,13 +156,32 @@ def main():
             service_ok = check_service_running()
             current_hci = find_adapter_by_device_path(expected_device_path)
             adapter_ok = current_hci is not None
+            now = time.time()
+            advertising_started_at = read_timestamp_file(GATT_ADVERTISING_READY_FILE)
+            client_seen_at = read_timestamp_file(GATT_CLIENT_SEEN_FILE)
+            stale_client_reason = stale_gatt_client_reason(
+                now,
+                advertising_started_at,
+                client_seen_at,
+            )
+            if stale_client_reason and (
+                now - last_gatt_client_restart_at < GATT_CLIENT_RESTART_COOLDOWN_SECONDS
+            ):
+                remaining = GATT_CLIENT_RESTART_COOLDOWN_SECONDS - (
+                    now - last_gatt_client_restart_at
+                )
+                logging.info(
+                    f'Suppressing stale GATT client restart for {remaining:.0f}s: '
+                    f'{stale_client_reason}'
+                )
+                stale_client_reason = None
 
             hci_changed = False
             if last_known_hci and current_hci and current_hci != last_known_hci:
                 logging.warning(f'GATT adapter moved from {last_known_hci} to {current_hci}')
                 hci_changed = True
 
-            if service_ok and adapter_ok and not hci_changed:
+            if service_ok and adapter_ok and not hci_changed and not stale_client_reason:
                 if consecutive_failures > 0:
                     logging.info('Rotorsync healthy')
                 consecutive_failures = 0
@@ -136,12 +195,16 @@ def main():
                     reason.append('adapter missing')
                 if hci_changed:
                     reason.append(f'HCI changed {last_known_hci}->{current_hci}')
+                if stale_client_reason:
+                    reason.append(stale_client_reason)
 
                 logging.warning(
                     f'Rotorsync issue ({consecutive_failures}/{FAIL_THRESHOLD}): {", ".join(reason)}'
                 )
 
                 if hci_changed or consecutive_failures >= FAIL_THRESHOLD:
+                    if stale_client_reason:
+                        last_gatt_client_restart_at = now
                     restart_rotorsync()
                     consecutive_failures = 0
                     time.sleep(30)

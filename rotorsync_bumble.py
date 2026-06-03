@@ -98,6 +98,8 @@ CALIBRATION_PROFILE_DIR = os.path.join(MOPEKA_DIR, 'calibrations')
 MOPEKA_CONFIG_PATH = os.path.join(MOPEKA_DIR, 'mopeka_config.json')
 WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
+GATT_ADVERTISING_READY_FILE = '/home/pi/rotorsync_gatt_advertising_ready.json'
+GATT_CLIENT_SEEN_FILE = '/home/pi/rotorsync_gatt_client_seen'
 DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
 MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
@@ -173,6 +175,7 @@ ble_device = None
 dashboard_ready = False
 last_dashboard_error_log = 0.0
 last_dashboard_error_message = None
+last_gatt_client_seen_write = 0.0
 maintenance_chunks = {}
 maintenance_chunk_timeout = 30
 maintenance_shell_process = None
@@ -440,6 +443,46 @@ def persist_gatt_device_path(device_path):
     except Exception as e:
         print(f'Failed to persist GATT device path: {e}', flush=True)
 
+
+def _atomic_write_text(path, text):
+    tmp_path = f'{path}.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+def persist_gatt_advertising_ready(ble_name, address):
+    """Tell the watchdog that Bumble reached the advertising-ready point."""
+    try:
+        payload = {
+            'timestamp': time.time(),
+            'pid': os.getpid(),
+            'name': ble_name,
+            'address': str(address),
+        }
+        _atomic_write_text(
+            GATT_ADVERTISING_READY_FILE,
+            json.dumps(payload, separators=(',', ':')) + '\n',
+        )
+    except Exception as e:
+        print(f'Failed to persist GATT advertising ready state: {e}', flush=True)
+
+
+def mark_gatt_client_seen():
+    """Record recent GATT client activity without touching the Bluetooth adapter."""
+    global last_gatt_client_seen_write
+
+    now = time.time()
+    if now - last_gatt_client_seen_write < 5:
+        return
+
+    try:
+        _atomic_write_text(GATT_CLIENT_SEEN_FILE, f'{now:.3f}\n')
+        last_gatt_client_seen_write = now
+    except Exception as e:
+        print(f'Failed to persist GATT client heartbeat: {e}', flush=True)
+
+
 async def monitor_gatt_adapter(expected_adapter, expected_device_path):
     """Exit so systemd can restart if the GATT adapter is re-enumerated."""
     while True:
@@ -466,6 +509,7 @@ async def monitor_gatt_adapter(expected_adapter, expected_device_path):
 
 def make_read_handler(data_key):
     def read_value(connection):
+        mark_gatt_client_seen()
         data = sensor_data[data_key].copy()
         data.pop('last_update', None)
         value = json.dumps(data)
@@ -475,6 +519,7 @@ def make_read_handler(data_key):
 
 def make_history_read_handler():
     def read_value(connection):
+        mark_gatt_client_seen()
         value = dashboard_status['history']
         print(f'ReadValue history: {value[:50]}...', flush=True)
         return bytes(value, 'utf-8')
@@ -482,6 +527,7 @@ def make_history_read_handler():
 
 def make_dashboard_read_handler(field):
     def read_value(connection):
+        mark_gatt_client_seen()
         value = str(dashboard_status[field])
         print(f'ReadValue {field}: {value}', flush=True)
         return bytes(value, 'utf-8')
@@ -490,6 +536,7 @@ def make_dashboard_read_handler(field):
 
 def make_state_read_handler():
     def read_value(connection):
+        mark_gatt_client_seen()
         value = dashboard_status.get('state_json', '{}')
         print(f'ReadValue state: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
@@ -498,6 +545,7 @@ def make_state_read_handler():
 
 def make_config_notify_read_handler():
     def read_value(connection):
+        mark_gatt_client_seen()
         value = config_response
         print(f'ReadValue config_notify: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
@@ -3288,6 +3336,7 @@ async def main():
         scan_response_data=bytes(scan_response),
         auto_restart=True,
     )
+    persist_gatt_advertising_ready(ble_name, device.public_address)
     print('=== Rotorsync GATT Server Running ===', flush=True)
     print('Characteristics:', flush=True)
     print('  def1: BMS (read)        - {"voltage": x, "soc": y}', flush=True)
