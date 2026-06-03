@@ -13,6 +13,7 @@ import json
 import csv
 import shlex
 import builtins
+import math
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -1111,6 +1112,90 @@ def adjust_batch_mix_gallons(delta, source):
     root.after(0, update_batch_mix_overlay)
     root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
     return True
+
+
+def set_batch_mix_gallons(value, source):
+    """Set BatchMix water target and scale all formula amounts to match."""
+    global batch_mix_data, requested_gallons, mix_requested_gallons, colors_are_green
+
+    if not _batch_mix_payload_active():
+        return None
+
+    try:
+        water_target = max(1.0, float(value))
+        batch_mix_data = scaled_batchmix_payload_for_water(batch_mix_data, water_target)
+        water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        new_acres = float(batch_mix_data.get("total_acres", 0))
+    except Exception as exc:
+        msg = f"{source}: BatchMix gallon set failed: {exc}"
+        print(msg)
+        try:
+            with open(debug_log, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        except Exception:
+            pass
+        return False
+
+    requested_gallons = water_needed
+    mix_requested_gallons = water_needed
+    colors_are_green = False
+    save_mode_presets()
+
+    msg = (
+        f"{source}: Set BatchMix gallons to {water_needed:.1f}, "
+        f"acres now {new_acres:.1f}"
+    )
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, update_batch_mix_overlay)
+    root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
+    return True
+
+
+def set_requested_gallons(value, source):
+    """Set the active requested-gallons preset from a trusted control path."""
+    global requested_gallons, fill_requested_gallons, mix_requested_gallons, colors_are_green
+
+    try:
+        target = float(value)
+    except (TypeError, ValueError):
+        return False, "invalid number"
+
+    if not math.isfinite(target):
+        return False, "invalid number"
+
+    if current_mode == "mix":
+        batch_mix_result = set_batch_mix_gallons(target, source)
+        if batch_mix_result is not None:
+            if batch_mix_result:
+                return True, requested_gallons
+            return False, "batchmix set failed"
+
+    requested_gallons = max(0.0, target)
+    colors_are_green = False
+
+    if current_mode == "fill":
+        fill_requested_gallons = requested_gallons
+    else:
+        mix_requested_gallons = requested_gallons
+    save_mode_presets()
+
+    msg = f"{source}: Set requested gallons to {requested_gallons:.3f}"
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, lambda value=requested_gallons: draw_requested_number(_format_batch_mix_target(value), "red"))
+    root.after(0, update_batch_mix_overlay)
+    return True, requested_gallons
 
 def _format_batch_mix_product_amount(ounces):
     """Format product volume as gallons and ounces for display."""
@@ -2271,6 +2356,8 @@ def _build_dashboard_state_snapshot():
         "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
+        "current_curve": flow_curve_status_text(),
+        "pending_curve": flow_curve_proposal_status_text(),
     }
 
 
@@ -5012,11 +5099,21 @@ def socket_command_listener():
                                                 ts = parts[0].strip()
                                                 req = parts[1].replace("Requested:", "").replace("gal", "").strip()
                                                 act = parts[2].replace("Actual:", "").replace("gal", "").strip()
-                                                history_items.append(f"{ts},{req},{act}")
+                                                shutoff_type = parts[4].strip() if len(parts) >= 5 else ""
+                                                history_items.append(f"{ts},{req},{act},accepted,{shutoff_type}")
                                         history_response = ";".join(history_items)
                                         client.send(f"HIST:{history_response}\n".encode())
                                 except Exception:
                                     client.send(b"HIST:\n")
+                                continue
+
+                            elif line.startswith("SET_REQUESTED_GALLONS:"):
+                                value = line.split(":", 1)[1].strip()
+                                ok, result = set_requested_gallons(value, "Socket")
+                                if ok:
+                                    client.send(f"SET_REQUESTED_GALLONS_OK:{float(result):.3f}\n".encode())
+                                else:
+                                    client.send(f"SET_REQUESTED_GALLONS_ERR:{result}\n".encode())
                                 continue
 
                             elif line in ['+1', '-1', '+10', '-10']:
