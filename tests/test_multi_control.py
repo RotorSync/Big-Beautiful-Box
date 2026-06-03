@@ -308,7 +308,7 @@ def test_gatt_advertising_resume_hook_keeps_advertising_on(bumble_module, monkey
         {
             'advertising_data': b'adv',
             'scan_response_data': b'scan',
-            'auto_restart': True,
+            'auto_restart': False,
         }
     ]
     assert device.stop_calls == []
@@ -352,6 +352,7 @@ def test_gatt_advertising_stays_on_when_one_client_disconnects(
 
     assert bumble_module.active_gatt_connections == {'ipad'}
     assert device.advertising is True
+    assert len(device.start_calls) == 1
     assert device.stop_calls == []
 
 

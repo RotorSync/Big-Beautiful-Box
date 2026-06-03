@@ -551,7 +551,7 @@ async def restart_gatt_advertising_after_disconnect(
         await device.start_advertising(
             advertising_data=advertising_data,
             scan_response_data=scan_response_data,
-            auto_restart=True,
+            auto_restart=False,
         )
         persist_gatt_advertising_ready(ble_name, device.public_address)
         print('GATT advertising restarted after all clients disconnected', flush=True)
@@ -602,7 +602,7 @@ async def keep_gatt_connected_advertising_on(
         await device.start_advertising(
             advertising_data=advertising_data,
             scan_response_data=scan_response_data,
-            auto_restart=True,
+            auto_restart=False,
         )
         persist_gatt_advertising_ready(ble_name, device.public_address)
         print(
@@ -669,15 +669,9 @@ def install_gatt_advertising_resume_hook(
             flush=True,
         )
         if active_gatt_connections:
-            task = asyncio.create_task(
-                keep_gatt_connected_advertising_on(
-                    device,
-                    advertising_data,
-                    scan_response_data,
-                    ble_name,
-                    delay=0.0,
-                    reason='controller disconnected but anchor remains',
-                )
+            print(
+                'GATT advertising left untouched; anchor controller remains',
+                flush=True,
             )
         else:
             task = asyncio.create_task(
@@ -688,7 +682,7 @@ def install_gatt_advertising_resume_hook(
                     ble_name,
                 )
             )
-        task.add_done_callback(_handle_background_task_done)
+            task.add_done_callback(_handle_background_task_done)
 
     def on_connection(connection):
         peer = _connection_key(connection)
@@ -3804,7 +3798,7 @@ async def main():
     await device.start_advertising(
         advertising_data=advertising_payload,
         scan_response_data=scan_response_payload,
-        auto_restart=True,
+        auto_restart=False,
     )
     persist_gatt_advertising_ready(ble_name, device.public_address)
     print('=== Rotorsync GATT Server Running ===', flush=True)
