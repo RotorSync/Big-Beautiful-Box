@@ -8,13 +8,19 @@ Exposes requested/actual gallons from dashboard
 
 """
 import asyncio
+import base64
+import contextlib
 import csv
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import socket
+import tarfile
 import time
 
 logging.basicConfig(level=logging.INFO)
@@ -78,6 +84,9 @@ CONFIG_DATA_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefc') # Config da
 STATE_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefd')      # Live iOS-friendly dashboard state
 COMMAND_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefe')    # JSON command channel for iOS app
 CONFIG_NOTIFY_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdeff')  # Config response notify/read
+MAINTENANCE_CONTROL_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf00')
+MAINTENANCE_STDIN_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf01')
+MAINTENANCE_STDOUT_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf02')
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +99,11 @@ WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
 DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
+MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
+MAINTENANCE_REPO_DIR = '/home/pi/Big-Beautiful-Box'
+MAINTENANCE_TMP_DIR = '/tmp/rotorsync-maintenance-update'
+MAINTENANCE_UPDATE_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,96}$')
+MAINTENANCE_STDOUT_TEXT_CHARS = 180
 
 # Sensor data with timestamps
 sensor_data = {
@@ -137,10 +151,19 @@ def _encode_ble_state_payload(state):
 config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
 config_notify_char = None
+maintenance_stdout_char = None
 ble_device = None
 dashboard_ready = False
 last_dashboard_error_log = 0.0
 last_dashboard_error_message = None
+maintenance_chunks = {}
+maintenance_chunk_timeout = 30
+maintenance_shell_process = None
+maintenance_shell_reader_task = None
+maintenance_active_session_id = None
+maintenance_stdout_seq = 0
+maintenance_last_stdout_payload = '{"type":"status","text":"Maintenance bridge idle","seq":0}'
+maintenance_updates = {}
 
 # Chunked config command buffer
 config_cmd_chunks = {}
@@ -470,6 +493,620 @@ def _connection_key(connection):
         if value is not None:
             return str(value)
     return 'default'
+
+
+def _maintenance_session_id(default='unknown'):
+    return maintenance_active_session_id or default
+
+
+def _notify_maintenance_stdout():
+    if not ble_device or not maintenance_stdout_char:
+        return
+
+    async def _notify():
+        try:
+            await ble_device.notify_subscribers(
+                maintenance_stdout_char,
+                maintenance_last_stdout_payload.encode('utf-8'),
+            )
+        except Exception as e:
+            print(f'Maintenance stdout notify error: {e}', flush=True)
+
+    try:
+        asyncio.get_running_loop().create_task(_notify())
+    except RuntimeError:
+        pass
+
+
+def _set_maintenance_stdout_obj(obj):
+    global maintenance_stdout_seq, maintenance_last_stdout_payload
+    maintenance_stdout_seq += 1
+    payload = {
+        'type': obj.get('type', 'output'),
+        'seq': maintenance_stdout_seq,
+        'session_id': obj.get('session_id') or _maintenance_session_id(),
+    }
+    for key in ('text', 'data', 'reason', 'update_id', 'sha256', 'size', 'status'):
+        if key in obj and obj[key] is not None:
+            payload[key] = obj[key]
+    maintenance_last_stdout_payload = json.dumps(payload, separators=(',', ':'))
+    print(f'Maintenance stdout: {maintenance_last_stdout_payload[:220]}', flush=True)
+    _notify_maintenance_stdout()
+
+
+def _emit_maintenance_text(text, *, event_type='output', session_id=None):
+    text = str(text)
+    if not text:
+        return
+    for start in range(0, len(text), MAINTENANCE_STDOUT_TEXT_CHARS):
+        _set_maintenance_stdout_obj({
+            'type': event_type,
+            'session_id': session_id or _maintenance_session_id(),
+            'text': text[start:start + MAINTENANCE_STDOUT_TEXT_CHARS],
+        })
+
+
+def make_maintenance_stdout_read_handler():
+    def read_value(connection):
+        print(f'ReadValue maintenance stdout: {maintenance_last_stdout_payload[:120]}', flush=True)
+        return maintenance_last_stdout_payload.encode('utf-8')
+    return read_value
+
+
+def _cleanup_maintenance_chunks():
+    now = time.time()
+    stale_keys = [
+        key for key, buffer in maintenance_chunks.items()
+        if now - buffer.get('timestamp', 0) > maintenance_chunk_timeout
+    ]
+    for key in stale_keys:
+        maintenance_chunks.pop(key, None)
+
+
+def _decode_maintenance_write(connection, value, channel):
+    """Decode iOS maintenance MCHUNK frames into the original payload bytes."""
+    _cleanup_maintenance_chunks()
+    try:
+        data_str = value.decode('utf-8').strip()
+    except UnicodeDecodeError:
+        return value
+
+    if not data_str.startswith('MCHUNK:'):
+        return value
+
+    parts = data_str.split(':', 3)
+    if len(parts) != 4:
+        print(f'Maintenance {channel}: invalid chunk header', flush=True)
+        return None
+
+    message_id, chunk_info, chunk_data = parts[1], parts[2], parts[3]
+    try:
+        chunk_num_str, total_chunks_str = chunk_info.split('/', 1)
+        chunk_num = int(chunk_num_str)
+        total_chunks = int(total_chunks_str)
+    except Exception:
+        print(f'Maintenance {channel}: invalid chunk count {chunk_info!r}', flush=True)
+        return None
+
+    if chunk_num < 1 or total_chunks < 1 or chunk_num > total_chunks:
+        print(f'Maintenance {channel}: out-of-range chunk {chunk_info!r}', flush=True)
+        return None
+
+    key = f'{_connection_key(connection)}:{channel}:{message_id}'
+    buffer = maintenance_chunks.get(key)
+    if not buffer or buffer.get('total') != total_chunks:
+        buffer = {'chunks': {}, 'total': total_chunks, 'timestamp': time.time()}
+        maintenance_chunks[key] = buffer
+
+    buffer['chunks'][chunk_num] = chunk_data
+    buffer['timestamp'] = time.time()
+    print(
+        f'Maintenance {channel} chunk {chunk_num}/{total_chunks} '
+        f'({len(chunk_data)} chars)',
+        flush=True,
+    )
+
+    if len(buffer['chunks']) < total_chunks:
+        return None
+
+    try:
+        encoded = ''.join(buffer['chunks'][i] for i in range(1, total_chunks + 1))
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception as e:
+        print(f'Maintenance {channel}: chunk decode failed: {e}', flush=True)
+        maintenance_chunks.pop(key, None)
+        return None
+
+    maintenance_chunks.pop(key, None)
+    print(f'Maintenance {channel} complete: {len(decoded)} bytes', flush=True)
+    return decoded
+
+
+def _parse_maintenance_payload(payload_bytes):
+    try:
+        text = payload_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        return None, payload_bytes
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None, payload_bytes
+    return obj if isinstance(obj, dict) else None, payload_bytes
+
+
+async def _stop_maintenance_shell(reason='closed'):
+    global maintenance_shell_process, maintenance_shell_reader_task, maintenance_active_session_id
+    process = maintenance_shell_process
+    task = maintenance_shell_reader_task
+    current_task = asyncio.current_task()
+    maintenance_shell_process = None
+    maintenance_shell_reader_task = None
+
+    if task and task is not current_task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    if process and process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+    _set_maintenance_stdout_obj({
+        'type': 'closed',
+        'session_id': _maintenance_session_id(),
+        'reason': reason,
+    })
+    maintenance_active_session_id = None
+
+
+async def _read_maintenance_shell_stdout(process, session_id):
+    try:
+        while True:
+            chunk = await process.stdout.read(256)
+            if not chunk:
+                break
+            _emit_maintenance_text(
+                chunk.decode('utf-8', errors='replace'),
+                session_id=session_id,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _emit_maintenance_text(f'\n[maintenance stdout error: {e}]\n', session_id=session_id)
+    finally:
+        if maintenance_shell_process is process:
+            await _stop_maintenance_shell('shell exited')
+
+
+async def _ensure_maintenance_shell(session_id=None):
+    global maintenance_shell_process, maintenance_shell_reader_task, maintenance_active_session_id
+    if maintenance_shell_process and maintenance_shell_process.returncode is None:
+        if session_id:
+            maintenance_active_session_id = session_id
+        return maintenance_shell_process
+
+    maintenance_active_session_id = session_id or maintenance_active_session_id or 'unknown'
+    env = dict(os.environ)
+    env.setdefault('TERM', 'dumb')
+    process = await asyncio.create_subprocess_exec(
+        '/bin/bash',
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=MAINTENANCE_REPO_DIR if os.path.isdir(MAINTENANCE_REPO_DIR) else os.getcwd(),
+        env=env,
+    )
+    maintenance_shell_process = process
+    maintenance_shell_reader_task = asyncio.create_task(
+        _read_maintenance_shell_stdout(process, maintenance_active_session_id)
+    )
+    _set_maintenance_stdout_obj({
+        'type': 'session_opened',
+        'session_id': maintenance_active_session_id,
+        'text': 'Maintenance shell ready\n',
+    })
+    return process
+
+
+def _safe_update_id(update_id):
+    update_id = str(update_id or '').strip()
+    if not MAINTENANCE_UPDATE_ID_RE.match(update_id):
+        raise ValueError('invalid update_id')
+    return update_id
+
+
+def _update_paths(update_id):
+    safe_id = _safe_update_id(update_id)
+    base = Path(MAINTENANCE_UPDATE_DIR) / safe_id
+    return {
+        'base': base,
+        'tmp': base / 'artifact.bin.tmp',
+        'artifact': base / 'artifact.bin',
+        'meta': base / 'metadata.json',
+    }
+
+
+def _read_update_meta(update_id):
+    paths = _update_paths(update_id)
+    try:
+        with open(paths['meta'], 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def _write_update_meta(update_id, meta):
+    paths = _update_paths(update_id)
+    paths['base'].mkdir(parents=True, exist_ok=True)
+    with open(paths['meta'], 'w', encoding='utf-8') as f:
+        json.dump(meta, f, separators=(',', ':'), sort_keys=True)
+
+
+def _emit_update_status(event_type, update_id, text, **extra):
+    obj = {
+        'type': event_type,
+        'update_id': update_id,
+        'text': text,
+    }
+    obj.update(extra)
+    _set_maintenance_stdout_obj(obj)
+
+
+def _handle_update_begin(frame):
+    update_id = _safe_update_id(frame.get('update_id'))
+    expected_size = int(frame.get('size', -1))
+    expected_sha = str(frame.get('sha256', '')).lower()
+    if expected_size <= 0 or not re.match(r'^[a-f0-9]{64}$', expected_sha):
+        raise ValueError('invalid update size or sha256')
+    paths = _update_paths(update_id)
+    paths['base'].mkdir(parents=True, exist_ok=True)
+    with open(paths['tmp'], 'wb'):
+        pass
+    meta = {
+        'update_id': update_id,
+        'expected_size': expected_size,
+        'expected_sha256': expected_sha,
+        'received': 0,
+        'status': 'receiving',
+        'started_at': time.time(),
+    }
+    _write_update_meta(update_id, meta)
+    maintenance_updates[update_id] = meta
+    _emit_update_status('update_receiving', update_id, f'Receiving update {update_id}\n')
+
+
+def _handle_update_chunk(frame):
+    update_id = _safe_update_id(frame.get('update_id'))
+    paths = _update_paths(update_id)
+    meta = _read_update_meta(update_id)
+    if not meta or meta.get('status') != 'receiving':
+        raise ValueError('update is not receiving')
+    offset = int(frame.get('offset', -1))
+    try:
+        chunk = base64.b64decode(str(frame.get('data_b64', '')), validate=True)
+    except Exception as e:
+        raise ValueError(f'invalid update chunk base64: {e}') from e
+    current_size = paths['tmp'].stat().st_size if paths['tmp'].exists() else 0
+    if offset != current_size:
+        raise ValueError(f'chunk offset mismatch: got {offset}, expected {current_size}')
+    expected_size = int(meta['expected_size'])
+    if current_size + len(chunk) > expected_size:
+        raise ValueError('update chunk exceeds expected size')
+    with open(paths['tmp'], 'ab') as f:
+        f.write(chunk)
+    meta['received'] = current_size + len(chunk)
+    meta['updated_at'] = time.time()
+    _write_update_meta(update_id, meta)
+    if meta['received'] == expected_size:
+        _emit_update_status(
+            'update_received',
+            update_id,
+            f'Received {meta["received"]} bytes for {update_id}\n',
+            size=meta['received'],
+        )
+
+
+def _handle_update_finalize(frame):
+    update_id = _safe_update_id(frame.get('update_id'))
+    paths = _update_paths(update_id)
+    meta = _read_update_meta(update_id)
+    if not meta:
+        raise ValueError('unknown update')
+    expected_size = int(meta['expected_size'])
+    actual_size = paths['tmp'].stat().st_size if paths['tmp'].exists() else -1
+    if actual_size != expected_size:
+        raise ValueError(f'update size mismatch: got {actual_size}, expected {expected_size}')
+    digest = hashlib.sha256()
+    with open(paths['tmp'], 'rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(block)
+    actual_sha = digest.hexdigest()
+    if actual_sha != meta['expected_sha256']:
+        raise ValueError('update sha256 mismatch')
+    os.replace(paths['tmp'], paths['artifact'])
+    meta.update({
+        'status': 'verified',
+        'sha256': actual_sha,
+        'size': actual_size,
+        'verified_at': time.time(),
+    })
+    _write_update_meta(update_id, meta)
+    _emit_update_status(
+        'update_verified',
+        update_id,
+        f'Verified update {update_id}: {actual_size} bytes\n',
+        sha256=actual_sha,
+        size=actual_size,
+    )
+
+
+def _handle_update_status(frame):
+    update_id = _safe_update_id(frame.get('update_id'))
+    meta = _read_update_meta(update_id)
+    if not meta:
+        _emit_update_status('update_status', update_id, f'No staged update {update_id}\n', status='missing')
+        return
+    _emit_update_status(
+        'update_status',
+        update_id,
+        f'Update {update_id}: {meta.get("status", "unknown")}\n',
+        status=meta.get('status'),
+        size=meta.get('size') or meta.get('received'),
+        sha256=meta.get('sha256') or meta.get('expected_sha256'),
+    )
+
+
+def _validate_tar_member(member):
+    name = member.name
+    if name.startswith('/') or '..' in Path(name).parts:
+        raise ValueError(f'unsafe tar path: {name}')
+    if member.islnk() or member.issym() or member.isdev():
+        raise ValueError(f'unsafe tar member type: {name}')
+
+
+def _find_extracted_update_root(extract_dir):
+    root = Path(extract_dir)
+    if (root / 'dashboard.py').exists() and (root / 'rotorsync_bumble.py').exists():
+        return root
+    children = [child for child in root.iterdir() if child.is_dir()]
+    if len(children) == 1:
+        child = children[0]
+        if (child / 'dashboard.py').exists() and (child / 'rotorsync_bumble.py').exists():
+            return child
+    raise ValueError('update tar does not look like a BBB repo snapshot')
+
+
+def _copy_path(src, dst):
+    src = Path(src)
+    dst = Path(dst)
+    if src.is_dir():
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    elif src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _backup_current_runtime(update_id):
+    backup_dir = Path(MAINTENANCE_UPDATE_DIR) / update_id / 'backup'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    repo = Path(MAINTENANCE_REPO_DIR)
+    for name in ('dashboard.py', 'rotorsync_bumble.py', 'rotorsync_watchdog.py', 'start_iol_dashboard.sh', 'VERSION', 'config.py'):
+        src = repo / name
+        if src.exists():
+            _copy_path(src, backup_dir / name)
+    for name in ('src',):
+        src = repo / name
+        if src.exists():
+            _copy_path(src, backup_dir / name)
+    return backup_dir
+
+
+def _refresh_opt_runtime(repo_root):
+    opt_root = Path('/opt')
+    (opt_root / 'src').mkdir(parents=True, exist_ok=True)
+    _copy_path(repo_root / 'rotorsync_bumble.py', opt_root / 'rotorsync_bumble.py')
+    _copy_path(repo_root / 'rotorsync_watchdog.py', opt_root / 'rotorsync_watchdog.py')
+    _copy_path(repo_root / 'src', opt_root / 'src')
+    mopeka_src = repo_root / 'mopeka'
+    mopeka_dst = opt_root / 'mopeka'
+    if mopeka_src.exists():
+        mopeka_dst.mkdir(parents=True, exist_ok=True)
+        for file_path in mopeka_src.iterdir():
+            if not file_path.is_file():
+                continue
+            if file_path.name == 'mopeka_config.json' and (mopeka_dst / file_path.name).exists():
+                continue
+            shutil.copy2(file_path, mopeka_dst / file_path.name)
+    for relative in ('deploy/bbb-logrotate.conf', 'deploy/bbb-logrotate.service', 'deploy/bbb-logrotate.timer'):
+        src = repo_root / relative
+        if not src.exists():
+            continue
+        name = Path(relative).name
+        dst = Path('/etc/logrotate.d/bbb') if name == 'bbb-logrotate.conf' else Path('/etc/systemd/system') / name
+        _copy_path(src, dst)
+
+
+def _apply_tar_update(update_id, artifact_path):
+    extract_dir = Path(MAINTENANCE_TMP_DIR) / update_id
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(artifact_path) as archive:
+        for member in archive.getmembers():
+            _validate_tar_member(member)
+        archive.extractall(extract_dir)
+
+    update_root = _find_extracted_update_root(extract_dir)
+    for required in ('dashboard.py', 'rotorsync_bumble.py', 'src'):
+        if not (update_root / required).exists():
+            raise ValueError(f'update is missing {required}')
+
+    subprocess.run(
+        ['python3', '-m', 'py_compile', str(update_root / 'dashboard.py'), str(update_root / 'rotorsync_bumble.py')],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    subprocess.run(
+        ['python3', '-m', 'compileall', '-q', str(update_root / 'src')],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    repo = Path(MAINTENANCE_REPO_DIR)
+    if not repo.exists():
+        raise ValueError(f'{MAINTENANCE_REPO_DIR} does not exist')
+
+    _backup_current_runtime(update_id)
+    for name in (
+        'dashboard.py',
+        'rotorsync_bumble.py',
+        'rotorsync_watchdog.py',
+        'start_iol_dashboard.sh',
+        'VERSION',
+        'config.py',
+        'requirements.txt',
+        'install.sh',
+        'src',
+        'deploy',
+    ):
+        src = update_root / name
+        if src.exists():
+            _copy_path(src, repo / name)
+
+    _refresh_opt_runtime(repo)
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
+    subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
+    return update_root
+
+
+def _schedule_service_restart():
+    restart_cmd = 'sleep 1; systemctl restart rotorsync.service rotorsync_watchdog.service iol_dashboard.service'
+    subprocess.Popen(['bash', '-lc', restart_cmd])
+
+
+def _handle_update_apply(frame):
+    update_id = _safe_update_id(frame.get('update_id'))
+    paths = _update_paths(update_id)
+    meta = _read_update_meta(update_id)
+    if not meta or meta.get('status') != 'verified' or not paths['artifact'].exists():
+        raise ValueError('update is not verified')
+    if not tarfile.is_tarfile(paths['artifact']):
+        raise ValueError('verified artifact is not a tar archive')
+
+    _emit_update_status('update_applying', update_id, f'Applying update {update_id}\n')
+    _apply_tar_update(update_id, paths['artifact'])
+    meta['status'] = 'applied'
+    meta['applied_at'] = time.time()
+    _write_update_meta(update_id, meta)
+    _emit_update_status(
+        'update_applied',
+        update_id,
+        'Update applied; restarting BBB services\n',
+        status='restarting',
+    )
+    _schedule_service_restart()
+
+
+async def _write_maintenance_stdin_bytes(data, session_id=None):
+    process = await _ensure_maintenance_shell(session_id)
+    if not process.stdin:
+        raise RuntimeError('maintenance shell stdin unavailable')
+    process.stdin.write(data)
+    await process.stdin.drain()
+
+
+async def _handle_maintenance_control_payload(payload_bytes):
+    global maintenance_active_session_id
+    frame, raw = _parse_maintenance_payload(payload_bytes)
+    if not frame:
+        await _write_maintenance_stdin_bytes(raw)
+        return
+
+    frame_type = str(frame.get('type') or frame.get('kind') or frame.get('op') or '').lower()
+    session_id = frame.get('session_id') or frame.get('sessionId') or maintenance_active_session_id
+    if session_id:
+        maintenance_active_session_id = str(session_id)
+
+    try:
+        if frame_type == 'open':
+            await _ensure_maintenance_shell(str(session_id) if session_id else None)
+        elif frame_type in ('heartbeat', 'resize'):
+            _set_maintenance_stdout_obj({
+                'type': frame_type,
+                'session_id': _maintenance_session_id(),
+                'text': f'{frame_type} ack\n',
+            })
+        elif frame_type == 'close':
+            await _stop_maintenance_shell('remote close requested')
+        elif frame_type == 'stdin':
+            await _write_maintenance_stdin_bytes(str(frame.get('data', '')).encode('utf-8'), str(session_id) if session_id else None)
+        elif frame_type == 'update_begin':
+            _handle_update_begin(frame)
+        elif frame_type == 'update_chunk':
+            _handle_update_chunk(frame)
+        elif frame_type == 'update_finalize':
+            _handle_update_finalize(frame)
+        elif frame_type == 'update_status':
+            _handle_update_status(frame)
+        elif frame_type == 'update_apply':
+            _handle_update_apply(frame)
+        else:
+            data = frame.get('data') or frame.get('command') or frame.get('cmd')
+            if data:
+                await _write_maintenance_stdin_bytes(str(data).encode('utf-8'), str(session_id) if session_id else None)
+            else:
+                _emit_maintenance_text(f'Unsupported maintenance frame type: {frame_type or "unknown"}\n')
+    except Exception as e:
+        print(f'Maintenance control error: {e}', flush=True)
+        _set_maintenance_stdout_obj({
+            'type': 'error',
+            'session_id': _maintenance_session_id(),
+            'text': f'{e}\n',
+            'reason': str(e),
+        })
+
+
+async def _handle_maintenance_stdin_payload(payload_bytes):
+    frame, raw = _parse_maintenance_payload(payload_bytes)
+    if frame:
+        session_id = frame.get('session_id') or frame.get('sessionId') or maintenance_active_session_id
+        data = frame.get('data')
+        if data is None:
+            data = frame.get('input') or frame.get('text') or ''
+        await _write_maintenance_stdin_bytes(str(data).encode('utf-8'), str(session_id) if session_id else None)
+    else:
+        await _write_maintenance_stdin_bytes(raw)
+
+
+def maintenance_control_write_handler(connection, value):
+    payload = _decode_maintenance_write(connection, value, 'control')
+    if payload is None:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_handle_maintenance_control_payload(payload))
+    except RuntimeError:
+        print('Maintenance control ignored: no event loop', flush=True)
+
+
+def maintenance_stdin_write_handler(connection, value):
+    payload = _decode_maintenance_write(connection, value, 'stdin')
+    if payload is None:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_handle_maintenance_stdin_payload(payload))
+    except RuntimeError:
+        print('Maintenance stdin ignored: no event loop', flush=True)
 
 
 def _notify_config_response():
@@ -2218,7 +2855,7 @@ async def monitor_sensor_health(sensor_task):
             os._exit(1)
 
 async def main():
-    global ble_device, config_notify_char
+    global ble_device, config_notify_char, maintenance_stdout_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
@@ -2349,6 +2986,24 @@ async def main():
         Characteristic.READABLE,
         CharacteristicValue(read=make_config_notify_read_handler()),
     )
+    maintenance_control_char = Characteristic(
+        MAINTENANCE_CONTROL_CHAR_UUID,
+        Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
+        Characteristic.WRITEABLE,
+        CharacteristicValue(write=maintenance_control_write_handler),
+    )
+    maintenance_stdin_char = Characteristic(
+        MAINTENANCE_STDIN_CHAR_UUID,
+        Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
+        Characteristic.WRITEABLE,
+        CharacteristicValue(write=maintenance_stdin_write_handler),
+    )
+    maintenance_stdout_char = Characteristic(
+        MAINTENANCE_STDOUT_CHAR_UUID,
+        Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+        Characteristic.READABLE,
+        CharacteristicValue(read=make_maintenance_stdout_read_handler()),
+    )
 
     service = Service(
         SERVICE_UUID,
@@ -2368,6 +3023,9 @@ async def main():
             config_cmd_char,
             config_data_char,
             config_notify_char,
+            maintenance_control_char,
+            maintenance_stdin_char,
+            maintenance_stdout_char,
         ],
     )
     device.add_service(service)
@@ -2414,6 +3072,9 @@ async def main():
     print('  defb: ConfigCmd (write) - JSON commands for sensor/calibration CRUD', flush=True)
     print('  defc: ConfigData (read) - response from last config command', flush=True)
     print('  deff: ConfigNotify(r/n) - last config response with request_id echo', flush=True)
+    print('  df00: MaintCtl (write) - admin maintenance control/update frames', flush=True)
+    print('  df01: MaintIn (write)  - admin maintenance shell stdin', flush=True)
+    print('  df02: MaintOut (r/n)   - admin maintenance shell stdout/status', flush=True)
 
     await asyncio.Event().wait()
 
