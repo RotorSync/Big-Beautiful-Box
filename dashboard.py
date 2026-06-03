@@ -5016,6 +5016,9 @@ def socket_command_listener():
                             elif line == "RESET":
                                 root.after(0, lambda: force_flow_reset("socket_reset"))
 
+                            elif line == "TU":
+                                root.after(0, lambda: handle_thumbs_up_press("socket TU"))
+
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
 

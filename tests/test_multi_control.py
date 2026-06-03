@@ -32,6 +32,7 @@ class FakeGattDevice:
         self.public_address = 'AA:BB:CC:DD:EE:FF'
         self.listeners = {}
         self.start_calls = []
+        self.stop_calls = []
 
     def on(self, event, callback):
         self.listeners[event] = callback
@@ -39,6 +40,10 @@ class FakeGattDevice:
     async def start_advertising(self, **kwargs):
         self.start_calls.append(kwargs)
         self.advertising = True
+
+    async def stop_advertising(self):
+        self.stop_calls.append({})
+        self.advertising = False
 
 
 async def stop_worker(module):
@@ -136,6 +141,54 @@ def test_reset_flow_command_forwards_dashboard_reset(bumble_module, monkeypatch)
     assert queries == ['query']
 
 
+def test_confirm_fill_command_forwards_dashboard_tu(bumble_module, monkeypatch):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'confirm_fill'}).encode('utf-8'),
+    )
+
+    assert sent == ['TU']
+    assert queries == ['query']
+
+
+def test_accept_pending_curve_command_forwards_dashboard_apply(bumble_module, monkeypatch):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'CURVE_ACCEPTED:{}',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'accept_pending_curve'}).encode('utf-8'),
+    )
+
+    assert sent == ['ACCEPT_PENDING_CURVE']
+    assert queries == ['query']
+
+
 def test_control_write_falls_back_inline_before_worker_starts(bumble_module, monkeypatch):
     sent = []
     queries = []
@@ -182,9 +235,40 @@ def test_config_responses_are_isolated_by_ble_peer(bumble_module):
     }
 
 
+def test_state_payload_stays_compact_with_curve_labels(bumble_module):
+    payload = json.loads(bumble_module._encode_ble_state_payload({
+        'version': 'V2.8',
+        'requested_gal': 10.0,
+        'actual_gal': 0.0,
+        'flow_gpm': 0.0,
+        'mode': 'fill',
+        'override': False,
+        'thumbs_visible': False,
+        'fill_pending': False,
+        'can_confirm_fill': False,
+        'colors_green': False,
+        'pump_stop_latched': False,
+        'flow_meter_connected': True,
+        'switch_box_connected': True,
+        'current_curve': 'Learned -0.10 gal',
+        'pending_curve': 'No pending curve',
+    }))
+
+    assert payload == {
+        'ver': 'V2.8',
+        'req': 10.0,
+        'act': 0.0,
+        'flow': 0.0,
+        'mode': 'fill',
+        'cc': '-0.10',
+    }
+    assert len(json.dumps(payload, separators=(',', ':'))) < 160
+
+
 def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monkeypatch):
     persisted = []
     device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
 
     monkeypatch.setattr(
         bumble_module,
@@ -204,6 +288,10 @@ def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monk
         deadline = asyncio.get_running_loop().time() + 1
         while not device.start_calls and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
+        device.listeners['connection'](connection('ipad'))
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.stop_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
 
     asyncio.run(run())
 
@@ -214,7 +302,27 @@ def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monk
             'auto_restart': True,
         }
     ]
+    assert device.stop_calls == [{}]
     assert persisted == [('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF')]
+
+
+def test_gatt_advertising_resume_hook_can_be_disabled_for_single_client_mode(
+    bumble_module,
+    monkeypatch,
+):
+    device = FakeGattDevice()
+    monkeypatch.setenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', '1')
+
+    installed = bumble_module.install_gatt_advertising_resume_hook(
+        device,
+        b'adv',
+        b'scan',
+        'TrailerSync-TR2',
+    )
+
+    assert installed is False
+    assert device.listeners == {}
+    assert device.start_calls == []
 
 
 def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):

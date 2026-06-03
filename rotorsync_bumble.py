@@ -63,6 +63,7 @@ STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_PO
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
+GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS = 8.0
 
 # Recovery settings
 MAX_CONSECUTIVE_FAILURES = 5
@@ -70,6 +71,7 @@ ADAPTER_RESET_COOLDOWN = 30
 GATT_ADAPTER_CHECK_INTERVAL = 5
 SENSOR_LOOP_HEARTBEAT_TIMEOUT = 120
 SENSOR_ADAPTER_OPEN_TIMEOUT = 10
+GATT_ADVERTISING_RESUME_FAILURE_BACKOFF_SECONDS = 20
 
 # UUIDs
 SERVICE_UUID = UUID('12345678-1234-5678-1234-56789abcdef0')
@@ -150,25 +152,55 @@ dashboard_status = {
 sensor_loop_heartbeat = 0.0
 calibration_mtime_snapshot = None
 last_calibration_reload_check = 0.0
+connected_advertising_resume_succeeded = False
+connected_advertising_next_retry_at = 0.0
+connected_advertising_stop_task = None
 
 
 def _encode_ble_state_payload(state):
     """Encode the dashboard snapshot into a compact BLE/iOS-friendly JSON payload."""
+    def put_if_present(target, key, value):
+        if value is not None:
+            target[key] = value
+
+    def put_bool_if_non_default(target, key, value, default):
+        if value is None:
+            return
+        bool_value = bool(value)
+        if bool_value != default:
+            target[key] = bool_value
+
+    def compact_curve_value(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if 'no pending' in lowered or lowered in ('none', '--'):
+            return None
+        match = re.search(r'[-+]?\d+(?:\.\d+)?', text)
+        if match:
+            return match.group(0)
+        return text[:24]
+
     compact = {
         'ver': state.get('version'),
         'req': state.get('requested_gal'),
         'act': state.get('actual_gal'),
         'flow': state.get('flow_gpm'),
         'mode': state.get('mode'),
-        'ov': state.get('override'),
-        'thumb': state.get('thumbs_visible'),
-        'pend': state.get('fill_pending'),
-        'confirm': state.get('can_confirm_fill'),
-        'green': state.get('colors_green'),
-        'latch': state.get('pump_stop_latched'),
-        'fm_ok': state.get('flow_meter_connected'),
-        'sb_ok': state.get('switch_box_connected'),
     }
+    put_bool_if_non_default(compact, 'ov', state.get('override'), False)
+    put_bool_if_non_default(compact, 'thumb', state.get('thumbs_visible'), False)
+    put_bool_if_non_default(compact, 'pend', state.get('fill_pending'), False)
+    put_bool_if_non_default(compact, 'confirm', state.get('can_confirm_fill'), False)
+    put_bool_if_non_default(compact, 'green', state.get('colors_green'), False)
+    put_bool_if_non_default(compact, 'latch', state.get('pump_stop_latched'), False)
+    put_bool_if_non_default(compact, 'fm_ok', state.get('flow_meter_connected'), True)
+    put_bool_if_non_default(compact, 'sb_ok', state.get('switch_box_connected'), True)
+    put_if_present(compact, 'cc', compact_curve_value(state.get('current_curve')))
+    put_if_present(compact, 'pc', compact_curve_value(state.get('pending_curve')))
     return json.dumps(compact, separators=(',', ':'))
 
 # Config command state
@@ -493,6 +525,39 @@ def _is_gatt_advertising(device):
     return False
 
 
+async def stop_gatt_connected_advertising(device, reason, *, delay=0.0):
+    """Stop the connected advertising window without touching active clients."""
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    if not _is_gatt_advertising(device):
+        print(f'GATT connected advertising already stopped: {reason}', flush=True)
+        return True
+
+    try:
+        await device.stop_advertising()
+        print(f'GATT connected advertising stopped: {reason}', flush=True)
+        return True
+    except Exception as e:
+        print(
+            f'GATT connected advertising stop failed: {type(e).__name__}: {e}',
+            flush=True,
+        )
+        return False
+
+
+def schedule_gatt_connected_advertising_stop(device, reason, *, delay):
+    global connected_advertising_stop_task
+
+    if connected_advertising_stop_task and not connected_advertising_stop_task.done():
+        connected_advertising_stop_task.cancel()
+
+    connected_advertising_stop_task = asyncio.create_task(
+        stop_gatt_connected_advertising(device, reason, delay=delay)
+    )
+    connected_advertising_stop_task.add_done_callback(_handle_background_task_done)
+
+
 async def resume_gatt_advertising_after_connection(
     device,
     advertising_data,
@@ -502,11 +567,42 @@ async def resume_gatt_advertising_after_connection(
     delay=GATT_ADVERTISING_RESUME_DELAY_SECONDS,
 ):
     """Try to keep the GATT server discoverable after one client connects."""
+    global connected_advertising_resume_succeeded, connected_advertising_next_retry_at
+
     if delay > 0:
         await asyncio.sleep(delay)
 
+    now = time.time()
+    if connected_advertising_resume_succeeded:
+        print(
+            'GATT connected advertising already resumed once; skipping duplicate '
+            'resume request',
+            flush=True,
+        )
+        schedule_gatt_connected_advertising_stop(
+            device,
+            'additional client connection observed',
+            delay=0.0,
+        )
+        return True
+
+    if connected_advertising_next_retry_at > now:
+        remaining = int(connected_advertising_next_retry_at - now)
+        print(
+            f'GATT advertising resume retry suppressed for {remaining}s after '
+            'recent controller error',
+            flush=True,
+        )
+        return False
+
     if _is_gatt_advertising(device):
         print('GATT advertising already active after connection', flush=True)
+        connected_advertising_resume_succeeded = True
+        schedule_gatt_connected_advertising_stop(
+            device,
+            'connected advertising window elapsed',
+            delay=GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS,
+        )
         return True
 
     try:
@@ -521,8 +617,17 @@ async def resume_gatt_advertising_after_connection(
             'should be able to discover this trailer',
             flush=True,
         )
+        connected_advertising_resume_succeeded = True
+        schedule_gatt_connected_advertising_stop(
+            device,
+            'connected advertising window elapsed',
+            delay=GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS,
+        )
         return True
     except Exception as e:
+        connected_advertising_next_retry_at = (
+            time.time() + GATT_ADVERTISING_RESUME_FAILURE_BACKOFF_SECONDS
+        )
         print(
             'GATT advertising resume after connection failed; controller may not '
             f'support advertising while connected: {type(e).__name__}: {e}',
@@ -537,6 +642,14 @@ def install_gatt_advertising_resume_hook(
     scan_response_data,
     ble_name,
 ):
+    if os.environ.get('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING') == '1':
+        print(
+            'GATT advertising resume-on-connect hook disabled; '
+            'controller is single-client stable mode',
+            flush=True,
+        )
+        return False
+
     if not hasattr(device, 'on'):
         print('GATT advertising resume hook unavailable: Bumble device has no event API', flush=True)
         return False
@@ -1755,6 +1868,14 @@ def command_write_handler(connection, value):
 
     if command in ('reset_flow', 'flow_reset'):
         _enqueue_control_actions(connection, 'command:reset_flow', 'RESET')
+        return
+
+    if command in ('accept_pending_curve', 'apply_pending_curve'):
+        _enqueue_control_actions(
+            connection,
+            'command:accept_pending_curve',
+            'ACCEPT_PENDING_CURVE',
+        )
         return
 
     if command == 'set_mode':
