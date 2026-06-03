@@ -526,7 +526,22 @@ def _set_maintenance_stdout_obj(obj):
         'seq': maintenance_stdout_seq,
         'session_id': obj.get('session_id') or _maintenance_session_id(),
     }
-    for key in ('text', 'data', 'reason', 'update_id', 'sha256', 'size', 'status'):
+    for key in (
+        'text',
+        'data',
+        'reason',
+        'update_id',
+        'sha256',
+        'size',
+        'status',
+        'ack_type',
+        'frame_type',
+        'offset',
+        'received',
+        'expected_size',
+        'commandId',
+        'command_id',
+    ):
         if key in obj and obj[key] is not None:
             payload[key] = obj[key]
     maintenance_last_stdout_payload = json.dumps(payload, separators=(',', ':'))
@@ -756,6 +771,22 @@ def _emit_update_status(event_type, update_id, text, **extra):
     _set_maintenance_stdout_obj(obj)
 
 
+def _emit_update_ack(frame, update_id, text, **extra):
+    frame_type = str(frame.get('type') or frame.get('kind') or frame.get('op') or '').lower()
+    obj = {
+        'type': 'ack',
+        'ack_type': frame_type,
+        'frame_type': frame_type,
+        'update_id': update_id,
+        'text': text,
+        'session_id': frame.get('session_id') or frame.get('sessionId') or _maintenance_session_id(),
+        'commandId': frame.get('commandId'),
+        'command_id': frame.get('command_id'),
+    }
+    obj.update(extra)
+    _set_maintenance_stdout_obj(obj)
+
+
 def _handle_update_begin(frame):
     update_id = _safe_update_id(frame.get('update_id'))
     expected_size = int(frame.get('size', -1))
@@ -776,6 +807,16 @@ def _handle_update_begin(frame):
     }
     _write_update_meta(update_id, meta)
     maintenance_updates[update_id] = meta
+    _emit_update_ack(
+        frame,
+        update_id,
+        f'Update begin accepted for {update_id}\n',
+        size=expected_size,
+        sha256=expected_sha,
+        status='receiving',
+        received=0,
+        expected_size=expected_size,
+    )
     _emit_update_status('update_receiving', update_id, f'Receiving update {update_id}\n')
 
 
@@ -801,6 +842,16 @@ def _handle_update_chunk(frame):
     meta['received'] = current_size + len(chunk)
     meta['updated_at'] = time.time()
     _write_update_meta(update_id, meta)
+    _emit_update_ack(
+        frame,
+        update_id,
+        f'Update chunk accepted for {update_id} at {offset}\n',
+        offset=offset,
+        size=len(chunk),
+        received=meta['received'],
+        expected_size=expected_size,
+        status='receiving',
+    )
     if meta['received'] == expected_size:
         _emit_update_status(
             'update_received',
@@ -836,6 +887,16 @@ def _handle_update_finalize(frame):
         'verified_at': time.time(),
     })
     _write_update_meta(update_id, meta)
+    _emit_update_ack(
+        frame,
+        update_id,
+        f'Update finalize accepted for {update_id}\n',
+        sha256=actual_sha,
+        size=actual_size,
+        received=actual_size,
+        expected_size=expected_size,
+        status='verified',
+    )
     _emit_update_status(
         'update_verified',
         update_id,
@@ -1108,6 +1169,12 @@ async def _handle_maintenance_control_payload(payload_bytes):
             'session_id': _maintenance_session_id(),
             'text': f'{e}\n',
             'reason': str(e),
+            'ack_type': frame_type or None,
+            'frame_type': frame_type or None,
+            'update_id': frame.get('update_id'),
+            'offset': frame.get('offset'),
+            'commandId': frame.get('commandId'),
+            'command_id': frame.get('command_id'),
         })
 
 
