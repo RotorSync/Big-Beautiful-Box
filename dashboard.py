@@ -35,6 +35,22 @@ SIM_RENDER_SCALE = 1.0
 FILL_HISTORY_SOCKET_LIMIT = 20
 
 
+def _base36_encode(value):
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    value = int(value)
+    if value == 0:
+        return "0"
+    sign = ""
+    if value < 0:
+        sign = "-"
+        value = -value
+    result = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        result = chars[remainder] + result
+    return sign + result
+
+
 def _geometry_size(geometry):
     try:
         size = geometry.split("+", 1)[0]
@@ -160,6 +176,7 @@ class _SimIOLHat:
         self.powered = True
         self.totalizer_liters = 0.0
         self.flow_rate_l_per_s = 0.0
+        self.temperature_c = 20.0
         self._last_tick = time.time()
         self._flow_start_l_per_s = 0.0
         self._flow_target_l_per_s = 0.0
@@ -236,7 +253,8 @@ class _SimIOLHat:
                 b"\x00\x00\x00\x00"
                 + struct.pack(">f", abs(self.totalizer_liters))
                 + struct.pack(">f", self.flow_rate_l_per_s)
-                + bytes([self._packet_counter, 0, 0])
+                + struct.pack(">h", int(round(self.temperature_c * 10)))
+                + bytes([0])
             )
             return packet[:data_length].ljust(data_length, b"\x00")
 
@@ -261,6 +279,7 @@ if SIM_MODE:
 # Global variables
 last_totalizer_liters = 0.0
 last_flow_rate = 0.0
+last_flow_meter_temp_f = None
 previous_totalizer_liters = 0.0
 connection_error = False
 error_message = ""
@@ -326,6 +345,7 @@ pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
 pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
+pending_fill_temp_f = None  # Flow-meter temperature snapshot associated with the completed fill
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
@@ -568,6 +588,20 @@ def stale_raw_threshold_reads():
 def get_cached_actual_gallons():
     """Return the latest cached totalizer reading without touching IO-Link."""
     return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+
+def _decode_flow_meter_temp_f(raw_data):
+    """Decode Picomag process-data temperature from tenths C to F."""
+    if len(raw_data) < 14:
+        return None
+    temp_c = struct.unpack('>h', raw_data[12:14])[0] / 10.0
+    return (temp_c * 9.0 / 5.0) + 32.0
+
+
+def _format_flow_meter_temp_field(temp_f):
+    if temp_f is None:
+        return ""
+    return f" | Temp: {temp_f:.1f} F"
 
 
 def log_flow_control(message):
@@ -1843,7 +1877,8 @@ def update_flow_rate_display(flow_rate_gpm):
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_loads_gallons
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
@@ -1852,7 +1887,13 @@ def record_pending_fill():
 
         # Write to fill history log
         with open(fill_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal | Actual: {pending_fill_gallons:.3f} gal | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal | {pending_fill_shutoff_type}\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
+                f" | Actual: {pending_fill_gallons:.3f} gal"
+                f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
+                f" | {pending_fill_shutoff_type}"
+                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}\n"
+            )
 
         # Write detailed calibration record with flow snapshot and threshold in one line
         with open(calibration_log, 'a') as f:
@@ -1860,6 +1901,7 @@ def record_pending_fill():
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
                 f" | Actual: {pending_fill_gallons:.3f} gal"
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
+                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
                 f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
                 f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
                 f" | TriggerActual: {last_trigger_actual:.3f} gal"
@@ -1882,6 +1924,7 @@ def record_pending_fill():
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
+        pending_fill_temp_f = None
 
     else:
         print("No pending fill to record")
@@ -2401,6 +2444,7 @@ def _build_dashboard_state_snapshot():
             "actual_gal": round(pending_fill_gallons, 3),
             "flow_gpm": round(pending_fill_flow_gpm, 1),
             "shutoff_type": pending_fill_shutoff_type,
+            "flow_meter_temp_f": None if pending_fill_temp_f is None else round(pending_fill_temp_f, 1),
             "thumbs_status": "pending",
         } if fill_pending else None,
         "colors_green": bool(colors_are_green),
@@ -4443,6 +4487,7 @@ def _describe_iol_status_fault(st):
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
+    global last_flow_meter_temp_f
     global last_flow_read_was_fresh, last_fresh_flow_read_time
     global consecutive_identical_raw, last_raw_data
 
@@ -4531,10 +4576,12 @@ def read_flow_meter():
             # Decode the data according to Picomag format
             totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
             flow_rate_l_per_s = raw_flow_rate_l_per_s
+            flow_meter_temp_f = _decode_flow_meter_temp_f(raw_data)
             detect_totalizer_reset(totalizer_liters)
 
             last_totalizer_liters = totalizer_liters
             last_flow_rate = flow_rate_l_per_s
+            last_flow_meter_temp_f = flow_meter_temp_f
             # Clear error state - set LED green on reconnect
             if connection_error:
                 try:
@@ -5165,11 +5212,23 @@ def socket_command_listener():
                                             parts = entry.strip().split("|")
                                             if len(parts) >= 3:
                                                 ts = parts[0].strip()
-                                                req = parts[1].replace("Requested:", "").replace("gal", "").strip()
-                                                act = parts[2].replace("Actual:", "").replace("gal", "").strip()
+                                                req = float(parts[1].replace("Requested:", "").replace("gal", "").strip())
+                                                act = float(parts[2].replace("Actual:", "").replace("gal", "").strip())
                                                 shutoff_type = parts[4].strip() if len(parts) >= 5 else ""
-                                                history_items.append(f"{ts},{req},{act},accepted,{shutoff_type}")
-                                        history_response = ";".join(history_items)
+                                                temp_token = ""
+                                                if len(parts) >= 6:
+                                                    temp_text = parts[5].replace("Temp:", "").replace("F", "").strip()
+                                                    if temp_text:
+                                                        temp_token = _base36_encode(round(float(temp_text) * 10.0))
+                                                timestamp = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+                                                minute_token = _base36_encode(int(timestamp // 60))
+                                                req_token = _base36_encode(round(req * 1000.0))
+                                                act_token = _base36_encode(round(act * 1000.0))
+                                                shutoff_token = "a" if shutoff_type.lower().startswith("auto") else "m"
+                                                history_items.append(
+                                                    f"{minute_token},{req_token},{act_token},{shutoff_token},{temp_token}"
+                                                )
+                                        history_response = "H2:" + ";".join(history_items)
                                         client.send(f"HIST:{history_response}\n".encode())
                                 except Exception:
                                     client.send(b"HIST:\n")
@@ -6351,7 +6410,8 @@ def update_dashboard():
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
     global new_fill_flow_started_at, new_fill_last_fresh_at, new_fill_cycle_cleared
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global last_trigger_predicted_actual, last_trigger_loop_dt_ms
     global flow_cycle_counter, calibration_state, last_status_text, last_daily_total_text, last_daily_total_mode
@@ -6449,6 +6509,7 @@ def update_dashboard():
             pending_fill_shutoff_type = ""
             pending_fill_flow_gpm = 0.0
             pending_fill_trigger_threshold = 0.0
+            pending_fill_temp_f = None
             last_trigger_flow_gpm = 0.0
             last_trigger_threshold = 0.0
             last_trigger_actual = 0.0
@@ -6470,6 +6531,7 @@ def update_dashboard():
             pending_fill_gallons = actual
             pending_fill_requested = requested_gallons
             pending_fill_shutoff_type = shutoff_type
+            pending_fill_temp_f = last_flow_meter_temp_f
 
             print(
                 f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
@@ -6516,6 +6578,7 @@ def update_dashboard():
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
+        pending_fill_temp_f = None
         new_fill_cycle_cleared = True
         print("Sustained high-flow fill cycle detected - thumbs up hidden, pending fill cleared")
 
