@@ -1,4 +1,5 @@
 import importlib
+import asyncio
 import json
 import sys
 import tarfile
@@ -183,3 +184,33 @@ def test_apply_failure_marks_update_failed_and_reports_status(bumble_module, mon
     payload = json.loads(bumble_module.maintenance_last_stdout_payload)
     assert payload['type'] == 'update_apply_failed'
     assert payload['update_id'] == 'update-1'
+
+
+class CapturingBleDevice:
+    def __init__(self):
+        self.notifications = []
+
+    async def notify_subscribers(self, characteristic, data):
+        self.notifications.append((characteristic, data.decode('utf-8')))
+
+
+def test_maintenance_stdout_notifications_capture_each_payload(bumble_module):
+    async def run_test():
+        device = CapturingBleDevice()
+        bumble_module.ble_device = device
+        bumble_module.maintenance_stdout_char = object()
+        bumble_module.maintenance_stdout_seq = 0
+        bumble_module.maintenance_active_session_id = 'session-1'
+
+        bumble_module._set_maintenance_stdout_obj({'text': 'first'})
+        bumble_module._set_maintenance_stdout_obj({'text': 'second'})
+        await asyncio.sleep(0)
+
+        payloads = [
+            json.loads(data)
+            for _characteristic, data in device.notifications
+        ]
+        assert [payload['text'] for payload in payloads] == ['first', 'second']
+        assert [payload['seq'] for payload in payloads] == [1, 2]
+
+    asyncio.run(run_test())

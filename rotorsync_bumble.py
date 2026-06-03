@@ -564,15 +564,16 @@ def _maintenance_session_id(default='unknown'):
     return maintenance_active_session_id or default
 
 
-def _notify_maintenance_stdout():
+def _notify_maintenance_stdout(payload=None):
     if not ble_device or not maintenance_stdout_char:
         return
+    payload_text = payload if payload is not None else maintenance_last_stdout_payload
 
     async def _notify():
         try:
             await ble_device.notify_subscribers(
                 maintenance_stdout_char,
-                maintenance_last_stdout_payload.encode('utf-8'),
+                payload_text.encode('utf-8'),
             )
         except Exception as e:
             print(f'Maintenance stdout notify error: {e}', flush=True)
@@ -611,7 +612,7 @@ def _set_maintenance_stdout_obj(obj):
             payload[key] = obj[key]
     maintenance_last_stdout_payload = json.dumps(payload, separators=(',', ':'))
     print(f'Maintenance stdout: {maintenance_last_stdout_payload[:220]}', flush=True)
-    _notify_maintenance_stdout()
+    _notify_maintenance_stdout(maintenance_last_stdout_payload)
 
 
 def _emit_maintenance_text(text, *, event_type='output', session_id=None):
