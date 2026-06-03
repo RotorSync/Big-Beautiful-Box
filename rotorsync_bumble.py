@@ -173,6 +173,8 @@ def _encode_ble_state_payload(state):
 # Config command state
 config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
+config_response_by_connection = {}
+config_response_pages_by_connection = {}
 config_notify_char = None
 maintenance_stdout_char = None
 ble_device = None
@@ -180,6 +182,9 @@ dashboard_ready = False
 last_dashboard_error_log = 0.0
 last_dashboard_error_message = None
 last_gatt_client_seen_write = 0.0
+control_command_queue = None
+control_command_worker_task = None
+control_command_seq = 0
 maintenance_chunks = {}
 maintenance_chunk_timeout = 30
 maintenance_shell_process = None
@@ -552,7 +557,7 @@ def make_state_read_handler():
 def make_config_notify_read_handler():
     def read_value(connection):
         mark_gatt_client_seen()
-        value = config_response
+        value = config_response_by_connection.get(_connection_key(connection), config_response)
         print(f'ReadValue config_notify: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
@@ -564,6 +569,85 @@ def _connection_key(connection):
         if value is not None:
             return str(value)
     return 'default'
+
+
+def _next_control_command_seq():
+    global control_command_seq
+    control_command_seq += 1
+    return control_command_seq
+
+
+def _run_control_command(item):
+    peer = item['peer']
+    seq = item['seq']
+    source = item['source']
+    actions = item['actions']
+    refresh = item.get('refresh', True)
+    print(
+        f'Control command #{seq} from {peer} via {source}: '
+        f'{",".join(_redact_dashboard_command(action) for action in actions)}',
+        flush=True,
+    )
+    for action in actions:
+        send_dashboard_command(action)
+    if refresh:
+        query_dashboard_status()
+
+
+async def control_command_worker():
+    while True:
+        item = await control_command_queue.get()
+        try:
+            _run_control_command(item)
+        except Exception as e:
+            print(
+                f'Control command #{item.get("seq", "?")} error: '
+                f'{type(e).__name__}: {e}',
+                flush=True,
+            )
+        finally:
+            control_command_queue.task_done()
+
+
+def start_control_command_worker():
+    global control_command_queue, control_command_worker_task
+    if control_command_queue is None:
+        control_command_queue = asyncio.Queue()
+    if control_command_worker_task is None or control_command_worker_task.done():
+        control_command_worker_task = asyncio.create_task(control_command_worker())
+    return control_command_worker_task
+
+
+def _enqueue_control_actions(connection, source, actions, *, refresh=True):
+    mark_gatt_client_seen()
+    if isinstance(actions, str):
+        actions = [actions]
+    actions = [action for action in actions if action]
+    if not actions:
+        return
+
+    item = {
+        'seq': _next_control_command_seq(),
+        'peer': _connection_key(connection),
+        'source': source,
+        'actions': actions,
+        'refresh': refresh,
+    }
+
+    if control_command_queue is not None:
+        control_command_queue.put_nowait(item)
+        print(
+            f'Queued control command #{item["seq"]} from {item["peer"]} '
+            f'via {source}',
+            flush=True,
+        )
+        return
+
+    print(
+        f'Control command queue unavailable; running #{item["seq"]} inline',
+        flush=True,
+    )
+    _run_control_command(item)
 
 
 def _maintenance_session_id(default='unknown'):
@@ -1483,13 +1567,14 @@ def maintenance_stdin_write_handler(connection, value):
         print('Maintenance stdin ignored: no event loop', flush=True)
 
 
-def _notify_config_response():
+def _notify_config_response(payload=None):
     if not ble_device or not config_notify_char:
         return
+    payload_text = payload if payload is not None else config_response
 
     async def _notify():
         try:
-            await ble_device.notify_subscribers(config_notify_char, config_response.encode('utf-8'))
+            await ble_device.notify_subscribers(config_notify_char, payload_text.encode('utf-8'))
         except Exception as e:
             print(f'Config notify error: {e}', flush=True)
 
@@ -1502,7 +1587,7 @@ def _notify_config_response():
 def _set_config_response_obj(obj):
     global config_response
     config_response = json.dumps(obj, separators=(',', ':'))
-    _notify_config_response()
+    _notify_config_response(config_response)
 
 
 def _schedule_identity_restart(reason, delay=1.0):
@@ -1545,9 +1630,9 @@ def _set_paginated_config_response(items, *, request_id=None, op=None, page_size
 def pump_write_handler(connection, value):
     """Handle pump control writes. Write '1' or 'PS' to stop pump."""
     cmd = value.decode('utf-8').strip().upper()
-    print(f'Pump write: {cmd}', flush=True)
+    print(f'Pump write from {_connection_key(connection)}: {cmd}', flush=True)
     if cmd in ['1', 'PS', 'STOP']:
-        send_dashboard_command('PS')
+        _enqueue_control_actions(connection, 'pump', 'PS')
     return
 
 
@@ -1555,7 +1640,7 @@ def command_write_handler(connection, value):
     """Handle compact JSON commands from the iOS app."""
     try:
         payload = value.decode('utf-8').strip()
-        print(f'Command write: {payload[:200]}', flush=True)
+        print(f'Command write from {_connection_key(connection)}: {payload[:200]}', flush=True)
         cmd = json.loads(payload)
         if not isinstance(cmd, dict):
             raise ValueError('command payload must be a JSON object')
@@ -1569,23 +1654,19 @@ def command_write_handler(connection, value):
         return
 
     if command == 'pump_stop':
-        send_dashboard_command('PS')
-        query_dashboard_status()
+        _enqueue_control_actions(connection, 'command:pump_stop', 'PS')
         return
 
     if command == 'confirm_fill':
-        send_dashboard_command('TU')
-        query_dashboard_status()
+        _enqueue_control_actions(connection, 'command:confirm_fill', 'TU')
         return
 
     if command == 'set_mode':
         mode = str(cmd.get('mode', '')).strip().lower()
         if mode == 'mix':
-            send_dashboard_command('MIX')
-            query_dashboard_status()
+            _enqueue_control_actions(connection, 'command:set_mode', 'MIX')
         elif mode == 'fill':
-            send_dashboard_command('FILL')
-            query_dashboard_status()
+            _enqueue_control_actions(connection, 'command:set_mode', 'FILL')
         else:
             print(f'Command write ignored: invalid mode {mode!r}', flush=True)
         return
@@ -1603,8 +1684,7 @@ def command_write_handler(connection, value):
         except Exception:
             delta = None
         if delta in allowed:
-            send_dashboard_command(allowed[delta])
-            query_dashboard_status()
+            _enqueue_control_actions(connection, 'command:adjust', allowed[delta])
         else:
             print(f'Command write ignored: invalid delta {delta!r}', flush=True)
         return
@@ -1627,8 +1707,11 @@ def command_write_handler(connection, value):
         else:
             print(f'Command write ignored: invalid override value {enabled!r}', flush=True)
             return
-        send_dashboard_command('OV:1' if desired else 'OV:0')
-        query_dashboard_status()
+        _enqueue_control_actions(
+            connection,
+            'command:set_override',
+            'OV:1' if desired else 'OV:0',
+        )
         return
 
     if command == 'set_batchmix':
@@ -1645,12 +1728,10 @@ def command_write_handler(connection, value):
 def gallons_write_handler(connection, value):
     """Handle gallons adjustment. Write '+1', '-1', '+10', '-10'."""
     cmd = value.decode('utf-8').strip()
-    print(f'Gallons write: {cmd}', flush=True)
+    print(f'Gallons write from {_connection_key(connection)}: {cmd}', flush=True)
 
     if cmd in ['+1', '-1', '+10', '-10']:
-        send_dashboard_command(cmd)
-        # Update local status after change
-        asyncio.get_event_loop().call_soon(query_dashboard_status)
+        _enqueue_control_actions(connection, 'gallons', cmd)
     return
 
 # Chunked data buffer for batch mix (handles large payloads)
@@ -2845,6 +2926,31 @@ def _cmd_page(cmd, *, request_id=None):
     _set_config_response_obj(page_obj)
 
 
+def process_config_command_for_connection(data_str, connection_key):
+    """Run config command state against the caller's response/page buffers."""
+    global config_response, config_response_pages
+
+    previous_global_response = config_response
+    previous_global_pages = config_response_pages
+    config_response = config_response_by_connection.get(
+        connection_key,
+        previous_global_response,
+    )
+    config_response_pages = list(
+        config_response_pages_by_connection.get(connection_key, [])
+    )
+
+    try:
+        process_config_command(data_str)
+        config_response_by_connection[connection_key] = config_response
+        config_response_pages_by_connection[connection_key] = list(config_response_pages)
+        previous_global_response = config_response
+        previous_global_pages = list(config_response_pages)
+    finally:
+        config_response = previous_global_response
+        config_response_pages = previous_global_pages
+
+
 def _reload_converter():
     """Reload mopeka_converter after CSV changes."""
     try:
@@ -2926,9 +3032,9 @@ def config_cmd_write_handler(connection, value):
                             print(f'ConfigCmd: missing chunk {i}!', flush=True)
                             return
                     config_cmd_chunks.pop(connection_key, None)
-                    process_config_command(assembled)
+                    process_config_command_for_connection(assembled, connection_key)
         else:
-            process_config_command(data_str)
+            process_config_command_for_connection(data_str, connection_key)
 
     except Exception as e:
         print(f'ConfigCmd error: {e}', flush=True)
@@ -2937,7 +3043,7 @@ def config_cmd_write_handler(connection, value):
 
 def config_data_read_handler(connection):
     """Read the response from the last config command."""
-    value = config_response
+    value = config_response_by_connection.get(_connection_key(connection), config_response)
     print(f'ReadValue config_data: {value[:80]}...', flush=True)
     return value.encode('utf-8')
 
@@ -3411,6 +3517,7 @@ async def main():
             'continuing and relying on retry loop',
             flush=True,
         )
+    start_control_command_worker()
     status_task = asyncio.create_task(poll_dashboard_status(device, state_char))
 
     await device.power_on()
