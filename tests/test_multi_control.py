@@ -26,6 +26,15 @@ def connection(peer):
     return types.SimpleNamespace(peer_address=peer)
 
 
+class FakeConnection:
+    def __init__(self, peer):
+        self.peer_address = peer
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners[event] = callback
+
+
 class FakeGattDevice:
     def __init__(self):
         self.advertising = False
@@ -265,7 +274,7 @@ def test_state_payload_stays_compact_with_curve_labels(bumble_module):
     assert len(json.dumps(payload, separators=(',', ':'))) < 160
 
 
-def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monkeypatch):
+def test_gatt_advertising_resume_hook_keeps_advertising_on(bumble_module, monkeypatch):
     persisted = []
     device = FakeGattDevice()
     monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
@@ -284,14 +293,14 @@ def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monk
             'TrailerSync-TR2',
         )
         assert installed is True
-        device.listeners['connection'](connection('iphone'))
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](iphone)
         deadline = asyncio.get_running_loop().time() + 1
         while not device.start_calls and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
-        device.listeners['connection'](connection('ipad'))
-        deadline = asyncio.get_running_loop().time() + 1
-        while not device.stop_calls and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.01)
+        ipad = FakeConnection('ipad')
+        device.listeners['connection'](ipad)
+        await asyncio.sleep(0.05)
 
     asyncio.run(run())
 
@@ -302,8 +311,93 @@ def test_gatt_advertising_resume_hook_restarts_on_connection(bumble_module, monk
             'auto_restart': True,
         }
     ]
-    assert device.stop_calls == [{}]
+    assert device.stop_calls == []
     assert persisted == [('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF')]
+
+
+def test_gatt_advertising_stays_on_when_one_client_disconnects(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda name, address: persisted.append((name, address)),
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](ipad)
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+        device.listeners['connection'](iphone)
+        iphone.listeners['disconnection']()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad'}
+    assert device.advertising is True
+    assert device.stop_calls == []
+
+
+def test_gatt_advertising_restarts_after_all_clients_disconnect(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda name, address: persisted.append((name, address)),
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](iphone)
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+        device.advertising = False
+        iphone.listeners['disconnection']()
+        deadline = asyncio.get_running_loop().time() + 1
+        while len(device.start_calls) < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+    assert len(device.start_calls) == 2
+    assert bumble_module.active_gatt_connections == set()
+    assert bumble_module.connected_advertising_resume_succeeded is False
+    assert persisted == [
+        ('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF'),
+        ('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF'),
+    ]
 
 
 def test_gatt_advertising_resume_hook_can_be_disabled_for_single_client_mode(
@@ -332,6 +426,7 @@ def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):
             raise RuntimeError('command disallowed')
 
     async def run():
+        bumble_module.active_gatt_connections.add('iphone')
         result = await bumble_module.resume_gatt_advertising_after_connection(
             RejectingDevice(),
             b'adv',

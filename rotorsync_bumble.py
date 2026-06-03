@@ -63,7 +63,6 @@ STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_PO
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
-GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS = 8.0
 
 # Recovery settings
 MAX_CONSECUTIVE_FAILURES = 5
@@ -154,7 +153,7 @@ calibration_mtime_snapshot = None
 last_calibration_reload_check = 0.0
 connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
-connected_advertising_stop_task = None
+active_gatt_connections = set()
 
 
 def _encode_ble_state_payload(state):
@@ -525,67 +524,66 @@ def _is_gatt_advertising(device):
     return False
 
 
-async def stop_gatt_connected_advertising(device, reason, *, delay=0.0):
-    """Stop the connected advertising window without touching active clients."""
+async def restart_gatt_advertising_after_disconnect(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    delay=0.25,
+):
+    """Restart normal advertising after the last connected controller leaves."""
+    global connected_advertising_resume_succeeded
+
     if delay > 0:
         await asyncio.sleep(delay)
 
-    if not _is_gatt_advertising(device):
-        print(f'GATT connected advertising already stopped: {reason}', flush=True)
+    if active_gatt_connections:
+        return False
+
+    connected_advertising_resume_succeeded = False
+
+    if _is_gatt_advertising(device):
+        print('GATT advertising already active after all clients disconnected', flush=True)
         return True
 
     try:
-        await device.stop_advertising()
-        print(f'GATT connected advertising stopped: {reason}', flush=True)
+        await device.start_advertising(
+            advertising_data=advertising_data,
+            scan_response_data=scan_response_data,
+            auto_restart=True,
+        )
+        persist_gatt_advertising_ready(ble_name, device.public_address)
+        print('GATT advertising restarted after all clients disconnected', flush=True)
         return True
     except Exception as e:
         print(
-            f'GATT connected advertising stop failed: {type(e).__name__}: {e}',
+            'GATT advertising restart after disconnect failed: '
+            f'{type(e).__name__}: {e}',
             flush=True,
         )
         return False
 
 
-def schedule_gatt_connected_advertising_stop(device, reason, *, delay):
-    global connected_advertising_stop_task
-
-    if connected_advertising_stop_task and not connected_advertising_stop_task.done():
-        connected_advertising_stop_task.cancel()
-
-    connected_advertising_stop_task = asyncio.create_task(
-        stop_gatt_connected_advertising(device, reason, delay=delay)
-    )
-    connected_advertising_stop_task.add_done_callback(_handle_background_task_done)
-
-
-async def resume_gatt_advertising_after_connection(
+async def keep_gatt_connected_advertising_on(
     device,
     advertising_data,
     scan_response_data,
     ble_name,
     *,
     delay=GATT_ADVERTISING_RESUME_DELAY_SECONDS,
+    reason='controller connected',
 ):
-    """Try to keep the GATT server discoverable after one client connects."""
+    """Keep advertising active while one or more controllers are connected."""
     global connected_advertising_resume_succeeded, connected_advertising_next_retry_at
 
     if delay > 0:
         await asyncio.sleep(delay)
 
-    now = time.time()
-    if connected_advertising_resume_succeeded:
-        print(
-            'GATT connected advertising already resumed once; skipping duplicate '
-            'resume request',
-            flush=True,
-        )
-        schedule_gatt_connected_advertising_stop(
-            device,
-            'additional client connection observed',
-            delay=0.0,
-        )
-        return True
+    if not active_gatt_connections:
+        return False
 
+    now = time.time()
     if connected_advertising_next_retry_at > now:
         remaining = int(connected_advertising_next_retry_at - now)
         print(
@@ -596,13 +594,8 @@ async def resume_gatt_advertising_after_connection(
         return False
 
     if _is_gatt_advertising(device):
-        print('GATT advertising already active after connection', flush=True)
+        print(f'GATT advertising already active: {reason}', flush=True)
         connected_advertising_resume_succeeded = True
-        schedule_gatt_connected_advertising_stop(
-            device,
-            'connected advertising window elapsed',
-            delay=GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS,
-        )
         return True
 
     try:
@@ -613,16 +606,11 @@ async def resume_gatt_advertising_after_connection(
         )
         persist_gatt_advertising_ready(ble_name, device.public_address)
         print(
-            'GATT advertising resumed after connection; additional controllers '
-            'should be able to discover this trailer',
+            f'GATT advertising kept on: {reason}; additional controllers should '
+            'be able to discover this trailer anytime',
             flush=True,
         )
         connected_advertising_resume_succeeded = True
-        schedule_gatt_connected_advertising_stop(
-            device,
-            'connected advertising window elapsed',
-            delay=GATT_CONNECTED_ADVERTISING_WINDOW_SECONDS,
-        )
         return True
     except Exception as e:
         connected_advertising_next_retry_at = (
@@ -634,6 +622,25 @@ async def resume_gatt_advertising_after_connection(
             flush=True,
         )
         return False
+
+
+async def resume_gatt_advertising_after_connection(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    delay=GATT_ADVERTISING_RESUME_DELAY_SECONDS,
+):
+    """Try to keep the GATT server discoverable after one client connects."""
+    return await keep_gatt_connected_advertising_on(
+        device,
+        advertising_data,
+        scan_response_data,
+        ble_name,
+        delay=delay,
+        reason='controller connected',
+    )
 
 
 def install_gatt_advertising_resume_hook(
@@ -654,13 +661,51 @@ def install_gatt_advertising_resume_hook(
         print('GATT advertising resume hook unavailable: Bumble device has no event API', flush=True)
         return False
 
+    def on_disconnection(peer):
+        active_gatt_connections.discard(peer)
+        print(
+            f'GATT client disconnected from {peer}; '
+            f'{len(active_gatt_connections)} controller(s) remain',
+            flush=True,
+        )
+        if active_gatt_connections:
+            task = asyncio.create_task(
+                keep_gatt_connected_advertising_on(
+                    device,
+                    advertising_data,
+                    scan_response_data,
+                    ble_name,
+                    delay=0.0,
+                    reason='controller disconnected but anchor remains',
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                restart_gatt_advertising_after_disconnect(
+                    device,
+                    advertising_data,
+                    scan_response_data,
+                    ble_name,
+                )
+            )
+        task.add_done_callback(_handle_background_task_done)
+
     def on_connection(connection):
         peer = _connection_key(connection)
+        active_gatt_connections.add(peer)
         print(
             f'GATT client connected from {peer}; trying to keep advertising for '
             'additional controllers',
             flush=True,
         )
+        if hasattr(connection, 'on'):
+            connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
+        else:
+            print(
+                'GATT connection object has no event API; disconnect advertising '
+                'restart will rely on watchdog',
+                flush=True,
+            )
         task = asyncio.create_task(
             resume_gatt_advertising_after_connection(
                 device,
