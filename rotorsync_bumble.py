@@ -827,6 +827,7 @@ def _handle_update_finalize(frame):
     actual_sha = digest.hexdigest()
     if actual_sha != meta['expected_sha256']:
         raise ValueError('update sha256 mismatch')
+    _validate_update_archive(paths['tmp'])
     os.replace(paths['tmp'], paths['artifact'])
     meta.update({
         'status': 'verified',
@@ -866,6 +867,39 @@ def _validate_tar_member(member):
         raise ValueError(f'unsafe tar path: {name}')
     if member.islnk() or member.issym() or member.isdev():
         raise ValueError(f'unsafe tar member type: {name}')
+
+
+def _tar_contains_bbb_snapshot(members):
+    names = [Path(member.name) for member in members]
+    root_names = {path.parts[0] for path in names if path.parts}
+    candidate_roots = ['']
+    if len(root_names) == 1:
+        candidate_roots.append(next(iter(root_names)))
+
+    for root in candidate_roots:
+        prefix = f'{root}/' if root else ''
+        has_dashboard = any(member.name == f'{prefix}dashboard.py' for member in members)
+        has_bumble = any(member.name == f'{prefix}rotorsync_bumble.py' for member in members)
+        has_src = any(
+            member.name == f'{prefix}src' or member.name.startswith(f'{prefix}src/')
+            for member in members
+        )
+        if has_dashboard and has_bumble and has_src:
+            return True
+
+    return False
+
+
+def _validate_update_archive(artifact_path):
+    if not tarfile.is_tarfile(artifact_path):
+        raise ValueError('update artifact is not a tar archive')
+
+    with tarfile.open(artifact_path) as archive:
+        members = archive.getmembers()
+        for member in members:
+            _validate_tar_member(member)
+        if not _tar_contains_bbb_snapshot(members):
+            raise ValueError('update tar does not look like a BBB repo snapshot')
 
 
 def _find_extracted_update_root(extract_dir):
