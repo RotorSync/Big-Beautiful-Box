@@ -32,6 +32,7 @@ if SIM_MODE:
 SIM_GEOMETRY = os.environ.get("BBB_SIM_GEOMETRY", "1920x1080")
 SIM_PUMP_GLIDE_SECONDS = 3.0
 SIM_RENDER_SCALE = 1.0
+FILL_HISTORY_SOCKET_LIMIT = 20
 
 
 def _geometry_size(geometry):
@@ -5142,9 +5143,9 @@ def socket_command_listener():
                                 try:
                                     with open("/home/pi/fill_history.log", "r") as hf:
                                         all_lines = hf.readlines()
-                                        last_5 = all_lines[-5:] if len(all_lines) >= 5 else all_lines
+                                        latest_entries = all_lines[-FILL_HISTORY_SOCKET_LIMIT:]
                                         history_items = []
-                                        for entry in last_5:
+                                        for entry in reversed(latest_entries):
                                             parts = entry.strip().split("|")
                                             if len(parts) >= 3:
                                                 ts = parts[0].strip()
