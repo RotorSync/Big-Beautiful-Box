@@ -294,6 +294,23 @@ The install script configures:
 Production devices use the on-screen updater to pull from `origin/master`.
 Development can continue on `main`, but anything intended for field updates must also be pushed to `master`.
 
+### Maintenance Update Bundle
+
+RotorSync admin maintenance updates expect a verified BBB tar bundle. Build one
+from committed runtime files with:
+
+```bash
+python3 scripts/build_update_bundle.py
+```
+
+The helper writes `dist/Big-Beautiful-Box-<VERSION>-<commit>.tar.gz`, prints the
+SHA-256 and size used by the admin relay, and refuses uncommitted changes in the
+included runtime paths unless `--allow-dirty` is supplied for a test bundle.
+The bundle intentionally contains only the bounded runtime set that the Pi-side
+maintenance updater can apply: `dashboard.py`, `rotorsync_bumble.py`,
+`rotorsync_watchdog.py`, `start_iol_dashboard.sh`, `VERSION`, `config.py`,
+`install.sh`, `src`, and `deploy`.
+
 ## Operational Workflow
 
 ### Fill Cycle

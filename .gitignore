@@ -5,3 +5,4 @@ __pycache__/
 *.log
 .lgd-*
 .sim-data/
+dist/
