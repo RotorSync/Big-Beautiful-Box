@@ -60,6 +60,9 @@ BMS_READ_INTERVAL = 20  # 20 * 15s scan interval = 5 minutes
 STATUS_POLL_INTERVAL = 2.0  # Poll dashboard for status every 2 seconds
 STATUS_HISTORY_POLL_INTERVAL = 10.0
 STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_POLL_INTERVAL))
+LIVE_TELEMETRY_POLL_INTERVAL = 0.25
+LIVE_TELEMETRY_FAST_READ_WINDOW = 2.0
+LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM = 0.05
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
@@ -92,6 +95,7 @@ CONFIG_NOTIFY_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdeff')  # Config
 MAINTENANCE_CONTROL_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf00')
 MAINTENANCE_STDIN_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf01')
 MAINTENANCE_STDOUT_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf02')
+LIVE_TELEMETRY_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf03')
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -145,6 +149,7 @@ dashboard_status = {
     'history': '',
     'state': {},
     'state_json': '{}',
+    'live_json': '{}',
     'last_update': 0
 }
 
@@ -154,6 +159,8 @@ last_calibration_reload_check = 0.0
 connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
 active_gatt_connections = set()
+live_telemetry_notify_task = None
+last_live_telemetry_client_read_at = 0.0
 
 
 def _encode_ble_state_payload(state):
@@ -201,6 +208,16 @@ def _encode_ble_state_payload(state):
     put_if_present(compact, 'cc', compact_curve_value(state.get('current_curve')))
     put_if_present(compact, 'pc', compact_curve_value(state.get('pending_curve')))
     return json.dumps(compact, separators=(',', ':'))
+
+
+def _encode_live_telemetry_payload(actual, flow):
+    return json.dumps(
+        {
+            'act': round(float(actual), 3),
+            'flow': round(float(flow), 2),
+        },
+        separators=(',', ':'),
+    )
 
 # Config command state
 config_response = '{"ok":false,"error":"No command issued"}'
@@ -296,6 +313,10 @@ def query_dashboard_status():
             state = json.loads(payload)
             dashboard_status['state'] = state
             dashboard_status['state_json'] = _encode_ble_state_payload(state)
+            dashboard_status['live_json'] = _encode_live_telemetry_payload(
+                state.get('actual_gal', 0.0),
+                state.get('flow_gpm', 0.0),
+            )
             dashboard_status['requested'] = float(state.get('requested_gal', 0.0))
             dashboard_status['actual'] = float(state.get('actual_gal', 0.0))
             dashboard_status['mode'] = str(state.get('mode', 'fill'))
@@ -323,10 +344,42 @@ def query_dashboard_status():
             dashboard_status['state_json'] = _encode_ble_state_payload(
                 dashboard_status['state']
             )
+            dashboard_status['live_json'] = _encode_live_telemetry_payload(
+                dashboard_status['actual'],
+                0.0,
+            )
             dashboard_status['last_update'] = time.time()
             return True
         except Exception as e:
             print(f'Status parse error: {e}', flush=True)
+    return False
+
+
+def query_live_telemetry():
+    """Query just actual gallons and flow from the dashboard for high-rate BLE."""
+    response = send_dashboard_command('LIVE_TELEMETRY')
+    if response and response.startswith('LIVE:'):
+        try:
+            payload = response.split(':', 1)[1]
+            live = json.loads(payload)
+            actual = float(live.get('act', 0.0))
+            flow = float(live.get('flow', 0.0))
+            dashboard_status['actual'] = actual
+            state = dashboard_status.get('state') or {}
+            if isinstance(state, dict):
+                state['actual_gal'] = actual
+                state['flow_gpm'] = flow
+                dashboard_status['state'] = state
+            dashboard_status['live_json'] = _encode_live_telemetry_payload(actual, flow)
+            dashboard_status['last_update'] = time.time()
+            return True
+        except Exception as e:
+            print(f'Live telemetry parse error: {e}', flush=True)
+
+    state = dashboard_status.get('state') or {}
+    actual = state.get('actual_gal', dashboard_status.get('actual', 0.0))
+    flow = state.get('flow_gpm', 0.0)
+    dashboard_status['live_json'] = _encode_live_telemetry_payload(actual, flow)
     return False
 
 
@@ -794,6 +847,18 @@ def make_state_read_handler():
         mark_gatt_client_seen()
         value = dashboard_status.get('state_json', '{}')
         print(f'ReadValue state: {value[:120]}', flush=True)
+        return bytes(value, 'utf-8')
+    return read_value
+
+
+def make_live_telemetry_read_handler():
+    def read_value(connection):
+        global last_live_telemetry_client_read_at
+        mark_gatt_client_seen()
+        last_live_telemetry_client_read_at = time.time()
+        query_live_telemetry()
+        value = dashboard_status.get('live_json', '{}')
+        print(f'ReadValue live: {value[:80]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
 
@@ -3471,6 +3536,40 @@ async def poll_dashboard_status(device, state_char):
             print(f'Status poll error: {e}', flush=True)
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
+
+async def poll_live_telemetry(device, live_char):
+    """Poll only actual gallons and flow fast, then notify subscribers on change."""
+    last_notified_live_json = dashboard_status.get('live_json', '{}')
+    while True:
+        try:
+            cached_state = dashboard_status.get('state') or {}
+            cached_flow = 0.0
+            if isinstance(cached_state, dict):
+                try:
+                    cached_flow = float(cached_state.get('flow_gpm', 0.0))
+                except (TypeError, ValueError):
+                    cached_flow = 0.0
+            recent_client_read = (
+                time.time() - last_live_telemetry_client_read_at
+                <= LIVE_TELEMETRY_FAST_READ_WINDOW
+            )
+            should_poll = (
+                active_gatt_connections
+                and (recent_client_read or cached_flow > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM)
+            )
+            if should_poll:
+                updated = query_live_telemetry()
+                current_live_json = dashboard_status.get('live_json', '{}')
+                if updated and current_live_json != last_notified_live_json:
+                    await device.notify_subscribers(
+                        live_char,
+                        bytes(current_live_json, 'utf-8'),
+                    )
+                    last_notified_live_json = current_live_json
+        except Exception as e:
+            print(f'Live telemetry poll error: {e}', flush=True)
+        await asyncio.sleep(LIVE_TELEMETRY_POLL_INTERVAL)
+
 async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data, sensor_loop_heartbeat
 
@@ -3688,6 +3787,12 @@ async def main():
         Characteristic.READABLE,
         CharacteristicValue(read=make_state_read_handler()),
     )
+    live_telemetry_char = Characteristic(
+        LIVE_TELEMETRY_CHAR_UUID,
+        Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+        Characteristic.READABLE,
+        CharacteristicValue(read=make_live_telemetry_read_handler()),
+    )
     command_char = Characteristic(
         COMMAND_CHAR_UUID,
         Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
@@ -3752,6 +3857,7 @@ async def main():
             requested_char,
             actual_char,
             state_char,
+            live_telemetry_char,
             command_char,
             history_char,
             batchmix_char,
@@ -3775,6 +3881,9 @@ async def main():
         )
     start_control_command_worker()
     status_task = asyncio.create_task(poll_dashboard_status(device, state_char))
+    live_telemetry_notify_task = asyncio.create_task(
+        poll_live_telemetry(device, live_telemetry_char)
+    )
 
     await device.power_on()
     print(f'Device address: {device.public_address}', flush=True)
@@ -3811,6 +3920,7 @@ async def main():
     print('  def6: Requested (read)  - requested gallons', flush=True)
     print('  def7: Actual (read)     - actual gallons', flush=True)
     print('  defd: State (r/n)       - live dashboard JSON snapshot', flush=True)
+    print('  df03: Live (r/n)        - actual gallons + flow only', flush=True)
     print('  defe: Command (write)   - JSON command channel for iPad app', flush=True)
     print('  def8: History (read)    - last 5 fills', flush=True)
     print('  def9: BatchMix (write)  - JSON batch mix data from iPad', flush=True)

@@ -5002,6 +5002,18 @@ def socket_command_listener():
                                 )
                                 continue
 
+                            if line == "LIVE_TELEMETRY":
+                                actual = last_totalizer_liters * config.LITERS_TO_GALLONS
+                                flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+                                payload = {
+                                    "act": round(actual, 3),
+                                    "flow": round(flow_gpm, 2),
+                                }
+                                client.send(
+                                    f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
+                                )
+                                continue
+
                             elif line == "ACCEPT_PENDING_CURVE":
                                 ok, payload = accept_pending_flow_curve("Socket")
                                 prefix = "CURVE_ACCEPTED" if ok else "CURVE_ACCEPT_ERR"
