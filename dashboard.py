@@ -2343,6 +2343,13 @@ def _build_dashboard_state_snapshot():
         "thumbs_visible": bool(thumbs_up_visible),
         "fill_pending": bool(fill_pending),
         "can_confirm_fill": bool(can_confirm_fill),
+        "pending_fill": {
+            "requested_gal": round(pending_fill_requested, 3),
+            "actual_gal": round(pending_fill_gallons, 3),
+            "flow_gpm": round(pending_fill_flow_gpm, 1),
+            "shutoff_type": pending_fill_shutoff_type,
+            "thumbs_status": "pending",
+        } if fill_pending else None,
         "colors_green": bool(colors_are_green),
         "pump_stop_latched": bool(auto_shutoff_latched),
         "flow_meter_connected": bool(flow_meter_connected),

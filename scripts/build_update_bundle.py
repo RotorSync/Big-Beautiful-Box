@@ -61,7 +61,10 @@ def included_dirty_paths(repo: Path, paths: tuple[str, ...]) -> list[str]:
     for line in status.splitlines():
         if not line:
             continue
-        dirty.append(line[3:] if len(line) > 3 else line)
+        if len(line) > 2 and line[2] == " ":
+            dirty.append(line[3:])
+        else:
+            dirty.append(line[2:].strip() if len(line) > 2 else line)
     return dirty
 
 
