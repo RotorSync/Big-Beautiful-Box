@@ -5619,6 +5619,13 @@ def serial_listener():
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: handle_thumbs_up_press("serial TU"))
 
+                                elif line in ('RST', 'RESET'):
+                                    msg = "Serial: Flow reset command received"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, lambda: force_flow_reset("serial reset"))
+
                                 elif line == 'MIX':
                                     msg = "Serial: Mix mode command received"
                                     print(msg)
@@ -6765,6 +6772,8 @@ def _sim_send_command(line):
                 override_enabled_time = time.time()
     elif line == "TU":
         handle_thumbs_up_press("sim TU")
+    elif line in ("RST", "RESET"):
+        force_flow_reset("sim reset")
     elif line == "MIX":
         switch_mode("mix")
     elif line == "FILL":
@@ -6893,7 +6902,7 @@ def _create_sim_controls():
 
     cmd_frame = ttk.LabelFrame(panel, text="Switch Box")
     cmd_frame.pack(fill="x", padx=16, pady=8)
-    for row in [("+1", "-1", "+10", "-10"), ("OV", "PS", "TU"), ("FILL", "MIX")]:
+    for row in [("+1", "-1", "+10", "-10"), ("OV", "PS", "TU", "RST"), ("FILL", "MIX")]:
         row_frame = ttk.Frame(cmd_frame)
         row_frame.pack(fill="x", padx=6, pady=4)
         for command in row:

@@ -1753,6 +1753,10 @@ def command_write_handler(connection, value):
         _enqueue_control_actions(connection, 'command:confirm_fill', 'TU')
         return
 
+    if command in ('reset_flow', 'flow_reset'):
+        _enqueue_control_actions(connection, 'command:reset_flow', 'RESET')
+        return
+
     if command == 'set_mode':
         mode = str(cmd.get('mode', '')).strip().lower()
         if mode == 'mix':

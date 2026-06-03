@@ -82,6 +82,7 @@ The Pico-based Switch Box connects via RJ45 and sends serial commands:
 | Encoder + modifier | `+10` / `-10` | Coarse adjustment |
 | Pump Stop button | `PS` | Emergency pump stop |
 | Override button | `OV` | Toggle auto-alert |
+| Reset button | `RST` / `RESET` | Reset flow totalizer |
 | Fill/Mix toggle | `FILL` / `MIX` | Switch modes |
 | Thumbs Up button | `TU` | Pilot acknowledgment |
 

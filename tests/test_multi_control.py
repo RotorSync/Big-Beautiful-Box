@@ -112,6 +112,30 @@ def test_control_writes_keep_peer_and_source_metadata(bumble_module, monkeypatch
     ]
 
 
+def test_reset_flow_command_forwards_dashboard_reset(bumble_module, monkeypatch):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'reset_flow'}).encode('utf-8'),
+    )
+
+    assert sent == ['RESET']
+    assert queries == ['query']
+
+
 def test_control_write_falls_back_inline_before_worker_starts(bumble_module, monkeypatch):
     sent = []
     queries = []
