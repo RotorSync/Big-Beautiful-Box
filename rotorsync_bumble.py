@@ -105,6 +105,18 @@ MAINTENANCE_REPO_DIR = '/home/pi/Big-Beautiful-Box'
 MAINTENANCE_TMP_DIR = '/tmp/rotorsync-maintenance-update'
 MAINTENANCE_UPDATE_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,96}$')
 MAINTENANCE_STDOUT_TEXT_CHARS = 180
+MAINTENANCE_RUNTIME_PATHS = (
+    'dashboard.py',
+    'rotorsync_bumble.py',
+    'rotorsync_watchdog.py',
+    'start_iol_dashboard.sh',
+    'VERSION',
+    'config.py',
+    'requirements.txt',
+    'install.sh',
+    'src',
+    'deploy',
+)
 MAINTENANCE_SECRET_PATHS = (
     '/etc/rotorsync/maintenance.secret',
     '/home/pi/.rotorsync-maintenance-secret',
@@ -1055,15 +1067,26 @@ def _backup_current_runtime(update_id):
     backup_dir = Path(MAINTENANCE_UPDATE_DIR) / update_id / 'backup'
     backup_dir.mkdir(parents=True, exist_ok=True)
     repo = Path(MAINTENANCE_REPO_DIR)
-    for name in ('dashboard.py', 'rotorsync_bumble.py', 'rotorsync_watchdog.py', 'start_iol_dashboard.sh', 'VERSION', 'config.py'):
-        src = repo / name
-        if src.exists():
-            _copy_path(src, backup_dir / name)
-    for name in ('src',):
+    for name in MAINTENANCE_RUNTIME_PATHS:
         src = repo / name
         if src.exists():
             _copy_path(src, backup_dir / name)
     return backup_dir
+
+
+def _restore_runtime_backup(backup_dir):
+    repo = Path(MAINTENANCE_REPO_DIR)
+    backup_dir = Path(backup_dir)
+    for name in MAINTENANCE_RUNTIME_PATHS:
+        src = backup_dir / name
+        dst = repo / name
+        if src.exists():
+            _copy_path(src, dst)
+            continue
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        elif dst.exists():
+            dst.unlink()
 
 
 def _refresh_opt_runtime(repo_root):
@@ -1126,26 +1149,24 @@ def _apply_tar_update(update_id, artifact_path):
     if not repo.exists():
         raise ValueError(f'{MAINTENANCE_REPO_DIR} does not exist')
 
-    _backup_current_runtime(update_id)
-    for name in (
-        'dashboard.py',
-        'rotorsync_bumble.py',
-        'rotorsync_watchdog.py',
-        'start_iol_dashboard.sh',
-        'VERSION',
-        'config.py',
-        'requirements.txt',
-        'install.sh',
-        'src',
-        'deploy',
-    ):
-        src = update_root / name
-        if src.exists():
-            _copy_path(src, repo / name)
+    backup_dir = _backup_current_runtime(update_id)
+    try:
+        for name in MAINTENANCE_RUNTIME_PATHS:
+            src = update_root / name
+            if src.exists():
+                _copy_path(src, repo / name)
 
-    _refresh_opt_runtime(repo)
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
-    subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
+        _refresh_opt_runtime(repo)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
+        subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
+    except Exception as apply_error:
+        try:
+            _restore_runtime_backup(backup_dir)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                f'update apply failed and rollback failed: {apply_error}; rollback: {rollback_error}'
+            ) from rollback_error
+        raise RuntimeError(f'update apply failed; restored previous runtime: {apply_error}') from apply_error
     return update_root
 
 
@@ -1164,7 +1185,21 @@ def _handle_update_apply(frame):
         raise ValueError('verified artifact is not a tar archive')
 
     _emit_update_status('update_applying', update_id, f'Applying update {update_id}\n')
-    _apply_tar_update(update_id, paths['artifact'])
+    try:
+        _apply_tar_update(update_id, paths['artifact'])
+    except Exception as e:
+        meta['status'] = 'apply_failed'
+        meta['apply_error'] = str(e)
+        meta['apply_failed_at'] = time.time()
+        _write_update_meta(update_id, meta)
+        _emit_update_status(
+            'update_apply_failed',
+            update_id,
+            f'Update apply failed; previous runtime restored: {e}\n',
+            status='apply_failed',
+            reason=str(e),
+        )
+        raise
     meta['status'] = 'applied'
     meta['applied_at'] = time.time()
     _write_update_meta(update_id, meta)
