@@ -901,6 +901,51 @@ def _read_update_meta(update_id):
         return None
 
 
+def _update_meta_time(meta):
+    for key in ('applied_at', 'verified_at', 'updated_at', 'started_at'):
+        try:
+            value = float(meta.get(key, 0))
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _newer_verified_bbb_master_update(update_id, meta):
+    if not str(update_id).startswith('bbb-master-'):
+        return None
+
+    current_time = _update_meta_time(meta)
+    update_root = Path(MAINTENANCE_UPDATE_DIR)
+    try:
+        candidates = list(update_root.iterdir())
+    except FileNotFoundError:
+        return None
+
+    newest_id = None
+    newest_time = current_time
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        candidate_id = candidate.name
+        if candidate_id == update_id or not candidate_id.startswith('bbb-master-'):
+            continue
+        if not MAINTENANCE_UPDATE_ID_RE.match(candidate_id):
+            continue
+        candidate_meta = _read_update_meta(candidate_id)
+        if not candidate_meta or candidate_meta.get('status') not in ('verified', 'applied'):
+            continue
+        if not _update_paths(candidate_id)['artifact'].exists():
+            continue
+        candidate_time = _update_meta_time(candidate_meta)
+        if candidate_time > newest_time:
+            newest_id = candidate_id
+            newest_time = candidate_time
+
+    return newest_id
+
+
 def _write_update_meta(update_id, meta):
     paths = _update_paths(update_id)
     paths['base'].mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1297,9 @@ def _handle_update_apply(frame):
     meta = _read_update_meta(update_id)
     if not meta or meta.get('status') != 'verified' or not paths['artifact'].exists():
         raise ValueError('update is not verified')
+    newer_update_id = _newer_verified_bbb_master_update(update_id, meta)
+    if newer_update_id:
+        raise ValueError(f'stale update {update_id}; newer verified update {newer_update_id} exists')
     if not tarfile.is_tarfile(paths['artifact']):
         raise ValueError('verified artifact is not a tar archive')
 

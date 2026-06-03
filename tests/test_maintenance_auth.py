@@ -186,6 +186,70 @@ def test_apply_failure_marks_update_failed_and_reports_status(bumble_module, mon
     assert payload['update_id'] == 'update-1'
 
 
+def test_apply_rejects_stale_bbb_master_update(bumble_module, monkeypatch, tmp_path):
+    updates = tmp_path / 'updates'
+    monkeypatch.setattr(bumble_module, 'MAINTENANCE_UPDATE_DIR', str(updates))
+    older_id = 'bbb-master-V2.5-11111111'
+    newer_id = 'bbb-master-V2.5-22222222'
+
+    for update_id, verified_at in ((older_id, 10), (newer_id, 20)):
+        paths = bumble_module._update_paths(update_id)
+        paths['base'].mkdir(parents=True)
+        paths['artifact'].write_bytes(b'placeholder')
+        bumble_module._write_update_meta(update_id, {
+            'update_id': update_id,
+            'status': 'verified',
+            'expected_size': 11,
+            'sha256': 'a' * 64,
+            'verified_at': verified_at,
+        })
+
+    monkeypatch.setattr(bumble_module.tarfile, 'is_tarfile', lambda _path: True)
+    monkeypatch.setattr(
+        bumble_module,
+        '_apply_tar_update',
+        lambda _update_id, _artifact_path: pytest.fail('stale update should not apply'),
+    )
+
+    with pytest.raises(ValueError, match='stale update'):
+        bumble_module._handle_update_apply({'update_id': older_id})
+
+    assert bumble_module._read_update_meta(older_id)['status'] == 'verified'
+
+
+def test_apply_allows_latest_verified_bbb_master_update(bumble_module, monkeypatch, tmp_path):
+    updates = tmp_path / 'updates'
+    monkeypatch.setattr(bumble_module, 'MAINTENANCE_UPDATE_DIR', str(updates))
+    older_id = 'bbb-master-V2.5-11111111'
+    newer_id = 'bbb-master-V2.5-22222222'
+
+    for update_id, verified_at in ((older_id, 10), (newer_id, 20)):
+        paths = bumble_module._update_paths(update_id)
+        paths['base'].mkdir(parents=True)
+        paths['artifact'].write_bytes(b'placeholder')
+        bumble_module._write_update_meta(update_id, {
+            'update_id': update_id,
+            'status': 'verified',
+            'expected_size': 11,
+            'sha256': 'a' * 64,
+            'verified_at': verified_at,
+        })
+
+    applied = []
+    monkeypatch.setattr(bumble_module.tarfile, 'is_tarfile', lambda _path: True)
+    monkeypatch.setattr(
+        bumble_module,
+        '_apply_tar_update',
+        lambda update_id, _artifact_path: applied.append(update_id),
+    )
+    monkeypatch.setattr(bumble_module, '_schedule_service_restart', lambda: None)
+
+    bumble_module._handle_update_apply({'update_id': newer_id})
+
+    assert applied == [newer_id]
+    assert bumble_module._read_update_meta(newer_id)['status'] == 'applied'
+
+
 class CapturingBleDevice:
     def __init__(self):
         self.notifications = []
