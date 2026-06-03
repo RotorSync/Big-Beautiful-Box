@@ -57,7 +57,9 @@ SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
 SCAN_INTERVAL = 15
 BMS_READ_INTERVAL = 20  # 20 * 15s scan interval = 5 minutes
-STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
+STATUS_POLL_INTERVAL = 2.0  # Poll dashboard for status every 2 seconds
+STATUS_HISTORY_POLL_INTERVAL = 10.0
+STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_POLL_INTERVAL))
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 
@@ -106,7 +108,9 @@ MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
 MAINTENANCE_REPO_DIR = '/home/pi/Big-Beautiful-Box'
 MAINTENANCE_TMP_DIR = '/tmp/rotorsync-maintenance-update'
 MAINTENANCE_UPDATE_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,96}$')
-MAINTENANCE_STDOUT_TEXT_CHARS = 180
+MAINTENANCE_STDOUT_TEXT_CHARS = 96
+MAINTENANCE_STDOUT_NOTIFY_INTERVAL = 0.08
+MAINTENANCE_STDOUT_NOTIFY_QUEUE_LIMIT = 200
 MAINTENANCE_RUNTIME_PATHS = (
     'dashboard.py',
     'rotorsync_bumble.py',
@@ -183,6 +187,8 @@ maintenance_shell_reader_task = None
 maintenance_active_session_id = None
 maintenance_stdout_seq = 0
 maintenance_last_stdout_payload = '{"type":"status","text":"Maintenance bridge idle","seq":0}'
+maintenance_stdout_notify_queue = []
+maintenance_stdout_notify_task = None
 maintenance_updates = {}
 
 # Chunked config command buffer
@@ -565,21 +571,37 @@ def _maintenance_session_id(default='unknown'):
 
 
 def _notify_maintenance_stdout(payload=None):
+    global maintenance_stdout_notify_task
     if not ble_device or not maintenance_stdout_char:
         return
     payload_text = payload if payload is not None else maintenance_last_stdout_payload
+    maintenance_stdout_notify_queue.append(payload_text)
+    overflow_count = len(maintenance_stdout_notify_queue) - MAINTENANCE_STDOUT_NOTIFY_QUEUE_LIMIT
+    if overflow_count > 0:
+        del maintenance_stdout_notify_queue[:overflow_count]
 
-    async def _notify():
+    async def _drain_notifications():
+        global maintenance_stdout_notify_task
         try:
-            await ble_device.notify_subscribers(
-                maintenance_stdout_char,
-                payload_text.encode('utf-8'),
-            )
-        except Exception as e:
-            print(f'Maintenance stdout notify error: {e}', flush=True)
+            while maintenance_stdout_notify_queue:
+                queued_payload = maintenance_stdout_notify_queue.pop(0)
+                try:
+                    await ble_device.notify_subscribers(
+                        maintenance_stdout_char,
+                        queued_payload.encode('utf-8'),
+                    )
+                except Exception as e:
+                    print(f'Maintenance stdout notify error: {e}', flush=True)
+                if maintenance_stdout_notify_queue:
+                    await asyncio.sleep(MAINTENANCE_STDOUT_NOTIFY_INTERVAL)
+        finally:
+            maintenance_stdout_notify_task = None
 
     try:
-        asyncio.get_running_loop().create_task(_notify())
+        if maintenance_stdout_notify_task is None or maintenance_stdout_notify_task.done():
+            maintenance_stdout_notify_task = asyncio.get_running_loop().create_task(
+                _drain_notifications()
+            )
     except RuntimeError:
         pass
 
@@ -3008,9 +3030,9 @@ async def poll_dashboard_status(device, state_char):
                     bytes(current_state_json, 'utf-8'),
                 )
                 last_notified_state_json = current_state_json
-            # Poll history every 50 cycles (~10 seconds at 0.2s interval)
+            # Poll history less often than live state; it only changes after fills.
             poll_count += 1
-            if poll_count >= 50:
+            if poll_count >= STATUS_HISTORY_POLL_CYCLES:
                 query_fill_history()
                 poll_count = 0
         except Exception as e:

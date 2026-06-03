@@ -201,10 +201,15 @@ def test_maintenance_stdout_notifications_capture_each_payload(bumble_module):
         bumble_module.maintenance_stdout_char = object()
         bumble_module.maintenance_stdout_seq = 0
         bumble_module.maintenance_active_session_id = 'session-1'
+        bumble_module.maintenance_stdout_notify_queue = []
+        bumble_module.maintenance_stdout_notify_task = None
+        bumble_module.MAINTENANCE_STDOUT_NOTIFY_INTERVAL = 0.001
 
         bumble_module._set_maintenance_stdout_obj({'text': 'first'})
         bumble_module._set_maintenance_stdout_obj({'text': 'second'})
-        await asyncio.sleep(0)
+        deadline = time.time() + 1
+        while len(device.notifications) < 2 and time.time() < deadline:
+            await asyncio.sleep(0.01)
 
         payloads = [
             json.loads(data)

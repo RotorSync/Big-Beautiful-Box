@@ -465,6 +465,58 @@ def flow_curve_proposal_status_text():
     return "Pending curve"
 
 
+def _flow_curve_accept_payload(curve_payload):
+    """Build a compact JSON-safe response for an accepted learned curve."""
+    learning = curve_payload.get("learning", {}) if isinstance(curve_payload, dict) else {}
+    return {
+        "current_curve": flow_curve_status_text(),
+        "pending_curve": flow_curve_proposal_status_text(),
+        "sample_count": curve_payload.get("sample_count", 0) if isinstance(curve_payload, dict) else 0,
+        "applied_offset_gallons": learning.get("applied_offset_gallons"),
+        "raw_offset_gallons": learning.get("raw_offset_gallons"),
+        "accepted_at": curve_payload.get("accepted_at") if isinstance(curve_payload, dict) else None,
+    }
+
+
+def accept_pending_flow_curve(source="Socket"):
+    """Activate a pending learned flow curve without opening a UI dialog."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        return False, {
+            "code": "NO_PENDING_CURVE",
+            "message": "No learned curve proposal is ready.",
+            "current_curve": flow_curve_status_text(),
+            "pending_curve": "No pending curve",
+        }
+
+    try:
+        accepted = flow_curve.accept_curve_proposal(
+            FLOW_CURVE_PROPOSAL_PATH,
+            FLOW_CURVE_OVERRIDE_PATH,
+        )
+        load_flow_curve_state()
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted proposal"
+                f" | Source: {source}"
+                f" | Offset: {accepted.get('learning', {}).get('applied_offset_gallons', 'unknown')}\n"
+            )
+        return True, _flow_curve_accept_payload(accepted)
+    except Exception as exc:
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accept failed"
+                f" | Source: {source}"
+                f" | Error: {exc}\n"
+            )
+        return False, {
+            "code": "ACCEPT_FAILED",
+            "message": str(exc),
+            "current_curve": flow_curve_status_text(),
+            "pending_curve": flow_curve_proposal_status_text(),
+        }
+
+
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
     Calculate how many gallons before target to trigger shutoff based on flow rate.
@@ -3648,23 +3700,7 @@ def confirm_accept_flow_curve():
     def confirm_accept():
         global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
         global accept_flow_curve_cancel_handler
-        try:
-            accepted = flow_curve.accept_curve_proposal(
-                FLOW_CURVE_PROPOSAL_PATH,
-                FLOW_CURVE_OVERRIDE_PATH,
-            )
-            load_flow_curve_state()
-            with open("/home/pi/fill_calibration.log", "a") as f:
-                f.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted proposal"
-                    f" | Offset: {accepted.get('learning', {}).get('applied_offset_gallons', 'unknown')}\n"
-                )
-        except Exception as exc:
-            with open("/home/pi/fill_calibration.log", "a") as f:
-                f.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accept failed"
-                    f" | Error: {exc}\n"
-                )
+        accept_pending_flow_curve("TrailerScreen")
         confirm_window.destroy()
         accept_flow_curve_confirm_window = None
         accept_flow_curve_confirm_handler = None
@@ -4962,6 +4998,14 @@ def socket_command_listener():
                                 snapshot = _build_dashboard_state_snapshot()
                                 client.send(
                                     f"STATE_JSON:{json.dumps(snapshot, separators=(',', ':'))}\n".encode()
+                                )
+                                continue
+
+                            elif line == "ACCEPT_PENDING_CURVE":
+                                ok, payload = accept_pending_flow_curve("Socket")
+                                prefix = "CURVE_ACCEPTED" if ok else "CURVE_ACCEPT_ERR"
+                                client.send(
+                                    f"{prefix}:{json.dumps(payload, separators=(',', ':'))}\n".encode()
                                 )
                                 continue
 
