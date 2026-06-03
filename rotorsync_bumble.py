@@ -12,6 +12,7 @@ import base64
 import contextlib
 import csv
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -104,6 +105,10 @@ MAINTENANCE_REPO_DIR = '/home/pi/Big-Beautiful-Box'
 MAINTENANCE_TMP_DIR = '/tmp/rotorsync-maintenance-update'
 MAINTENANCE_UPDATE_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,96}$')
 MAINTENANCE_STDOUT_TEXT_CHARS = 180
+MAINTENANCE_SECRET_PATHS = (
+    '/etc/rotorsync/maintenance.secret',
+    '/home/pi/.rotorsync-maintenance-secret',
+)
 
 # Sensor data with timestamps
 sensor_data = {
@@ -649,6 +654,65 @@ def _parse_maintenance_payload(payload_bytes):
     return obj if isinstance(obj, dict) else None, payload_bytes
 
 
+def _maintenance_secret():
+    for env_name in ('BBB_MAINTENANCE_SECRET', 'MAINTENANCE_RELAY_SECRET'):
+        value = os.environ.get(env_name, '').strip()
+        if value:
+            return value.encode('utf-8')
+
+    for path in MAINTENANCE_SECRET_PATHS:
+        try:
+            with open(path, 'rb') as f:
+                value = f.read().strip()
+            if value:
+                return value
+        except OSError:
+            continue
+
+    return b'rotorsync-development-maintenance-secret'
+
+
+def _canonical_maintenance_payload(frame):
+    unsigned = {key: value for key, value in frame.items() if key != 'sig'}
+    return json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('utf-8')
+
+
+def _maintenance_frame_signature(frame):
+    digest = hmac.new(
+        _maintenance_secret(),
+        _canonical_maintenance_payload(frame),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
+
+
+def _verify_maintenance_frame(frame, now=None):
+    if not isinstance(frame, dict):
+        raise ValueError('maintenance frame must be a JSON object')
+
+    signature = frame.get('sig')
+    if not isinstance(signature, str) or not signature:
+        raise ValueError('missing frame signature')
+
+    expected = _maintenance_frame_signature(frame)
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError('invalid frame signature')
+
+    expires_at = frame.get('expires_at')
+    if expires_at is not None:
+        try:
+            expires_at_value = float(expires_at)
+        except (TypeError, ValueError) as e:
+            raise ValueError('invalid frame expiry') from e
+        if (now if now is not None else time.time()) > expires_at_value:
+            raise ValueError('expired maintenance frame')
+
+
 async def _stop_maintenance_shell(reason='closed'):
     global maintenance_shell_process, maintenance_shell_reader_task, maintenance_active_session_id
     process = maintenance_shell_process
@@ -1125,15 +1189,23 @@ async def _handle_maintenance_control_payload(payload_bytes):
     global maintenance_active_session_id
     frame, raw = _parse_maintenance_payload(payload_bytes)
     if not frame:
-        await _write_maintenance_stdin_bytes(raw)
+        print('Maintenance control error: unsigned control payload', flush=True)
+        _set_maintenance_stdout_obj({
+            'type': 'error',
+            'session_id': _maintenance_session_id(),
+            'text': 'unsigned maintenance control payload rejected\n',
+            'reason': 'missing frame signature',
+        })
         return
 
     frame_type = str(frame.get('type') or frame.get('kind') or frame.get('op') or '').lower()
     session_id = frame.get('session_id') or frame.get('sessionId') or maintenance_active_session_id
-    if session_id:
-        maintenance_active_session_id = str(session_id)
 
     try:
+        _verify_maintenance_frame(frame)
+        if session_id:
+            maintenance_active_session_id = str(session_id)
+
         if frame_type == 'open':
             await _ensure_maintenance_shell(str(session_id) if session_id else None)
         elif frame_type in ('heartbeat', 'resize'):
@@ -1180,14 +1252,39 @@ async def _handle_maintenance_control_payload(payload_bytes):
 
 async def _handle_maintenance_stdin_payload(payload_bytes):
     frame, raw = _parse_maintenance_payload(payload_bytes)
-    if frame:
+    if not frame:
+        print('Maintenance stdin error: unsigned stdin payload', flush=True)
+        _set_maintenance_stdout_obj({
+            'type': 'error',
+            'session_id': _maintenance_session_id(),
+            'text': 'unsigned maintenance stdin payload rejected\n',
+            'reason': 'missing frame signature',
+        })
+        return
+
+    frame_type = str(frame.get('type') or frame.get('kind') or frame.get('op') or '').lower()
+    session_id = frame.get('session_id') or frame.get('sessionId') or maintenance_active_session_id
+    try:
+        _verify_maintenance_frame(frame)
+        if frame_type not in ('stdin', 'input'):
+            raise ValueError(f'unsupported maintenance stdin frame type: {frame_type or "unknown"}')
         session_id = frame.get('session_id') or frame.get('sessionId') or maintenance_active_session_id
         data = frame.get('data')
         if data is None:
             data = frame.get('input') or frame.get('text') or ''
         await _write_maintenance_stdin_bytes(str(data).encode('utf-8'), str(session_id) if session_id else None)
-    else:
-        await _write_maintenance_stdin_bytes(raw)
+    except Exception as e:
+        print(f'Maintenance stdin error: {e}', flush=True)
+        _set_maintenance_stdout_obj({
+            'type': 'error',
+            'session_id': _maintenance_session_id(),
+            'text': f'{e}\n',
+            'reason': str(e),
+            'ack_type': frame_type or None,
+            'frame_type': frame_type or None,
+            'commandId': frame.get('commandId'),
+            'command_id': frame.get('command_id'),
+        })
 
 
 def maintenance_control_write_handler(connection, value):
