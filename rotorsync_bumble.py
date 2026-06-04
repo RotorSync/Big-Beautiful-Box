@@ -13,6 +13,7 @@ import contextlib
 import csv
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -81,6 +82,11 @@ ADAPTER_RESET_COOLDOWN = 30
 GATT_ADAPTER_CHECK_INTERVAL = 5
 SENSOR_LOOP_HEARTBEAT_TIMEOUT = 120
 SENSOR_ADAPTER_OPEN_TIMEOUT = 10
+HCI_SOCKET_OPEN_RETRY_ATTEMPTS = 12
+HCI_SOCKET_OPEN_RETRY_DELAY_SECONDS = 2.0
+CONFIG_RESPONSE_DIRECT_MAX_BYTES = 512
+CONFIG_RESPONSE_CHUNK_SIZE = 180
+CONFIG_RESPONSE_CHUNK_NOTIFY_DELAY_SECONDS = 0.005
 GATT_ADVERTISING_RESUME_FAILURE_BACKOFF_SECONDS = 20
 
 # UUIDs
@@ -268,6 +274,8 @@ config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
 config_response_by_connection = {}
 config_response_pages_by_connection = {}
+config_response_pages_by_request = {}
+config_response_read_index_by_connection = {}
 config_notify_char = None
 maintenance_stdout_char = None
 ble_device = None
@@ -570,6 +578,29 @@ def reset_adapter(adapter):
     except Exception as e:
         print(f'Adapter reset error: {e}', flush=True)
         return False
+
+
+def prepare_adapter_for_hci_user_channel(adapter):
+    """Put the adapter in the state required by Linux HCI_CHANNEL_USER."""
+    if not adapter:
+        return
+    try:
+        result = subprocess.run(
+            ['hciconfig', adapter, 'down'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or '').strip()
+            print(
+                f'WARNING: unable to bring {adapter} down before Bumble open'
+                f'{": " + detail if detail else ""}',
+                flush=True,
+            )
+    except Exception as e:
+        print(f'WARNING: unable to prepare {adapter} for Bumble open: {e!r}', flush=True)
+
 
 def adapter_exists(adapter):
     """Return True if the named HCI adapter still exists."""
@@ -966,7 +997,7 @@ def make_live_telemetry_read_handler():
 def make_config_notify_read_handler():
     def read_value(connection):
         mark_gatt_client_seen()
-        value = config_response_by_connection.get(_connection_key(connection), config_response)
+        value = _next_config_response_read_value(connection)
         print(f'ReadValue config_notify: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
@@ -1980,12 +2011,17 @@ def _notify_config_response(payload=None):
     if not ble_device or not config_notify_char:
         return
     payload_text = payload if payload is not None else config_response
+    payload_chunks = _config_response_notify_frames(payload_text)
 
     async def _notify():
-        try:
-            await ble_device.notify_subscribers(config_notify_char, payload_text.encode('utf-8'))
-        except Exception as e:
-            print(f'Config notify error: {e}', flush=True)
+        for payload_chunk in payload_chunks:
+            try:
+                await ble_device.notify_subscribers(config_notify_char, payload_chunk.encode('utf-8'))
+                if len(payload_chunks) > 1:
+                    await asyncio.sleep(CONFIG_RESPONSE_CHUNK_NOTIFY_DELAY_SECONDS)
+            except Exception as e:
+                print(f'Config notify error: {e}', flush=True)
+                break
 
     try:
         asyncio.get_running_loop().create_task(_notify())
@@ -1993,10 +2029,44 @@ def _notify_config_response(payload=None):
         pass
 
 
+def _config_response_notify_frames(payload_text):
+    payload_text = payload_text or ''
+    if len(payload_text.encode('utf-8')) <= CONFIG_RESPONSE_DIRECT_MAX_BYTES:
+        return [payload_text]
+
+    chunks = [
+        payload_text[index:index + CONFIG_RESPONSE_CHUNK_SIZE]
+        for index in range(0, len(payload_text), CONFIG_RESPONSE_CHUNK_SIZE)
+    ]
+    return [
+        f'CHUNK:{index + 1}/{len(chunks)}:{chunk}'
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def _config_response_read_value(payload_text):
+    return _config_response_notify_frames(payload_text)[0]
+
+
+def _next_config_response_read_value(connection):
+    connection_key = _connection_key(connection)
+    payload_text = config_response_by_connection.get(connection_key, config_response)
+    frames = _config_response_notify_frames(payload_text)
+    if len(frames) <= 1:
+        config_response_read_index_by_connection[connection_key] = 0
+        return frames[0]
+
+    index = config_response_read_index_by_connection.get(connection_key, 0)
+    frame = frames[min(index, len(frames) - 1)]
+    config_response_read_index_by_connection[connection_key] = (index + 1) % len(frames)
+    return frame
+
+
 def _set_config_response_obj(obj):
     global config_response
-    config_response = json.dumps(obj, separators=(',', ':'))
-    _notify_config_response(config_response)
+    payload_text = json.dumps(obj, separators=(',', ':'))
+    config_response = payload_text
+    _notify_config_response(payload_text)
 
 
 def _schedule_identity_restart(reason, delay=1.0):
@@ -2011,9 +2081,17 @@ def _schedule_identity_restart(reason, delay=1.0):
         pass
 
 
-def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450):
-    global config_response_pages
+def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450, max_pages=None):
+    global config_response_pages, config_response_pages_by_request
     pages = paginate_response(items, page_size_bytes=page_size_bytes)
+    if max_pages is not None and max_pages > 0 and len(pages) > max_pages:
+        limited_items = []
+        for page_json in pages[:max_pages]:
+            try:
+                limited_items.extend(json.loads(page_json).get('items', []))
+            except Exception:
+                pass
+        pages = paginate_response(limited_items, page_size_bytes=page_size_bytes)
     enriched_pages = []
     for page_json in pages:
         page_obj = json.loads(page_json)
@@ -2023,6 +2101,11 @@ def _set_paginated_config_response(items, *, request_id=None, op=None, page_size
             page_obj['op'] = op
         enriched_pages.append(json.dumps(page_obj, separators=(',', ':')))
     config_response_pages = enriched_pages
+    if request_id:
+        config_response_pages_by_request[request_id] = list(enriched_pages)
+        if len(config_response_pages_by_request) > 24:
+            for stale_request_id in list(config_response_pages_by_request.keys())[:-24]:
+                config_response_pages_by_request.pop(stale_request_id, None)
     if enriched_pages:
         _set_config_response_obj(json.loads(enriched_pages[0]))
     else:
@@ -3375,15 +3458,29 @@ def _cmd_delete_calibration(cmd, *, request_id=None):
 def _cmd_page(cmd, *, request_id=None):
     global config_response
     page = cmd.get('page', 1)
-    if not config_response_pages:
+    cursor_request_id = cmd.get('cursor_request_id')
+    pages = config_response_pages_by_request.get(cursor_request_id) if cursor_request_id else config_response_pages
+
+    if len(active_gatt_connections) > 1 and page > 1:
+        _set_config_response_obj({
+            'ok': False,
+            'op': 'PAGE',
+            'request_id': request_id,
+            'error': 'Older history paused while multiple controllers connected',
+        })
+        return
+
+    if not pages:
         _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': 'No paginated data available'})
         return
 
-    if page < 1 or page > len(config_response_pages):
-        _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': f'Page {page} out of range (1-{len(config_response_pages)})'})
+    if page < 1 or page > len(pages):
+        _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': f'Page {page} out of range (1-{len(pages)})'})
         return
 
-    page_obj = json.loads(config_response_pages[page - 1])
+    page_obj = json.loads(pages[page - 1])
+    if cursor_request_id:
+        page_obj['cursor_request_id'] = cursor_request_id
     if request_id is not None:
         page_obj['request_id'] = request_id
     _set_config_response_obj(page_obj)
@@ -3407,6 +3504,7 @@ def process_config_command_for_connection(data_str, connection_key):
         process_config_command(data_str)
         config_response_by_connection[connection_key] = config_response
         config_response_pages_by_connection[connection_key] = list(config_response_pages)
+        config_response_read_index_by_connection[connection_key] = 0
         previous_global_response = config_response
         previous_global_pages = list(config_response_pages)
     finally:
@@ -3784,18 +3882,67 @@ def maybe_prune_history_files():
     _prune_mopeka_history_file(now)
 
 
-def _load_mopeka_history_items(cmd):
-    if not os.path.exists(MOPEKA_HISTORY_LOG_PATH):
+def _history_newest_first_requested(cmd):
+    value = cmd.get('newest_first')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ('1', 'true', 'yes', 'y', 'desc', 'newest', 'newest_first'):
+        return True
+    order = str(cmd.get('order') or '').strip().lower()
+    return order in ('desc', 'newest', 'newest_first')
+
+
+def _mopeka_history_paths():
+    path = Path(MOPEKA_HISTORY_LOG_PATH)
+    paths = []
+    if path.exists():
+        paths.append(path)
+
+    for rotated_path in sorted(
+        path.parent.glob(f'{path.name}.*'),
+        key=lambda item: item.stat().st_mtime if item.exists() else 0,
+        reverse=True,
+    ):
+        if rotated_path == path:
+            continue
+        if rotated_path.name.endswith('.zst') or rotated_path.suffix in ('', '.1') or rotated_path.name.endswith('.csv.1'):
+            paths.append(rotated_path)
+
+    return paths[:120]
+
+
+def _read_mopeka_history_rows(path):
+    try:
+        if path.name.endswith('.zst'):
+            result = subprocess.run(
+                ['zstdcat', str(path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or '').strip()
+                print(f'Mopeka history read skipped {path}: {detail}', flush=True)
+                return []
+            return list(csv.DictReader(io.StringIO(result.stdout)))
+
+        with open(path, newline='') as f:
+            return list(csv.DictReader(f))
+    except Exception as e:
+        print(f'Mopeka history read skipped {path}: {e}', flush=True)
         return []
 
+
+def _load_mopeka_history_items(cmd):
     since, until = _clamped_history_window(cmd)
     items = []
-    with open(MOPEKA_HISTORY_LOG_PATH, newline='') as f:
-        for row in csv.DictReader(f):
+    seen = set()
+    for path in _mopeka_history_paths():
+        for row in _read_mopeka_history_rows(path):
             timestamp = _history_timestamp_epoch(row.get('timestamp'))
             if timestamp is None or timestamp < since or timestamp > until:
                 continue
-            items.append({
+            item = {
                 't': timestamp,
                 'r': row.get('reason') or '',
                 'fg': _history_float(row.get('front_gal')),
@@ -3806,18 +3953,33 @@ def _load_mopeka_history_items(cmd):
                 'bin': _history_float(row.get('back_in')),
                 'fq': _history_int(row.get('front_quality')),
                 'bq': _history_int(row.get('back_quality')),
-            })
-    return sorted(items, key=lambda item: item['t'])
+            }
+            key = (
+                item['t'],
+                item['fg'],
+                item['bg'],
+                item['fmm'],
+                item['bmm'],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    return sorted(items, key=lambda item: item['t'], reverse=_history_newest_first_requested(cmd))
 
 
 def _cmd_get_mopeka_history(cmd, *, request_id=None):
     maybe_prune_history_files()
     items = _load_mopeka_history_items(cmd)
+    max_pages = 1 if len(active_gatt_connections) > 1 else None
+    if max_pages:
+        print('GET_MOPEKA_HISTORY limited to newest page while multiple controllers are connected', flush=True)
     _set_paginated_config_response(
         items,
         request_id=request_id,
         op='GET_MOPEKA_HISTORY',
-        page_size_bytes=450,
+        page_size_bytes=8192,
+        max_pages=max_pages,
     )
 
 
@@ -4193,6 +4355,39 @@ async def monitor_sensor_health(sensor_task):
             )
             os._exit(1)
 
+
+async def open_hci_socket_transport_with_retry(
+    adapter_index,
+    adapter_name,
+    *,
+    attempts=HCI_SOCKET_OPEN_RETRY_ATTEMPTS,
+    delay=HCI_SOCKET_OPEN_RETRY_DELAY_SECONDS,
+    timeout=None,
+):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            prepare_adapter_for_hci_user_channel(adapter_name)
+            if timeout is None:
+                return await open_hci_socket_transport(adapter_index)
+            return await asyncio.wait_for(
+                open_hci_socket_transport(adapter_index),
+                timeout=timeout,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+            print(
+                f'WARNING: {adapter_name} HCI socket open failed '
+                f'({attempt}/{attempts}): {e!r}; retrying in {delay:.1f}s',
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+
+    raise last_error or RuntimeError(f'{adapter_name} HCI socket open failed')
+
+
 async def main():
     global ble_device, config_notify_char, maintenance_stdout_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
@@ -4234,8 +4429,11 @@ async def main():
     if sensor_adapter and sensor_adapter_index is not None:
         print(f'Opening HCI socket for {sensor_adapter}...', flush=True)
         try:
-            sensor_transport = await asyncio.wait_for(
-                open_hci_socket_transport(sensor_adapter_index),
+            sensor_transport = await open_hci_socket_transport_with_retry(
+                sensor_adapter_index,
+                sensor_adapter,
+                attempts=5,
+                delay=HCI_SOCKET_OPEN_RETRY_DELAY_SECONDS,
                 timeout=SENSOR_ADAPTER_OPEN_TIMEOUT,
             )
             sensor_host = Host(sensor_transport.source, sensor_transport.sink)
@@ -4257,7 +4455,10 @@ async def main():
     )
 
     print(f'Opening HCI socket for {gatt_adapter}...', flush=True)
-    hci_transport = await open_hci_socket_transport(gatt_adapter_index)
+    hci_transport = await open_hci_socket_transport_with_retry(
+        gatt_adapter_index,
+        gatt_adapter,
+    )
 
     host = Host(hci_transport.source, hci_transport.sink)
     ble_name = _compute_ble_name()
