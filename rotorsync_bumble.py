@@ -224,6 +224,7 @@ def _encode_ble_state_payload(state):
     put_bool_if_non_default(compact, 'confirm', state.get('can_confirm_fill'), False)
     put_bool_if_non_default(compact, 'green', state.get('colors_green'), False)
     put_bool_if_non_default(compact, 'latch', state.get('pump_stop_latched'), False)
+    put_bool_if_non_default(compact, 'rs', state.get('relay_slowdown_alarm'), False)
     put_bool_if_non_default(compact, 'fm_ok', state.get('flow_meter_connected'), True)
     put_bool_if_non_default(compact, 'sb_ok', state.get('switch_box_connected'), True)
     put_if_present(compact, 'cc', compact_curve_value(state.get('current_curve')))
@@ -231,15 +232,14 @@ def _encode_ble_state_payload(state):
     return json.dumps(compact, separators=(',', ':'))
 
 
-def _encode_live_telemetry_payload(requested, actual, flow):
-    return json.dumps(
-        {
-            'req': round(float(requested), 3),
-            'act': round(float(actual), 3),
-            'flow': round(float(flow), 2),
-        },
-        separators=(',', ':'),
-    )
+def _encode_live_telemetry_payload(requested, actual, flow, relay_slowdown_alarm=False):
+    payload = {
+        'req': round(float(requested), 3),
+        'act': round(float(actual), 3),
+        'flow': round(float(flow), 2),
+        'rs': bool(relay_slowdown_alarm),
+    }
+    return json.dumps(payload, separators=(',', ':'))
 
 
 def _state_flow_gpm(state):
@@ -389,6 +389,7 @@ def query_dashboard_status():
                 state.get('requested_gal', 0.0),
                 state.get('actual_gal', 0.0),
                 state.get('flow_gpm', 0.0),
+                state.get('relay_slowdown_alarm', False),
             )
             dashboard_status['requested'] = float(state.get('requested_gal', 0.0))
             dashboard_status['actual'] = float(state.get('actual_gal', 0.0))
@@ -421,6 +422,7 @@ def query_dashboard_status():
                 dashboard_status['requested'],
                 dashboard_status['actual'],
                 0.0,
+                False,
             )
             dashboard_status['last_update'] = time.time()
             return True
@@ -439,6 +441,12 @@ def query_live_telemetry():
             requested = float(live.get('req', dashboard_status.get('requested', 0.0)))
             actual = float(live.get('act', 0.0))
             flow = float(live.get('flow', 0.0))
+            relay_slowdown_alarm = bool(
+                live.get(
+                    'rs',
+                    (dashboard_status.get('state') or {}).get('relay_slowdown_alarm', False),
+                )
+            )
             dashboard_status['requested'] = requested
             dashboard_status['actual'] = actual
             state = dashboard_status.get('state') or {}
@@ -446,8 +454,14 @@ def query_live_telemetry():
                 state['requested_gal'] = requested
                 state['actual_gal'] = actual
                 state['flow_gpm'] = flow
+                state['relay_slowdown_alarm'] = relay_slowdown_alarm
                 dashboard_status['state'] = state
-            dashboard_status['live_json'] = _encode_live_telemetry_payload(requested, actual, flow)
+            dashboard_status['live_json'] = _encode_live_telemetry_payload(
+                requested,
+                actual,
+                flow,
+                relay_slowdown_alarm,
+            )
             dashboard_status['last_update'] = time.time()
             return True
         except Exception as e:
@@ -457,7 +471,12 @@ def query_live_telemetry():
     requested = state.get('requested_gal', dashboard_status.get('requested', 0.0))
     actual = state.get('actual_gal', dashboard_status.get('actual', 0.0))
     flow = state.get('flow_gpm', 0.0)
-    dashboard_status['live_json'] = _encode_live_telemetry_payload(requested, actual, flow)
+    dashboard_status['live_json'] = _encode_live_telemetry_payload(
+        requested,
+        actual,
+        flow,
+        state.get('relay_slowdown_alarm', False) if isinstance(state, dict) else False,
+    )
     return False
 
 

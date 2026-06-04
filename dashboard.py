@@ -2483,6 +2483,7 @@ def _build_dashboard_state_snapshot():
         } if fill_pending else None,
         "colors_green": bool(colors_are_green),
         "pump_stop_latched": bool(auto_shutoff_latched),
+        "relay_slowdown_alarm": bool(relay_slowdown_alarm_active),
         "flow_meter_connected": bool(flow_meter_connected),
         "switch_box_connected": bool(switch_box_connected),
         "bms_soc": None if bms_soc is None else int(round(bms_soc)),
@@ -5451,6 +5452,7 @@ def socket_command_listener():
                                     "req": round(requested_gallons, 3),
                                     "act": round(actual, 3),
                                     "flow": round(flow_gpm, 2),
+                                    "rs": bool(relay_slowdown_alarm_active),
                                 }
                                 client.send(
                                     f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
