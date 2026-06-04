@@ -253,6 +253,51 @@ def test_accept_pending_curve_command_forwards_dashboard_apply(bumble_module, mo
     assert queries == ['query']
 
 
+@pytest.mark.parametrize(
+    ('payload', 'expected_action'),
+    [
+        (
+            {'cmd': 'cursor_move', 'dx': 12, 'dy': -8},
+            'MOUSE:{"dx":12,"dy":-8,"action":"move"}',
+        ),
+        (
+            {'cmd': 'cursor_scroll', 'steps': -3},
+            'MOUSE:{"steps":-3,"action":"scroll"}',
+        ),
+        (
+            {'cmd': 'cursor_click', 'button': 3},
+            'MOUSE:{"button":3,"action":"click"}',
+        ),
+        (
+            {'cmd': 'cursor_key', 'key': 'alt_f4'},
+            'MOUSE:{"key":"alt_f4","action":"key"}',
+        ),
+    ],
+)
+def test_cursor_commands_forward_without_refresh(bumble_module, monkeypatch, payload, expected_action):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'MOUSE_OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps(payload).encode('utf-8'),
+    )
+
+    assert sent == [expected_action]
+    assert queries == []
+
+
 def test_control_write_falls_back_inline_before_worker_starts(bumble_module, monkeypatch):
     sent = []
     queries = []
@@ -340,6 +385,52 @@ def test_live_telemetry_payload_includes_requested_actual_and_flow(bumble_module
     assert len(json.dumps(payload, separators=(',', ':'))) < 45
 
 
+def test_state_notify_compare_can_ignore_live_only_fields(bumble_module):
+    first = json.dumps(
+        {'req': 30.0, 'act': 1.234, 'flow': 88.0, 'mode': 'fill'},
+        separators=(',', ':'),
+    )
+    second = json.dumps(
+        {'req': 30.0, 'act': 2.345, 'flow': 91.0, 'mode': 'fill'},
+        separators=(',', ':'),
+    )
+    requested_changed = json.dumps(
+        {'req': 31.0, 'act': 2.345, 'flow': 91.0, 'mode': 'fill'},
+        separators=(',', ':'),
+    )
+
+    assert bumble_module._state_notify_compare_json(first) != second
+    assert bumble_module._state_notify_compare_json(
+        first,
+        suppress_live_fields=True,
+    ) == bumble_module._state_notify_compare_json(
+        second,
+        suppress_live_fields=True,
+    )
+    assert bumble_module._state_notify_compare_json(
+        first,
+        suppress_live_fields=True,
+    ) != bumble_module._state_notify_compare_json(
+        requested_changed,
+        suppress_live_fields=True,
+    )
+
+
+def test_state_live_fields_suppress_only_for_multipoint_active_flow(bumble_module):
+    assert not bumble_module._state_notify_should_suppress_live_fields(
+        controller_count=1,
+        state={'flow_gpm': 100.0},
+    )
+    assert not bumble_module._state_notify_should_suppress_live_fields(
+        controller_count=2,
+        state={'flow_gpm': 0.0},
+    )
+    assert bumble_module._state_notify_should_suppress_live_fields(
+        controller_count=2,
+        state={'flow_gpm': 100.0},
+    )
+
+
 def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monkeypatch):
     monkeypatch.setattr(
         bumble_module,
@@ -357,6 +448,27 @@ def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monke
     }
     assert bumble_module.dashboard_status['requested'] == 12.0
     assert bumble_module.dashboard_status['actual'] == 4.321
+
+
+def test_live_telemetry_single_controller_notify_is_immediate(bumble_module):
+    assert bumble_module._live_telemetry_notify_due(
+        controller_count=1,
+        now=100.0,
+        last_notify_at=99.99,
+    )
+
+
+def test_live_telemetry_multipoint_notify_is_throttled(bumble_module):
+    assert not bumble_module._live_telemetry_notify_due(
+        controller_count=2,
+        now=100.0,
+        last_notify_at=99.5,
+    )
+    assert bumble_module._live_telemetry_notify_due(
+        controller_count=2,
+        now=100.0,
+        last_notify_at=99.25,
+    )
 
 
 def test_gatt_advertising_resume_hook_keeps_advertising_on(bumble_module, monkeypatch):
@@ -439,6 +551,45 @@ def test_gatt_advertising_stays_on_when_one_client_disconnects(
     assert device.advertising is True
     assert len(device.start_calls) == 1
     assert device.stop_calls == []
+
+
+def test_gatt_duplicate_connection_event_does_not_restart_advertising(
+    bumble_module,
+    monkeypatch,
+):
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](ipad)
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+        device.listeners['connection'](iphone)
+        device.listeners['connection'](iphone)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad', 'iphone'}
+    assert bumble_module.active_gatt_connection_counts['iphone'] == 2
+    assert len(device.start_calls) == 1
 
 
 def test_gatt_advertising_restarts_after_all_clients_disconnect(

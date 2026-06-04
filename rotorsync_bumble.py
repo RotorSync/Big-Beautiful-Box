@@ -61,6 +61,7 @@ STATUS_POLL_INTERVAL = 2.0  # Poll dashboard for status every 2 seconds
 STATUS_HISTORY_POLL_INTERVAL = 10.0
 STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_POLL_INTERVAL))
 LIVE_TELEMETRY_POLL_INTERVAL = 0.25
+LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL = 0.75
 LIVE_TELEMETRY_FAST_READ_WINDOW = 2.0
 LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM = 0.05
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
@@ -159,6 +160,7 @@ last_calibration_reload_check = 0.0
 connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
 active_gatt_connections = set()
+active_gatt_connection_counts = {}
 live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 
@@ -220,6 +222,36 @@ def _encode_live_telemetry_payload(requested, actual, flow):
         separators=(',', ':'),
     )
 
+
+def _state_flow_gpm(state):
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        return float(state.get('flow_gpm', state.get('flow', 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _state_notify_should_suppress_live_fields(controller_count, state):
+    return (
+        controller_count > 1
+        and _state_flow_gpm(state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+    )
+
+
+def _state_notify_compare_json(state_json, suppress_live_fields=False):
+    if not suppress_live_fields:
+        return state_json
+    try:
+        payload = json.loads(state_json)
+    except Exception:
+        return state_json
+    if not isinstance(payload, dict):
+        return state_json
+    for key in ('act', 'flow', 'actual_gal', 'flow_gpm'):
+        payload.pop(key, None)
+    return json.dumps(payload, separators=(',', ':'), sort_keys=True)
+
 # Config command state
 config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
@@ -262,6 +294,24 @@ def _redact_dashboard_command(cmd):
     except Exception:
         pass
     return cmd
+
+
+def _bounded_int(value, minimum, maximum, default=0):
+    try:
+        value = int(value)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _enqueue_cursor_command(connection, source, action, **payload):
+    payload['action'] = action
+    _enqueue_control_actions(
+        connection,
+        source,
+        f"MOUSE:{json.dumps(payload, separators=(',', ':'))}",
+        refresh=False,
+    )
 
 
 def send_dashboard_command(cmd):
@@ -722,7 +772,13 @@ def install_gatt_advertising_resume_hook(
         return False
 
     def on_disconnection(peer):
-        active_gatt_connections.discard(peer)
+        current_count = active_gatt_connection_counts.get(peer, 0)
+        if current_count > 1:
+            active_gatt_connection_counts[peer] = current_count - 1
+        else:
+            active_gatt_connection_counts.pop(peer, None)
+            active_gatt_connections.discard(peer)
+
         print(
             f'GATT client disconnected from {peer}; '
             f'{len(active_gatt_connections)} controller(s) remain',
@@ -733,6 +789,17 @@ def install_gatt_advertising_resume_hook(
                 'GATT advertising left untouched; anchor controller remains',
                 flush=True,
             )
+            if len(active_gatt_connections) == 1:
+                task = asyncio.create_task(
+                    keep_gatt_connected_advertising_on(
+                        device,
+                        advertising_data,
+                        scan_response_data,
+                        ble_name,
+                        reason='controller disconnected; anchor remains',
+                    )
+                )
+                task.add_done_callback(_handle_background_task_done)
         else:
             task = asyncio.create_task(
                 restart_gatt_advertising_after_disconnect(
@@ -746,6 +813,8 @@ def install_gatt_advertising_resume_hook(
 
     def on_connection(connection):
         peer = _connection_key(connection)
+        previous_count = active_gatt_connection_counts.get(peer, 0)
+        active_gatt_connection_counts[peer] = previous_count + 1
         active_gatt_connections.add(peer)
         print(
             f'GATT client connected from {peer}; trying to keep advertising for '
@@ -760,6 +829,19 @@ def install_gatt_advertising_resume_hook(
                 'restart will rely on watchdog',
                 flush=True,
             )
+        if previous_count > 0:
+            print(
+                f'GATT duplicate connection event from {peer}; '
+                'advertising state left untouched',
+                flush=True,
+            )
+            return
+        if len(active_gatt_connections) > 1:
+            print(
+                'GATT multipoint connected; advertising state left untouched',
+                flush=True,
+            )
+            return
         task = asyncio.create_task(
             resume_gatt_advertising_after_connection(
                 device,
@@ -1999,6 +2081,32 @@ def command_write_handler(connection, value):
             'command:accept_pending_curve',
             'ACCEPT_PENDING_CURVE',
         )
+        return
+
+    if command in ('cursor_move', 'trackpad_move'):
+        dx = _bounded_int(cmd.get('dx'), -250, 250)
+        dy = _bounded_int(cmd.get('dy'), -250, 250)
+        if dx or dy:
+            _enqueue_cursor_command(connection, 'command:cursor_move', 'move', dx=dx, dy=dy)
+        return
+
+    if command in ('cursor_scroll', 'trackpad_scroll'):
+        steps = _bounded_int(cmd.get('steps'), -8, 8)
+        if steps:
+            _enqueue_cursor_command(connection, 'command:cursor_scroll', 'scroll', steps=steps)
+        return
+
+    if command in ('cursor_click', 'trackpad_click'):
+        button = _bounded_int(cmd.get('button'), 1, 3, default=1)
+        _enqueue_cursor_command(connection, 'command:cursor_click', 'click', button=button)
+        return
+
+    if command in ('cursor_key', 'trackpad_key'):
+        key = str(cmd.get('key', '')).strip().lower()
+        if key in ('esc', 'escape', 'enter', 'return', 'alt_f4'):
+            _enqueue_cursor_command(connection, 'command:cursor_key', 'key', key=key)
+        else:
+            print(f'Command write ignored: invalid cursor key {key!r}', flush=True)
         return
 
     if command == 'set_mode':
@@ -3535,17 +3643,30 @@ def jbd_cmd(func):
 async def poll_dashboard_status(device, state_char):
     """Periodically poll dashboard state and notify subscribers on change."""
     poll_count = 0
-    last_notified_state_json = dashboard_status.get('state_json', '{}')
+    initial_state_json = dashboard_status.get('state_json', '{}')
+    last_notified_state_compare_json = _state_notify_compare_json(
+        initial_state_json,
+        suppress_live_fields=False,
+    )
     while True:
         try:
             updated = query_dashboard_status()
             current_state_json = dashboard_status.get('state_json', '{}')
-            if updated and current_state_json != last_notified_state_json:
+            current_state = dashboard_status.get('state') or {}
+            suppress_live_fields = _state_notify_should_suppress_live_fields(
+                len(active_gatt_connections),
+                current_state,
+            )
+            current_state_compare_json = _state_notify_compare_json(
+                current_state_json,
+                suppress_live_fields=suppress_live_fields,
+            )
+            if updated and current_state_compare_json != last_notified_state_compare_json:
                 await device.notify_subscribers(
                     state_char,
                     bytes(current_state_json, 'utf-8'),
                 )
-                last_notified_state_json = current_state_json
+                last_notified_state_compare_json = current_state_compare_json
             # Poll history less often than live state; it only changes after fills.
             poll_count += 1
             if poll_count >= STATUS_HISTORY_POLL_CYCLES:
@@ -3556,11 +3677,19 @@ async def poll_dashboard_status(device, state_char):
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
 
+def _live_telemetry_notify_due(controller_count, now, last_notify_at):
+    if controller_count <= 1:
+        return True
+    return now - last_notify_at >= LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL
+
+
 async def poll_live_telemetry(device, live_char):
     """Poll only actual gallons and flow fast, then notify subscribers on change."""
     last_notified_live_json = dashboard_status.get('live_json', '{}')
+    last_live_notify_at = 0.0
     while True:
         try:
+            now = time.time()
             cached_state = dashboard_status.get('state') or {}
             cached_flow = 0.0
             if isinstance(cached_state, dict):
@@ -3569,7 +3698,7 @@ async def poll_live_telemetry(device, live_char):
                 except (TypeError, ValueError):
                     cached_flow = 0.0
             recent_client_read = (
-                time.time() - last_live_telemetry_client_read_at
+                now - last_live_telemetry_client_read_at
                 <= LIVE_TELEMETRY_FAST_READ_WINDOW
             )
             should_poll = (
@@ -3579,12 +3708,18 @@ async def poll_live_telemetry(device, live_char):
             if should_poll:
                 updated = query_live_telemetry()
                 current_live_json = dashboard_status.get('live_json', '{}')
-                if updated and current_live_json != last_notified_live_json:
+                notify_due = _live_telemetry_notify_due(
+                    len(active_gatt_connections),
+                    now,
+                    last_live_notify_at,
+                )
+                if updated and current_live_json != last_notified_live_json and notify_due:
                     await device.notify_subscribers(
                         live_char,
                         bytes(current_live_json, 'utf-8'),
                     )
                     last_notified_live_json = current_live_json
+                    last_live_notify_at = now
         except Exception as e:
             print(f'Live telemetry poll error: {e}', flush=True)
         await asyncio.sleep(LIVE_TELEMETRY_POLL_INTERVAL)
