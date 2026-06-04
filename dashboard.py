@@ -12,6 +12,9 @@ import os
 import json
 import csv
 import shlex
+import shutil
+import fcntl
+import atexit
 import builtins
 import math
 from collections import deque
@@ -346,6 +349,7 @@ pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
 pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
 pending_fill_temp_f = None  # Flow-meter temperature snapshot associated with the completed fill
+pending_fill_stop_to_thumb_start_at = 0.0  # Relay activation time for the completed fill
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
@@ -381,6 +385,7 @@ relay_slowdown_trigger_time = 0.0
 relay_slowdown_trigger_flow_gpm = 0.0
 pump_stop_relay_lock = threading.Lock()
 pump_stop_pulse_count = 0
+last_pump_stop_relay_activated_at = 0.0
 pump_stop_fault_hold_active = False
 pump_stop_fault_hold_reason = ""
 flow_meter_reconnect_fresh_reads = 0
@@ -400,6 +405,7 @@ last_daily_total_text = None  # Cache daily total footer text
 last_daily_total_mode = None  # Track mode used for daily total rendering
 last_flow_rate_text = None  # Cache flow rate footer text
 last_flow_rate_mode = None  # Track mode used for flow footer rendering
+last_visible_cursor_check = 0.0
 
 # Shared menu order.
 MENU_ITEMS = [
@@ -602,6 +608,21 @@ def _format_flow_meter_temp_field(temp_f):
     if temp_f is None:
         return ""
     return f" | Temp: {temp_f:.1f} F"
+
+
+def _format_stop_to_thumb_field(seconds):
+    if seconds is None:
+        return ""
+    return f" | StopToThumb: {seconds:.1f} s"
+
+
+def _history_named_field(parts, name):
+    prefix = f"{name}:"
+    for part in parts:
+        text = part.strip()
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return ""
 
 
 def log_flow_control(message):
@@ -1878,30 +1899,39 @@ def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global pending_fill_stop_to_thumb_start_at
     global thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
         fill_log = "/home/pi/fill_history.log"
         calibration_log = "/home/pi/fill_calibration.log"
+        recorded_at = time.time()
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recorded_at))
+        stop_to_thumb_seconds = (
+            max(0.0, recorded_at - pending_fill_stop_to_thumb_start_at)
+            if pending_fill_stop_to_thumb_start_at > 0 else None
+        )
 
         # Write to fill history log
         with open(fill_log, 'a') as f:
             f.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
+                f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
                 f" | Actual: {pending_fill_gallons:.3f} gal"
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
                 f" | {pending_fill_shutoff_type}"
-                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}\n"
+                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
+                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}\n"
             )
 
         # Write detailed calibration record with flow snapshot and threshold in one line
         with open(calibration_log, 'a') as f:
             f.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
+                f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
                 f" | Actual: {pending_fill_gallons:.3f} gal"
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
                 f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
+                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
                 f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
                 f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
                 f" | TriggerActual: {last_trigger_actual:.3f} gal"
@@ -1925,6 +1955,7 @@ def record_pending_fill():
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
         pending_fill_temp_f = None
+        pending_fill_stop_to_thumb_start_at = 0.0
 
     else:
         print("No pending fill to record")
@@ -1956,7 +1987,7 @@ def handle_thumbs_up_press(source):
 
 def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
-    global pump_stop_pulse_count
+    global pump_stop_pulse_count, last_pump_stop_relay_activated_at
 
     try:
         log_relay_event("")
@@ -1968,7 +1999,8 @@ def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
 
         with pump_stop_relay_lock:
             pump_stop_pulse_count += 1
-            _set_pump_stop_output(True, f"pulse start {duration}s")
+            if _set_pump_stop_output(True, f"pulse start {duration}s"):
+                last_pump_stop_relay_activated_at = time.time()
 
         msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
         print(msg)
@@ -4614,6 +4646,7 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
     global auto_shutoff_latched, last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
 
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
@@ -4628,6 +4661,7 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
         last_trigger_actual = 0.0
         last_trigger_predicted_actual = 0.0
         last_trigger_loop_dt_ms = 0.0
+        last_pump_stop_relay_activated_at = 0.0
         recent_flow_rates_l_per_s.clear()
         log_flow_control(
             f"cycle_start | actual={actual:.3f} | flow_lps={last_flow_rate:.4f}"
@@ -4988,6 +5022,364 @@ def _wifi_connect(ssid, password, hidden=False):
         return {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
 
 
+def _mouse_int(value, minimum, maximum, default=0):
+    try:
+        value = int(value)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _xdotool_env():
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not env.get("XAUTHORITY"):
+        runtime_dir = Path(env["XDG_RUNTIME_DIR"])
+        auth_files = sorted(runtime_dir.glob(".mutter-Xwaylandauth.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if auth_files:
+            env["XAUTHORITY"] = str(auth_files[0])
+        else:
+            env["XAUTHORITY"] = "/home/pi/.Xauthority"
+    return env
+
+
+def _run_xdotool(args):
+    xdotool = shutil.which("xdotool") or "/usr/bin/xdotool"
+    if not os.path.exists(xdotool):
+        return False, "xdotool not installed"
+    try:
+        result = subprocess.run(
+            [xdotool] + args,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            env=_xdotool_env(),
+        )
+        if result.returncode != 0:
+            return False, ((result.stderr or result.stdout or "xdotool failed").strip()[:160])
+        return True, (result.stdout or "ok").strip()
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def _run_ydotool(args):
+    ydotool = shutil.which("ydotool") or "/usr/bin/ydotool"
+    if not os.path.exists(ydotool):
+        return False, "ydotool not installed"
+    try:
+        result = subprocess.run(
+            [ydotool] + args,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if result.returncode != 0:
+            return False, ((result.stderr or result.stdout or "ydotool failed").strip()[:160])
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+class UInputMouse:
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_RELBIT = 0x40045566
+
+    EV_SYN = 0
+    EV_KEY = 1
+    EV_REL = 2
+    SYN_REPORT = 0
+    REL_X = 0
+    REL_Y = 1
+    REL_WHEEL = 8
+    BTN_LEFT = 0x110
+    BTN_RIGHT = 0x111
+    BTN_MIDDLE = 0x112
+    BUS_USB = 0x03
+
+    def __init__(self):
+        self.fd = None
+        self.lock = threading.Lock()
+        self.available = False
+        self.error = ""
+
+    def ensure(self):
+        if self.available:
+            return True, "ok"
+        with self.lock:
+            if self.available:
+                return True, "ok"
+            try:
+                self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+                for evbit in (self.EV_KEY, self.EV_REL):
+                    fcntl.ioctl(self.fd, self.UI_SET_EVBIT, evbit)
+                for keybit in (self.BTN_LEFT, self.BTN_RIGHT, self.BTN_MIDDLE):
+                    fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, keybit)
+                for relbit in (self.REL_X, self.REL_Y, self.REL_WHEEL):
+                    fcntl.ioctl(self.fd, self.UI_SET_RELBIT, relbit)
+
+                name = b"TrailerSync app cursor"
+                user_dev = struct.pack(
+                    "80sHHHHi" + ("i" * 256),
+                    name,
+                    self.BUS_USB,
+                    0x5253,
+                    0x5453,
+                    1,
+                    0,
+                    *([0] * 256),
+                )
+                os.write(self.fd, user_dev)
+                fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+                time.sleep(0.25)
+                self.available = True
+                self.error = ""
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def close(self):
+        if self.fd is None:
+            self.available = False
+            return
+        try:
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+        self.fd = None
+        self.available = False
+
+    def emit(self, event_type, code, value):
+        now = time.time()
+        sec = int(now)
+        usec = int((now - sec) * 1_000_000)
+        os.write(self.fd, struct.pack("llHHi", sec, usec, event_type, code, int(value)))
+
+    def sync(self):
+        self.emit(self.EV_SYN, self.SYN_REPORT, 0)
+
+    def move(self, dx, dy):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        with self.lock:
+            try:
+                if dx:
+                    self.emit(self.EV_REL, self.REL_X, dx)
+                if dy:
+                    self.emit(self.EV_REL, self.REL_Y, dy)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def click(self, button):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        button_code = {
+            1: self.BTN_LEFT,
+            2: self.BTN_MIDDLE,
+            3: self.BTN_RIGHT,
+        }.get(button, self.BTN_LEFT)
+        with self.lock:
+            try:
+                self.emit(self.EV_KEY, button_code, 1)
+                self.sync()
+                self.emit(self.EV_KEY, button_code, 0)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def scroll(self, steps):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        with self.lock:
+            try:
+                self.emit(self.EV_REL, self.REL_WHEEL, steps)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+
+virtual_mouse = UInputMouse()
+atexit.register(virtual_mouse.close)
+
+
+def _screen_geometry():
+    ok, message = _run_xdotool(["getdisplaygeometry"])
+    if not ok:
+        return 1920, 1080
+    parts = str(message).replace("\n", " ").split()
+    try:
+        return max(1, int(parts[0])), max(1, int(parts[1]))
+    except Exception:
+        return 1920, 1080
+
+
+def _pointer_location():
+    ok, message = _run_xdotool(["getmouselocation"])
+    if not ok:
+        return 0, 0
+    x = 0
+    y = 0
+    for part in str(message).split():
+        if part.startswith("x:"):
+            try:
+                x = int(part.split(":", 1)[1])
+            except Exception:
+                pass
+        elif part.startswith("y:"):
+            try:
+                y = int(part.split(":", 1)[1])
+            except Exception:
+                pass
+    return x, y
+
+
+def _move_pointer_relative(dx, dy):
+    ok, message = virtual_mouse.move(dx, dy)
+    if ok:
+        return ok, message
+    ok, message = _run_xdotool(["mousemove_relative", "--", str(dx), str(dy)])
+    if ok:
+        return ok, message
+    x, y = _pointer_location()
+    width, height = _screen_geometry()
+    target_x = max(0, min(width - 1, x + dx))
+    target_y = max(0, min(height - 1, y + dy))
+    return _run_ydotool(["mousemove", "--delay", "0", str(target_x), str(target_y)])
+
+
+def _ensure_visible_cursor():
+    global last_visible_cursor_check
+    now = time.time()
+    if now - last_visible_cursor_check < 30:
+        return
+    last_visible_cursor_check = now
+
+    env = os.environ.copy()
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    try:
+        current_size = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "cursor-size"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=env,
+        )
+        if (current_size.stdout or "").strip() in ("0", ""):
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", "32"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                env=env,
+            )
+        current_theme = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "cursor-theme"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=env,
+        )
+        if (current_theme.stdout or "").strip() in ("''", ""):
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", "Yaru"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                env=env,
+            )
+    except Exception:
+        pass
+
+
+def handle_mouse_command(payload):
+    try:
+        req = json.loads(payload)
+        if not isinstance(req, dict):
+            return False, "payload must be object"
+    except Exception as e:
+        return False, f"invalid json: {e}"
+
+    action = str(req.get("action", "")).strip().lower()
+    _ensure_visible_cursor()
+
+    if action == "move":
+        dx = _mouse_int(req.get("dx"), -250, 250)
+        dy = _mouse_int(req.get("dy"), -250, 250)
+        if not dx and not dy:
+            return True, "noop"
+        return _move_pointer_relative(dx, dy)
+
+    if action == "click":
+        button = _mouse_int(req.get("button"), 1, 3, default=1)
+        ok, message = virtual_mouse.click(button)
+        if ok:
+            return ok, message
+        ok, message = _run_xdotool(["click", str(button)])
+        if ok:
+            return ok, message
+        ydotool_button = 2 if button == 3 else (3 if button == 2 else button)
+        return _run_ydotool(["click", "--delay", "0", str(ydotool_button)])
+
+    if action == "scroll":
+        steps = _mouse_int(req.get("steps"), -8, 8)
+        if not steps:
+            return True, "noop"
+        ok, message = virtual_mouse.scroll(steps)
+        if ok:
+            return ok, message
+        button = "4" if steps > 0 else "5"
+        ok = True
+        message = "ok"
+        for _ in range(abs(steps)):
+            ok, message = _run_xdotool(["click", button])
+            if not ok:
+                ok, message = _run_ydotool(["click", "--delay", "0", button])
+            if not ok:
+                break
+        return ok, message
+
+    if action == "key":
+        key = str(req.get("key", "")).strip().lower()
+        key_map = {
+            "esc": "Escape",
+            "escape": "Escape",
+            "enter": "Return",
+            "return": "Return",
+            "alt_f4": "alt+F4",
+        }
+        mapped = key_map.get(key)
+        if not mapped:
+            return False, f"unsupported key: {key}"
+        ok, message = _run_ydotool(["key", "--delay", "0", mapped])
+        if ok:
+            return ok, message
+        return _run_xdotool(["key", mapped])
+
+    return False, f"unsupported action: {action}"
+
+
 def socket_command_listener():
     """Listen for commands from rotorsync BLE server via localhost socket"""
     global requested_gallons, override_mode, override_enabled_time, colors_are_green
@@ -5130,6 +5522,15 @@ def socket_command_listener():
                                 client.send(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
                                 continue
 
+                            elif line.startswith("MOUSE:"):
+                                payload = line[6:]
+                                ok, mouse_message = handle_mouse_command(payload)
+                                if ok:
+                                    client.send(b"MOUSE_OK\n")
+                                else:
+                                    client.send(f"MOUSE_ERR:{mouse_message}\n".encode())
+                                continue
+
                             elif line.startswith("BATCHMIX_ERROR:"):
                                 # Handle BatchMix validation error
                                 error_msg = line[15:]
@@ -5226,21 +5627,33 @@ def socket_command_listener():
                                             parts = entry.strip().split("|")
                                             if len(parts) >= 3:
                                                 ts = parts[0].strip()
-                                                req = float(parts[1].replace("Requested:", "").replace("gal", "").strip())
-                                                act = float(parts[2].replace("Actual:", "").replace("gal", "").strip())
-                                                shutoff_type = parts[4].strip() if len(parts) >= 5 else ""
+                                                req = float(_history_named_field(parts, "Requested").replace("gal", "").strip())
+                                                act = float(_history_named_field(parts, "Actual").replace("gal", "").strip())
+                                                shutoff_type = ""
+                                                for part in parts[3:]:
+                                                    text = part.strip()
+                                                    if text.lower().startswith(("auto", "manual")):
+                                                        shutoff_type = text
+                                                        break
                                                 temp_token = ""
-                                                if len(parts) >= 6:
-                                                    temp_text = parts[5].replace("Temp:", "").replace("F", "").strip()
-                                                    if temp_text:
-                                                        temp_token = _base36_encode(round(float(temp_text) * 10.0))
+                                                temp_text = _history_named_field(parts, "Temp").replace("F", "").strip()
+                                                if temp_text:
+                                                    temp_token = _base36_encode(round(float(temp_text) * 10.0))
+                                                stop_to_thumb_token = ""
+                                                stop_to_thumb_text = (
+                                                    _history_named_field(parts, "StopToThumb")
+                                                    .replace("s", "")
+                                                    .strip()
+                                                )
+                                                if stop_to_thumb_text:
+                                                    stop_to_thumb_token = _base36_encode(round(float(stop_to_thumb_text) * 10.0))
                                                 timestamp = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
                                                 minute_token = _base36_encode(int(timestamp // 60))
                                                 req_token = _base36_encode(round(req * 1000.0))
                                                 act_token = _base36_encode(round(act * 1000.0))
                                                 shutoff_token = "a" if shutoff_type.lower().startswith("auto") else "m"
                                                 history_items.append(
-                                                    f"{minute_token},{req_token},{act_token},{shutoff_token},{temp_token}"
+                                                    f"{minute_token},{req_token},{act_token},{shutoff_token},{temp_token},{stop_to_thumb_token}"
                                                 )
                                         history_response = "H2:" + ";".join(history_items)
                                         client.send(f"HIST:{history_response}\n".encode())
@@ -5894,6 +6307,7 @@ def clear_auto_shutoff_state(reason=""):
     global last_alert_triggered, auto_shutoff_latched
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
 
     last_alert_triggered = False
     auto_shutoff_latched = False
@@ -5902,6 +6316,7 @@ def clear_auto_shutoff_state(reason=""):
     last_trigger_actual = 0.0
     last_trigger_predicted_actual = 0.0
     last_trigger_loop_dt_ms = 0.0
+    last_pump_stop_relay_activated_at = 0.0
     recent_flow_rates_l_per_s.clear()
     if reason:
         print(f"Auto-shutoff state cleared: {reason}")
@@ -6536,9 +6951,11 @@ def update_dashboard():
     global new_fill_flow_started_at, new_fill_last_fresh_at, new_fill_cycle_cleared
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global pending_fill_stop_to_thumb_start_at
     global last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
     global flow_cycle_counter, calibration_state, last_status_text, last_daily_total_text, last_daily_total_mode
 
     control_active = flow_control_active()
@@ -6635,9 +7052,11 @@ def update_dashboard():
             pending_fill_flow_gpm = 0.0
             pending_fill_trigger_threshold = 0.0
             pending_fill_temp_f = None
+            pending_fill_stop_to_thumb_start_at = 0.0
             last_trigger_flow_gpm = 0.0
             last_trigger_threshold = 0.0
             last_trigger_actual = 0.0
+            last_pump_stop_relay_activated_at = 0.0
             recent_flow_rates_l_per_s.clear()
             _refresh_calibration_window()
         else:
@@ -6657,6 +7076,7 @@ def update_dashboard():
             pending_fill_requested = requested_gallons
             pending_fill_shutoff_type = shutoff_type
             pending_fill_temp_f = last_flow_meter_temp_f
+            pending_fill_stop_to_thumb_start_at = last_pump_stop_relay_activated_at
 
             print(
                 f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
@@ -6684,6 +7104,7 @@ def update_dashboard():
             last_trigger_actual = 0.0
             last_trigger_predicted_actual = 0.0
             last_trigger_loop_dt_ms = 0.0
+            last_pump_stop_relay_activated_at = 0.0
             recent_flow_rates_l_per_s.clear()
         print("New fill cycle started - colors reset to red, auto-shutoff state cleared")
 
@@ -6704,6 +7125,7 @@ def update_dashboard():
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
         pending_fill_temp_f = None
+        pending_fill_stop_to_thumb_start_at = 0.0
         new_fill_cycle_cleared = True
         print("Sustained high-flow fill cycle detected - thumbs up hidden, pending fill cleared")
 
