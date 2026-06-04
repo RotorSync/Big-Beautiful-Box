@@ -24,6 +24,7 @@ import subprocess
 import socket
 import tarfile
 import time
+import zlib
 
 logging.basicConfig(level=logging.INFO)
 
@@ -87,6 +88,7 @@ HCI_SOCKET_OPEN_RETRY_DELAY_SECONDS = 2.0
 CONFIG_RESPONSE_DIRECT_MAX_BYTES = 512
 CONFIG_RESPONSE_CHUNK_SIZE = 360
 CONFIG_RESPONSE_CHUNK_NOTIFY_DELAY_SECONDS = 0.005
+CONFIG_RESPONSE_COMPRESSION = 'zlib'
 GATT_ADVERTISING_RESUME_FAILURE_BACKOFF_SECONDS = 20
 
 # UUIDs
@@ -2062,11 +2064,48 @@ def _next_config_response_read_value(connection):
     return frame
 
 
-def _set_config_response_obj(obj):
+def _config_response_compression(cmd):
+    compression = str(cmd.get('compression', '')).strip().lower()
+    if compression in (CONFIG_RESPONSE_COMPRESSION, 'zlib+base64'):
+        return CONFIG_RESPONSE_COMPRESSION
+    return None
+
+
+def _compressed_config_response_envelope(payload_text):
+    payload_bytes = payload_text.encode('utf-8')
+    compressor = zlib.compressobj(level=6, wbits=-zlib.MAX_WBITS)
+    compressed = compressor.compress(payload_bytes) + compressor.flush()
+    envelope = {
+        'ok': True,
+        'encoding': 'deflate+base64',
+        'data': base64.b64encode(compressed).decode('ascii'),
+        'raw_bytes': len(payload_bytes),
+        'compressed_bytes': len(compressed),
+    }
+    try:
+        payload_obj = json.loads(payload_text)
+        for key in ('op', 'request_id', 'page', 'total_pages', 'total_items'):
+            if key in payload_obj:
+                envelope[key] = payload_obj[key]
+    except Exception:
+        pass
+    return json.dumps(envelope, separators=(',', ':'))
+
+
+def _set_config_response_text(payload_text, *, compression=None):
     global config_response
+    response_text = (
+        _compressed_config_response_envelope(payload_text)
+        if compression == CONFIG_RESPONSE_COMPRESSION
+        else payload_text
+    )
+    config_response = response_text
+    _notify_config_response(response_text)
+
+
+def _set_config_response_obj(obj, *, compression=None):
     payload_text = json.dumps(obj, separators=(',', ':'))
-    config_response = payload_text
-    _notify_config_response(payload_text)
+    _set_config_response_text(payload_text, compression=compression)
 
 
 def _schedule_identity_restart(reason, delay=1.0):
@@ -2081,7 +2120,7 @@ def _schedule_identity_restart(reason, delay=1.0):
         pass
 
 
-def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450, max_pages=None):
+def _set_paginated_config_response(items, *, request_id=None, op=None, page_size_bytes=450, max_pages=None, compression=None):
     global config_response_pages, config_response_pages_by_request
     pages = paginate_response(items, page_size_bytes=page_size_bytes)
     if max_pages is not None and max_pages > 0 and len(pages) > max_pages:
@@ -2107,7 +2146,7 @@ def _set_paginated_config_response(items, *, request_id=None, op=None, page_size
             for stale_request_id in list(config_response_pages_by_request.keys())[:-24]:
                 config_response_pages_by_request.pop(stale_request_id, None)
     if enriched_pages:
-        _set_config_response_obj(json.loads(enriched_pages[0]))
+        _set_config_response_text(enriched_pages[0], compression=compression)
     else:
         _set_config_response_obj({
             'ok': True,
@@ -2117,7 +2156,7 @@ def _set_paginated_config_response(items, *, request_id=None, op=None, page_size
             'total_pages': 1,
             'total_items': 0,
             'items': [],
-        })
+        }, compression=compression)
 
 def pump_write_handler(connection, value):
     """Handle pump control writes. Write '1' or 'PS' to stop pump."""
@@ -3461,15 +3500,6 @@ def _cmd_page(cmd, *, request_id=None):
     cursor_request_id = cmd.get('cursor_request_id')
     pages = config_response_pages_by_request.get(cursor_request_id) if cursor_request_id else config_response_pages
 
-    if len(active_gatt_connections) > 1 and page > 1:
-        _set_config_response_obj({
-            'ok': False,
-            'op': 'PAGE',
-            'request_id': request_id,
-            'error': 'Older history paused while multiple controllers connected',
-        })
-        return
-
     if not pages:
         _set_config_response_obj({'ok': False, 'op': 'PAGE', 'request_id': request_id, 'error': 'No paginated data available'})
         return
@@ -3483,7 +3513,7 @@ def _cmd_page(cmd, *, request_id=None):
         page_obj['cursor_request_id'] = cursor_request_id
     if request_id is not None:
         page_obj['request_id'] = request_id
-    _set_config_response_obj(page_obj)
+    _set_config_response_obj(page_obj, compression=_config_response_compression(cmd))
 
 
 def process_config_command_for_connection(data_str, connection_key):
@@ -3971,15 +4001,12 @@ def _load_mopeka_history_items(cmd):
 def _cmd_get_mopeka_history(cmd, *, request_id=None):
     maybe_prune_history_files()
     items = _load_mopeka_history_items(cmd)
-    max_pages = 1 if len(active_gatt_connections) > 1 else None
-    if max_pages:
-        print('GET_MOPEKA_HISTORY limited to newest page while multiple controllers are connected', flush=True)
     _set_paginated_config_response(
         items,
         request_id=request_id,
         op='GET_MOPEKA_HISTORY',
         page_size_bytes=8192,
-        max_pages=max_pages,
+        compression=_config_response_compression(cmd),
     )
 
 
