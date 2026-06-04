@@ -65,8 +65,12 @@ LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL = 0.75
 LIVE_TELEMETRY_FAST_READ_WINDOW = 2.0
 LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM = 0.05
 MOPEKA_HISTORY_LOG_PATH = '/home/pi/mopeka_history.csv'
+FILL_HISTORY_LOG_PATH = '/home/pi/fill_history.log'
 MOPEKA_HISTORY_BASELINE_INTERVAL = 300.0
 MOPEKA_HISTORY_CHANGE_THRESHOLD_GAL = 2.0
+HISTORY_RETENTION_SECONDS = 366 * 24 * 3600
+HISTORY_MAX_FILE_BYTES = 8 * 1024 * 1024
+HISTORY_PRUNE_INTERVAL = 3600.0
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
@@ -168,6 +172,7 @@ live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 last_mopeka_history_log_at = 0.0
 last_mopeka_history_snapshot = None
+last_history_prune_at = 0.0
 
 
 def _encode_ble_state_payload(state):
@@ -2895,6 +2900,8 @@ def process_config_command(cmd_str):
             _cmd_delete_calibration(cmd, request_id=request_id)
         elif op == 'GET_MOPEKA_HISTORY':
             _cmd_get_mopeka_history(cmd, request_id=request_id)
+        elif op == 'GET_FILL_HISTORY':
+            _cmd_get_fill_history(cmd, request_id=request_id)
         elif op == 'PAGE':
             _cmd_page(cmd, request_id=request_id)
         else:
@@ -3631,30 +3638,171 @@ def _history_timestamp_epoch(value):
         return None
 
 
-def _clamped_history_hours(cmd):
+def _clamped_history_window(cmd, *, default_hours=12.0):
+    now = time.time()
+    min_since = now - HISTORY_RETENTION_SECONDS
     try:
-        hours = float(cmd.get('hours', 12))
+        until = float(cmd.get('until', now))
     except (TypeError, ValueError):
-        hours = 12.0
-    return max(1.0, min(72.0, hours))
+        until = now
+    until = max(min(until, now + 60.0), min_since)
+
+    if 'since' in cmd:
+        try:
+            since = float(cmd.get('since'))
+        except (TypeError, ValueError):
+            since = until - (default_hours * 3600.0)
+    else:
+        try:
+            hours = float(cmd.get('hours', default_hours))
+        except (TypeError, ValueError):
+            hours = default_hours
+        hours = max(1.0, min(float(HISTORY_RETENTION_SECONDS) / 3600.0, hours))
+        since = until - (hours * 3600.0)
+
+    since = max(min(since, until), min_since)
+    return since, until
 
 
-def _load_mopeka_history_items(hours):
+def _history_named_field(parts, name):
+    prefix = f'{name}:'
+    for part in parts:
+        text = part.strip()
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return ''
+
+
+def _parse_float_token(value):
+    try:
+        cleaned = (
+            str(value)
+            .replace('gal', '')
+            .replace('GPM', '')
+            .replace('F', '')
+            .replace('s', '')
+            .strip()
+        )
+        if not cleaned:
+            return None
+        return round(float(cleaned), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_history_item_from_line(line):
+    parts = line.strip().split('|')
+    if len(parts) < 3:
+        return None
+
+    timestamp = _history_timestamp_epoch(parts[0].strip())
+    if timestamp is None:
+        return None
+
+    requested = _parse_float_token(_history_named_field(parts, 'Requested'))
+    actual = _parse_float_token(_history_named_field(parts, 'Actual'))
+    if requested is None or actual is None:
+        return None
+
+    shutoff_type = ''
+    for part in parts[3:]:
+        text = part.strip()
+        if text.lower().startswith(('auto', 'manual')):
+            shutoff_type = text
+            break
+
+    return {
+        't': timestamp,
+        'rq': requested,
+        'ag': actual,
+        'df': round(actual - requested, 3),
+        'st': shutoff_type,
+        'tf': _parse_float_token(_history_named_field(parts, 'Temp')),
+        's2t': _parse_float_token(_history_named_field(parts, 'StopToThumb')),
+    }
+
+
+def _prune_fill_history_file(now):
+    if not os.path.exists(FILL_HISTORY_LOG_PATH):
+        return
+
+    try:
+        if os.path.getsize(FILL_HISTORY_LOG_PATH) <= HISTORY_MAX_FILE_BYTES:
+            return
+
+        cutoff = now - HISTORY_RETENTION_SECONDS
+        with open(FILL_HISTORY_LOG_PATH) as f:
+            lines = f.readlines()
+        kept = []
+        for line in lines:
+            item = _fill_history_item_from_line(line)
+            if item and item['t'] >= cutoff:
+                kept.append(line)
+        if not kept and lines:
+            kept = lines[-2000:]
+        with open(FILL_HISTORY_LOG_PATH, 'w') as f:
+            f.writelines(kept)
+    except Exception as e:
+        print(f'Fill history prune error: {e}', flush=True)
+
+
+def _prune_mopeka_history_file(now):
+    if not os.path.exists(MOPEKA_HISTORY_LOG_PATH):
+        return
+
+    try:
+        if os.path.getsize(MOPEKA_HISTORY_LOG_PATH) <= HISTORY_MAX_FILE_BYTES:
+            return
+
+        cutoff = now - HISTORY_RETENTION_SECONDS
+        with open(MOPEKA_HISTORY_LOG_PATH, newline='') as f:
+            rows = list(csv.DictReader(f))
+            fieldnames = f.fieldnames or []
+        kept = []
+        for row in rows:
+            timestamp = _history_timestamp_epoch(row.get('timestamp'))
+            if timestamp is not None and timestamp >= cutoff:
+                kept.append(row)
+        if not kept and rows:
+            kept = rows[-2000:]
+        with open(MOPEKA_HISTORY_LOG_PATH, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kept)
+    except Exception as e:
+        print(f'Mopeka history prune error: {e}', flush=True)
+
+
+def maybe_prune_history_files():
+    global last_history_prune_at
+    now = time.time()
+    if now - last_history_prune_at < HISTORY_PRUNE_INTERVAL:
+        return
+    last_history_prune_at = now
+    _prune_fill_history_file(now)
+    _prune_mopeka_history_file(now)
+
+
+def _load_mopeka_history_items(cmd):
     if not os.path.exists(MOPEKA_HISTORY_LOG_PATH):
         return []
 
-    cutoff = time.time() - (hours * 3600.0)
+    since, until = _clamped_history_window(cmd)
     items = []
     with open(MOPEKA_HISTORY_LOG_PATH, newline='') as f:
         for row in csv.DictReader(f):
             timestamp = _history_timestamp_epoch(row.get('timestamp'))
-            if timestamp is None or timestamp < cutoff:
+            if timestamp is None or timestamp < since or timestamp > until:
                 continue
             items.append({
                 't': timestamp,
                 'r': row.get('reason') or '',
                 'fg': _history_float(row.get('front_gal')),
                 'bg': _history_float(row.get('back_gal')),
+                'fmm': _history_float(row.get('front_mm')),
+                'bmm': _history_float(row.get('back_mm')),
+                'fin': _history_float(row.get('front_in')),
+                'bin': _history_float(row.get('back_in')),
                 'fq': _history_int(row.get('front_quality')),
                 'bq': _history_int(row.get('back_quality')),
             })
@@ -3662,12 +3810,40 @@ def _load_mopeka_history_items(hours):
 
 
 def _cmd_get_mopeka_history(cmd, *, request_id=None):
-    hours = _clamped_history_hours(cmd)
-    items = _load_mopeka_history_items(hours)
+    maybe_prune_history_files()
+    items = _load_mopeka_history_items(cmd)
     _set_paginated_config_response(
         items,
         request_id=request_id,
         op='GET_MOPEKA_HISTORY',
+        page_size_bytes=450,
+    )
+
+
+def _load_fill_history_items(cmd):
+    if not os.path.exists(FILL_HISTORY_LOG_PATH):
+        return []
+
+    since, until = _clamped_history_window(cmd)
+    items = []
+    with open(FILL_HISTORY_LOG_PATH) as f:
+        for line in f:
+            item = _fill_history_item_from_line(line)
+            if not item:
+                continue
+            if item['t'] < since or item['t'] > until:
+                continue
+            items.append(item)
+    return sorted(items, key=lambda item: item['t'])
+
+
+def _cmd_get_fill_history(cmd, *, request_id=None):
+    maybe_prune_history_files()
+    items = _load_fill_history_items(cmd)
+    _set_paginated_config_response(
+        items,
+        request_id=request_id,
+        op='GET_FILL_HISTORY',
         page_size_bytes=450,
     )
 

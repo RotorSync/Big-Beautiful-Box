@@ -2485,6 +2485,7 @@ def _build_dashboard_state_snapshot():
         "switch_box_connected": bool(switch_box_connected),
         "bms_soc": None if bms_soc is None else int(round(bms_soc)),
         "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
+        "daily_total_gal": round(daily_total, 3),
         "front_tank_gal": round(mopeka1_gallons, 1),
         "back_tank_gal": round(mopeka2_gallons, 1),
         "front_tank_quality": int(mopeka1_quality),
