@@ -64,6 +64,9 @@ LIVE_TELEMETRY_POLL_INTERVAL = 0.25
 LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL = 0.75
 LIVE_TELEMETRY_FAST_READ_WINDOW = 2.0
 LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM = 0.05
+MOPEKA_HISTORY_LOG_PATH = '/home/pi/mopeka_history.csv'
+MOPEKA_HISTORY_BASELINE_INTERVAL = 300.0
+MOPEKA_HISTORY_CHANGE_THRESHOLD_GAL = 2.0
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
@@ -163,6 +166,8 @@ active_gatt_connections = set()
 active_gatt_connection_counts = {}
 live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
+last_mopeka_history_log_at = 0.0
+last_mopeka_history_snapshot = None
 
 
 def _encode_ble_state_payload(state):
@@ -2888,6 +2893,8 @@ def process_config_command(cmd_str):
             _cmd_update_calibration(cmd, request_id=request_id)
         elif op == 'DELETE_CALIBRATION':
             _cmd_delete_calibration(cmd, request_id=request_id)
+        elif op == 'GET_MOPEKA_HISTORY':
+            _cmd_get_mopeka_history(cmd, request_id=request_id)
         elif op == 'PAGE':
             _cmd_page(cmd, request_id=request_id)
         else:
@@ -3505,6 +3512,166 @@ def decode_mopeka(data):
     level_mm = tank_raw * (0.153096 + 0.000327 * temp_raw - 0.000000294 * temp_raw * temp_raw)
     return {'level_mm': round(level_mm, 1), 'quality': quality}
 
+
+def _float_or_empty(value, digits=3):
+    try:
+        return f'{float(value):.{digits}f}'
+    except (TypeError, ValueError):
+        return ''
+
+
+def _int_or_empty(value):
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return ''
+
+
+def _mopeka_history_snapshot(current_time, m1, m2):
+    return {
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time)),
+        'front_gal': m1.get('gallons'),
+        'back_gal': m2.get('gallons'),
+        'front_mm': m1.get('level_mm'),
+        'back_mm': m2.get('level_mm'),
+        'front_in': m1.get('level_in'),
+        'back_in': m2.get('level_in'),
+        'front_quality': m1.get('quality'),
+        'back_quality': m2.get('quality'),
+    }
+
+
+def _mopeka_history_change_reason(snapshot, previous_snapshot):
+    if not previous_snapshot:
+        return 'start'
+    for key in ('front_gal', 'back_gal'):
+        try:
+            if abs(float(snapshot[key]) - float(previous_snapshot[key])) >= MOPEKA_HISTORY_CHANGE_THRESHOLD_GAL:
+                return 'change'
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ''
+
+
+def _append_mopeka_history_row(snapshot, reason):
+    fieldnames = [
+        'timestamp',
+        'reason',
+        'front_gal',
+        'back_gal',
+        'front_mm',
+        'back_mm',
+        'front_in',
+        'back_in',
+        'front_quality',
+        'back_quality',
+    ]
+    row = {
+        'timestamp': snapshot['timestamp'],
+        'reason': reason,
+        'front_gal': _float_or_empty(snapshot.get('front_gal'), 3),
+        'back_gal': _float_or_empty(snapshot.get('back_gal'), 3),
+        'front_mm': _float_or_empty(snapshot.get('front_mm'), 1),
+        'back_mm': _float_or_empty(snapshot.get('back_mm'), 1),
+        'front_in': _float_or_empty(snapshot.get('front_in'), 2),
+        'back_in': _float_or_empty(snapshot.get('back_in'), 2),
+        'front_quality': _int_or_empty(snapshot.get('front_quality')),
+        'back_quality': _int_or_empty(snapshot.get('back_quality')),
+    }
+    needs_header = not os.path.exists(MOPEKA_HISTORY_LOG_PATH) or os.path.getsize(MOPEKA_HISTORY_LOG_PATH) == 0
+    with open(MOPEKA_HISTORY_LOG_PATH, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def maybe_log_mopeka_history(current_time, m1, m2):
+    global last_mopeka_history_log_at, last_mopeka_history_snapshot
+
+    snapshot = _mopeka_history_snapshot(current_time, m1, m2)
+    reason = _mopeka_history_change_reason(snapshot, last_mopeka_history_snapshot)
+    if not reason and current_time - last_mopeka_history_log_at >= MOPEKA_HISTORY_BASELINE_INTERVAL:
+        reason = 'periodic'
+    if not reason:
+        return False
+
+    try:
+        _append_mopeka_history_row(snapshot, reason)
+        last_mopeka_history_log_at = current_time
+        last_mopeka_history_snapshot = snapshot
+        return True
+    except Exception as e:
+        print(f'Mopeka history log error: {e}', flush=True)
+        return False
+
+
+def _history_float(value):
+    try:
+        if value in (None, ''):
+            return None
+        return round(float(value), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_int(value):
+    try:
+        if value in (None, ''):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_timestamp_epoch(value):
+    try:
+        return int(time.mktime(time.strptime(value, '%Y-%m-%d %H:%M:%S')))
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamped_history_hours(cmd):
+    try:
+        hours = float(cmd.get('hours', 12))
+    except (TypeError, ValueError):
+        hours = 12.0
+    return max(1.0, min(72.0, hours))
+
+
+def _load_mopeka_history_items(hours):
+    if not os.path.exists(MOPEKA_HISTORY_LOG_PATH):
+        return []
+
+    cutoff = time.time() - (hours * 3600.0)
+    items = []
+    with open(MOPEKA_HISTORY_LOG_PATH, newline='') as f:
+        for row in csv.DictReader(f):
+            timestamp = _history_timestamp_epoch(row.get('timestamp'))
+            if timestamp is None or timestamp < cutoff:
+                continue
+            items.append({
+                't': timestamp,
+                'r': row.get('reason') or '',
+                'fg': _history_float(row.get('front_gal')),
+                'bg': _history_float(row.get('back_gal')),
+                'fq': _history_int(row.get('front_quality')),
+                'bq': _history_int(row.get('back_quality')),
+            })
+    return sorted(items, key=lambda item: item['t'])
+
+
+def _cmd_get_mopeka_history(cmd, *, request_id=None):
+    hours = _clamped_history_hours(cmd)
+    items = _load_mopeka_history_items(hours)
+    _set_paginated_config_response(
+        items,
+        request_id=request_id,
+        op='GET_MOPEKA_HISTORY',
+        page_size_bytes=450,
+    )
+
+
 async def scan_mopeka(sensor_device, current_time):
     mopeka_found = False
 
@@ -3776,6 +3943,7 @@ async def read_sensors(sensor_device, sensor_adapter):
                     m2_mm = m2.get("level_mm", 0)
                     m1_in = m1.get("level_in", 0)
                     m2_in = m2.get("level_in", 0)
+                    maybe_log_mopeka_history(current_time, m1, m2)
                     send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
                     send_dashboard_command(f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
                 else:
