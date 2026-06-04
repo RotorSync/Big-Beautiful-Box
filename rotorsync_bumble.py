@@ -3677,7 +3677,9 @@ async def poll_dashboard_status(device, state_char):
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
 
-def _live_telemetry_notify_due(controller_count, now, last_notify_at):
+def _live_telemetry_notify_due(controller_count, now, last_notify_at, flow_active=False):
+    if flow_active:
+        return True
     if controller_count <= 1:
         return True
     return now - last_notify_at >= LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL
@@ -3708,10 +3710,13 @@ async def poll_live_telemetry(device, live_char):
             if should_poll:
                 updated = query_live_telemetry()
                 current_live_json = dashboard_status.get('live_json', '{}')
+                current_state = dashboard_status.get('state') or {}
+                flow_active = _state_flow_gpm(current_state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
                 notify_due = _live_telemetry_notify_due(
                     len(active_gatt_connections),
                     now,
                     last_live_notify_at,
+                    flow_active=flow_active,
                 )
                 if updated and current_live_json != last_notified_live_json and notify_due:
                     await device.notify_subscribers(

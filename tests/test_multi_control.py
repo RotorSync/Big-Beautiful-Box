@@ -463,11 +463,22 @@ def test_live_telemetry_multipoint_notify_is_throttled(bumble_module):
         controller_count=2,
         now=100.0,
         last_notify_at=99.5,
+        flow_active=False,
     )
     assert bumble_module._live_telemetry_notify_due(
         controller_count=2,
         now=100.0,
         last_notify_at=99.25,
+        flow_active=False,
+    )
+
+
+def test_live_telemetry_active_flow_notify_is_immediate_for_multipoint(bumble_module):
+    assert bumble_module._live_telemetry_notify_due(
+        controller_count=2,
+        now=100.0,
+        last_notify_at=99.99,
+        flow_active=True,
     )
 
 
