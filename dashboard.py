@@ -5082,6 +5082,20 @@ def socket_command_listener():
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
 
+                            elif line == "REBOOT":
+                                msg = "Socket: Reboot command received"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                root.after(0, reboot_system)
+
+                            elif line == "SHUTDOWN":
+                                msg = "Socket: Shutdown command received"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                root.after(0, shutdown_system)
+
                             elif line.startswith("WIFI_SET:"):
                                 try:
                                     payload = line[9:]
@@ -5244,32 +5258,121 @@ def socket_command_listener():
                                 continue
 
                             elif line in ['+1', '-1', '+10', '-10']:
-                                try:
-                                    adjustment = int(line)
-                                    if adjust_batch_mix_gallons(adjustment, "Socket"):
-                                        continue
-                                    requested_gallons += adjustment
-                                    if requested_gallons < 0:
-                                        requested_gallons = 0
-                                    colors_are_green = False
-                                    if current_mode == 'fill':
-                                        fill_requested_gallons = requested_gallons
+                                if menu_mode:
+                                    if line == '+1':
+                                        msg = "Socket: Menu navigate down"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        menu_navigate_down()
+                                    elif line == '-1':
+                                        msg = "Socket: Menu navigate up"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        menu_navigate_up()
                                     else:
-                                        mix_requested_gallons = requested_gallons
-                                    save_mode_presets()
-                                    msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
+                                else:
+                                    try:
+                                        adjustment = int(line)
+                                        if adjust_batch_mix_gallons(adjustment, "Socket"):
+                                            continue
+                                        requested_gallons += adjustment
+                                        if requested_gallons < 0:
+                                            requested_gallons = 0
+                                        colors_are_green = False
+                                        if current_mode == 'fill':
+                                            fill_requested_gallons = requested_gallons
+                                        else:
+                                            mix_requested_gallons = requested_gallons
+                                        save_mode_presets()
+                                        msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    except ValueError:
+                                        pass
+
+                            elif line == 'PS':
+                                if exit_confirm_window:
+                                    msg = "Socket: Exit confirmation cancel"
                                     print(msg)
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                except ValueError:
-                                    pass
-
-                            elif line == 'PS':
-                                msg = "Socket: Pump Stop command received"
-                                print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                start_pump_stop_thread(config.PUMP_STOP_DURATION)
+                                    if exit_cancel_handler:
+                                        root.after(0, exit_cancel_handler)
+                                elif reset_season_confirm_window:
+                                    msg = "Socket: Reset season confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_season_cancel_handler:
+                                        root.after(0, reset_season_cancel_handler)
+                                elif reset_flow_curve_confirm_window:
+                                    msg = "Socket: Flow curve reset confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_cancel_handler:
+                                        root.after(0, reset_flow_curve_cancel_handler)
+                                elif accept_flow_curve_confirm_window:
+                                    msg = "Socket: Flow curve accept confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_cancel_handler:
+                                        root.after(0, accept_flow_curve_cancel_handler)
+                                elif calibration_mode:
+                                    msg = "Socket: Calibration cancel/back"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_cancel)
+                                elif log_viewer_mode:
+                                    msg = "Socket: Log viewer exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_log_viewer)
+                                elif fill_history_mode:
+                                    msg = "Socket: Fill history exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_fill_history)
+                                elif self_test_mode:
+                                    msg = "Socket: Self-test exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_self_test)
+                                elif full_test_mode:
+                                    msg = "Socket: Full-test PS command detected"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if full_test_window and hasattr(full_test_window, 'mark_tested'):
+                                        root.after(0, lambda: full_test_window.mark_tested('PS'))
+                                elif update_mode:
+                                    msg = "Socket: Update exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_update)
+                                elif menu_mode:
+                                    msg = "Socket: Menu close"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_menu)
+                                else:
+                                    msg = "Socket: Pump Stop command received"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                             elif line in ('OV:1', 'OV:0'):
                                 override_mode = (line == 'OV:1')
@@ -5281,13 +5384,35 @@ def socket_command_listener():
                                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             elif line == 'OV':
-                                override_mode = not override_mode
-                                if override_mode:
-                                    override_enabled_time = time.time()
-                                msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
-                                print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                if menu_mode:
+                                    msg = "Socket: Menu select"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    arm_menu_ov_guard()
+                                    root.after(0, menu_select)
+                                elif requested_gallons == 0:
+                                    if current_mode == 'mix' and batch_mix_data is not None:
+                                        msg = "Socket: Batch mix screen exit triggered (gallons=0, OV pressed)"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        root.after(0, lambda: clear_batch_mix_screen("socket OV at zero gallons"))
+                                    else:
+                                        msg = "Socket: Menu access triggered (gallons=0, OV pressed)"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        arm_menu_ov_guard()
+                                        root.after(0, show_menu)
+                                else:
+                                    override_mode = not override_mode
+                                    if override_mode:
+                                        override_enabled_time = time.time()
+                                    msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             client.send(b"OK\n")
                 except sock_module.timeout:

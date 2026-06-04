@@ -1981,6 +1981,18 @@ def command_write_handler(connection, value):
         _enqueue_control_actions(connection, 'command:reset_flow', 'RESET')
         return
 
+    if command in ('ov', 'override_press', 'switch_ov'):
+        _enqueue_control_actions(connection, 'command:ov', 'OV')
+        return
+
+    if command in ('reboot_box', 'restart_box', 'reboot_system'):
+        _enqueue_control_actions(connection, 'command:reboot_box', 'REBOOT', refresh=False)
+        return
+
+    if command in ('shutdown_box', 'poweroff_box', 'shutdown_system'):
+        _enqueue_control_actions(connection, 'command:shutdown_box', 'SHUTDOWN', refresh=False)
+        return
+
     if command in ('accept_pending_curve', 'apply_pending_curve'):
         _enqueue_control_actions(
             connection,

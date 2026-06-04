@@ -174,6 +174,61 @@ def test_confirm_fill_command_forwards_dashboard_tu(bumble_module, monkeypatch):
     assert queries == ['query']
 
 
+def test_ov_command_forwards_dashboard_ov(bumble_module, monkeypatch):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'ov'}).encode('utf-8'),
+    )
+
+    assert sent == ['OV']
+    assert queries == ['query']
+
+
+@pytest.mark.parametrize(
+    ('command', 'expected_action'),
+    [
+        ('reboot_box', 'REBOOT'),
+        ('shutdown_box', 'SHUTDOWN'),
+    ],
+)
+def test_power_commands_forward_without_refresh(bumble_module, monkeypatch, command, expected_action):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': command}).encode('utf-8'),
+    )
+
+    assert sent == [expected_action]
+    assert queries == []
+
+
 def test_accept_pending_curve_command_forwards_dashboard_apply(bumble_module, monkeypatch):
     sent = []
     queries = []
