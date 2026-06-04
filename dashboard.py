@@ -314,6 +314,8 @@ menu_highlight_refresh_pending = False  # Coalesce menu redraws so knob pulses d
 menu_displayed_index = None  # Last menu item whose highlight state was painted
 menu_ov_guard_until = 0.0  # Suppress OV contact/repeat bounce after screen changes
 MENU_OV_GUARD_SECONDS = 2.5
+last_serial_ov_toggle_time = 0.0
+SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS = 0.5
 log_viewer_mode = False  # Track if we're in log viewer
 log_viewer_window = None  # Reference to log viewer window
 log_viewer_text = None  # Reference to log text widget
@@ -5843,6 +5845,7 @@ def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
     global fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_serial_ov_toggle_time
 
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
@@ -6217,6 +6220,15 @@ def serial_listener():
                                             arm_menu_ov_guard()
                                             root.after(0, show_menu)
                                     else:
+                                        now = time.monotonic()
+                                        if now - last_serial_ov_toggle_time < SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS:
+                                            msg = "Serial: Ignored OV debounce during override toggle"
+                                            print(msg)
+                                            log_serial_debug(msg)
+                                            with open(debug_log, 'a') as f:
+                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            continue
+                                        last_serial_ov_toggle_time = now
                                         override_mode = not override_mode
                                         if override_mode:
                                             override_enabled_time = time.time()  # Record when enabled
