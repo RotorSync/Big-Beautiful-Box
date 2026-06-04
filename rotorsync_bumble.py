@@ -208,6 +208,7 @@ def _encode_ble_state_payload(state):
         'act': state.get('actual_gal'),
         'flow': state.get('flow_gpm'),
         'mode': state.get('mode'),
+        'bc': max(1, len(active_gatt_connections)),
     }
     put_bool_if_non_default(compact, 'ov', state.get('override'), False)
     put_bool_if_non_default(compact, 'thumb', state.get('thumbs_visible'), False)
