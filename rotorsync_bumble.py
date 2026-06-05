@@ -83,6 +83,8 @@ ADAPTER_RESET_COOLDOWN = 30
 GATT_ADAPTER_CHECK_INTERVAL = 5
 SENSOR_LOOP_HEARTBEAT_TIMEOUT = 120
 SENSOR_ADAPTER_OPEN_TIMEOUT = 10
+MOPEKA_SCAN_OPERATION_TIMEOUT = SCAN_TIMEOUT + 5
+BMS_READ_OPERATION_TIMEOUT = (BMS_TIMEOUT * 2) + 12
 HCI_SOCKET_OPEN_RETRY_ATTEMPTS = 12
 HCI_SOCKET_OPEN_RETRY_DELAY_SECONDS = 2.0
 CONFIG_RESPONSE_DIRECT_MAX_BYTES = 512
@@ -4093,9 +4095,15 @@ async def scan_mopeka(sensor_device, current_time):
 
     sensor_device.on('advertisement', on_advertisement)
     try:
-        await sensor_device.start_scanning(active=False)
+        await asyncio.wait_for(
+            sensor_device.start_scanning(active=False),
+            timeout=MOPEKA_SCAN_OPERATION_TIMEOUT,
+        )
         await asyncio.sleep(SCAN_TIMEOUT)
-        await sensor_device.stop_scanning()
+        try:
+            await asyncio.wait_for(sensor_device.stop_scanning(), timeout=5)
+        except Exception as e:
+            print(f'Mopeka scan stop warning: {type(e).__name__}: {e!r}', flush=True)
     finally:
         sensor_device.remove_listener('advertisement', on_advertisement)
 
@@ -4307,14 +4315,31 @@ async def read_sensors(sensor_device, sensor_adapter):
         current_time = time.time()
         reload_converter_if_calibration_changed()
 
-        if ((mopeka_enabled and mopeka_failures >= MAX_CONSECUTIVE_FAILURES) or bms_failures >= MAX_CONSECUTIVE_FAILURES):
+        if mopeka_enabled and mopeka_failures >= MAX_CONSECUTIVE_FAILURES:
             if current_time - last_adapter_reset > ADAPTER_RESET_COOLDOWN:
-                print('Too many sensor failures, exiting for service restart', flush=True)
-                os._exit(1)
+                print(
+                    'Mopeka remains offline after repeated scans; keeping GATT bridge up',
+                    flush=True,
+                )
+                send_dashboard_command('MOPEKA_OFFLINE')
+                mopeka_failures = 0
+                last_adapter_reset = current_time
+
+        if bms_failures >= MAX_CONSECUTIVE_FAILURES:
+            if current_time - last_adapter_reset > ADAPTER_RESET_COOLDOWN:
+                print(
+                    'BMS remains offline after repeated reads; keeping GATT bridge up',
+                    flush=True,
+                )
+                bms_failures = 0
+                last_adapter_reset = current_time
 
         if mopeka_enabled:
             try:
-                mopeka_found = await scan_mopeka(sensor_device, current_time)
+                mopeka_found = await asyncio.wait_for(
+                    scan_mopeka(sensor_device, current_time),
+                    timeout=MOPEKA_SCAN_OPERATION_TIMEOUT + 2,
+                )
 
                 if mopeka_found:
                     mopeka_failures = 0
@@ -4339,16 +4364,24 @@ async def read_sensors(sensor_device, sensor_adapter):
 
             except Exception as e:
                 mopeka_failures += 1
-                print(f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}', flush=True)
+                print(
+                    f'Mopeka error ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES}) '
+                    f'{type(e).__name__}: {e!r}',
+                    flush=True,
+                )
         else:
             mopeka_failures = 0
             if not mopeka_disabled_announced:
                 send_dashboard_command('MOPEKA_DISABLED')
                 mopeka_disabled_announced = True
 
+        sensor_loop_heartbeat = time.time()
         if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
             try:
-                if await read_bms(sensor_device, current_time):
+                if await asyncio.wait_for(
+                    read_bms(sensor_device, current_time),
+                    timeout=BMS_READ_OPERATION_TIMEOUT,
+                ):
                     bms_failures = 0
                     bms = sensor_data["bms"]
                     send_dashboard_command(f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
