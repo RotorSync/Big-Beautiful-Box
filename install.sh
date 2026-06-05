@@ -410,8 +410,7 @@ copy_if_needed "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/install.sh"
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
 sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
-sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
-sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
+sudo cp -r "$SCRIPT_DIR/src/." "$OPT_DIR/src/"
 for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
     [ -f "$mopeka_file" ] || continue
     base_name="$(basename "$mopeka_file")"
