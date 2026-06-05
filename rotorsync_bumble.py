@@ -152,6 +152,12 @@ MAINTENANCE_SECRET_PATHS = (
     '/home/pi/.rotorsync-maintenance-secret',
 )
 MAINTENANCE_DEVELOPMENT_SECRET = b'rotorsync-development-maintenance-secret'
+MAINTENANCE_USER_SECRET_PATH = '/home/pi/.rotorsync-maintenance-secret'
+MAINTENANCE_FRAME_SECRET_FIELDS = (
+    'maintenance_secret_b64',
+    'relay_secret_b64',
+    'bbb_maintenance_secret_b64',
+)
 
 # Sensor data with timestamps
 sensor_data = {
@@ -1285,7 +1291,7 @@ def _parse_maintenance_payload(payload_bytes):
     return obj if isinstance(obj, dict) else None, payload_bytes
 
 
-def _maintenance_secret_source():
+def _provisioned_maintenance_secret_source():
     for env_name in ('BBB_MAINTENANCE_SECRET', 'MAINTENANCE_RELAY_SECRET'):
         value = os.environ.get(env_name, '').strip()
         if value:
@@ -1300,6 +1306,13 @@ def _maintenance_secret_source():
         except OSError:
             continue
 
+    return None, None
+
+
+def _maintenance_secret_source():
+    source, secret = _provisioned_maintenance_secret_source()
+    if secret:
+        return source, secret
     return 'development-default', MAINTENANCE_DEVELOPMENT_SECRET
 
 
@@ -1317,6 +1330,38 @@ def _log_maintenance_secret_status():
         )
     else:
         print(f'Maintenance relay secret source: {source}', flush=True)
+
+
+def _frame_maintenance_secret(frame):
+    for key in MAINTENANCE_FRAME_SECRET_FIELDS:
+        value = frame.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            secret = base64.b64decode(value.strip(), validate=True)
+        except Exception as e:
+            raise ValueError('invalid maintenance secret bootstrap') from e
+        secret = secret.strip()
+        if len(secret) < 32 or len(secret) > 4096:
+            raise ValueError('invalid maintenance secret bootstrap length')
+        return secret
+    return None
+
+
+def _install_maintenance_secret(secret):
+    source, _existing = _provisioned_maintenance_secret_source()
+    if source:
+        return False
+
+    path = Path(MAINTENANCE_USER_SECRET_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + '.tmp')
+    with open(tmp_path, 'wb') as f:
+        f.write(secret.strip() + b'\n')
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    print(f'Maintenance relay secret provisioned at {path}', flush=True)
+    return True
 
 
 def _canonical_maintenance_payload(frame):
@@ -1338,6 +1383,15 @@ def _maintenance_frame_signature(frame):
     return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
 
 
+def _maintenance_frame_signature_with_secret(frame, secret):
+    digest = hmac.new(
+        secret,
+        _canonical_maintenance_payload(frame),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
+
+
 def _verify_maintenance_frame(frame, now=None):
     if not isinstance(frame, dict):
         raise ValueError('maintenance frame must be a JSON object')
@@ -1346,7 +1400,21 @@ def _verify_maintenance_frame(frame, now=None):
     if not isinstance(signature, str) or not signature:
         raise ValueError('missing frame signature')
 
-    expected = _maintenance_frame_signature(frame)
+    source, secret = _maintenance_secret_source()
+    expected = _maintenance_frame_signature_with_secret(frame, secret)
+    if hmac.compare_digest(signature, expected):
+        pass
+    else:
+        bootstrap_secret = None
+        if source == 'development-default':
+            bootstrap_secret = _frame_maintenance_secret(frame)
+        if not bootstrap_secret:
+            raise ValueError('invalid frame signature')
+        expected = _maintenance_frame_signature_with_secret(frame, bootstrap_secret)
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError('invalid frame signature')
+        _install_maintenance_secret(bootstrap_secret)
+
     if not hmac.compare_digest(signature, expected):
         raise ValueError('invalid frame signature')
 

@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import base64
 import json
 import sys
 import tarfile
@@ -135,6 +136,62 @@ def test_rejects_expired_maintenance_frame(bumble_module):
 
     with pytest.raises(ValueError, match='expired maintenance frame'):
         bumble_module._verify_maintenance_frame(frame)
+
+
+def test_bootstrap_secret_frame_provisions_unconfigured_trailer(monkeypatch, tmp_path):
+    monkeypatch.delenv('BBB_MAINTENANCE_SECRET', raising=False)
+    monkeypatch.delenv('MAINTENANCE_RELAY_SECRET', raising=False)
+    install_bumble_stubs(monkeypatch)
+    sys.modules.pop('rotorsync_bumble', None)
+    module = importlib.import_module('rotorsync_bumble')
+    secret_path = tmp_path / '.rotorsync-maintenance-secret'
+    monkeypatch.setattr(module, 'MAINTENANCE_SECRET_PATHS', (str(secret_path),))
+    monkeypatch.setattr(module, 'MAINTENANCE_USER_SECRET_PATH', str(secret_path))
+
+    new_secret = b'x' * 64
+    frame = {
+        'type': 'update_begin',
+        'session_id': 'session-1',
+        'update_id': 'bbb-master-V2.17-abcdef12',
+        'size': 100,
+        'sha256': 'a' * 64,
+        'maintenance_secret_b64': base64.b64encode(new_secret).decode('ascii'),
+        'expires_at': time.time() + 60,
+    }
+    frame['sig'] = module._maintenance_frame_signature_with_secret(frame, new_secret)
+
+    module._verify_maintenance_frame(frame)
+
+    assert secret_path.read_bytes().strip() == new_secret
+    assert oct(secret_path.stat().st_mode & 0o777) == '0o600'
+    sys.modules.pop('rotorsync_bumble', None)
+
+
+def test_bootstrap_secret_does_not_replace_existing_secret(bumble_module, monkeypatch, tmp_path):
+    existing_secret = b'e' * 64
+    replacement_secret = b'r' * 64
+    secret_path = tmp_path / '.rotorsync-maintenance-secret'
+    secret_path.write_bytes(existing_secret + b'\n')
+    monkeypatch.delenv('BBB_MAINTENANCE_SECRET', raising=False)
+    monkeypatch.delenv('MAINTENANCE_RELAY_SECRET', raising=False)
+    monkeypatch.setattr(bumble_module, 'MAINTENANCE_SECRET_PATHS', (str(secret_path),))
+    monkeypatch.setattr(bumble_module, 'MAINTENANCE_USER_SECRET_PATH', str(secret_path))
+
+    frame = {
+        'type': 'update_begin',
+        'session_id': 'session-1',
+        'update_id': 'bbb-master-V2.17-abcdef12',
+        'size': 100,
+        'sha256': 'a' * 64,
+        'maintenance_secret_b64': base64.b64encode(replacement_secret).decode('ascii'),
+        'expires_at': time.time() + 60,
+    }
+    frame['sig'] = bumble_module._maintenance_frame_signature_with_secret(frame, replacement_secret)
+
+    with pytest.raises(ValueError, match='invalid frame signature'):
+        bumble_module._verify_maintenance_frame(frame)
+
+    assert secret_path.read_bytes().strip() == existing_secret
 
 
 def write_runtime_tree(root, marker):
