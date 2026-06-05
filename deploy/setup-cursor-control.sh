@@ -20,6 +20,60 @@ changed=0
 rule_path="/etc/udev/rules.d/99-uinput-input.rules"
 rule_text='KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"'
 
+install_missing_cursor_tools() {
+    local missing=()
+    local tool
+
+    for tool in xdotool ydotool; do
+        if ! command -v "$tool" >/dev/null 2>&1 && [ ! -x "/usr/bin/$tool" ]; then
+            missing+=("$tool")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "setup-cursor-control: missing ${missing[*]}, apt-get unavailable" >&2
+        return 0
+    fi
+
+    local apt_opts=(
+        -o Acquire::Retries=2
+        -o Acquire::http::Timeout=20
+        -o Acquire::https::Timeout=20
+        -o Dpkg::Lock::Timeout=20
+    )
+    local update_cmd=(apt-get "${apt_opts[@]}" update)
+    local install_cmd=(apt-get "${apt_opts[@]}" install -y --no-install-recommends "${missing[@]}")
+
+    echo "setup-cursor-control: installing missing tools: ${missing[*]}"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 240 "${update_cmd[@]}" || {
+            echo "setup-cursor-control: apt-get update failed; cursor tools still missing" >&2
+            return 0
+        }
+        timeout 240 "${install_cmd[@]}" || {
+            echo "setup-cursor-control: apt-get install failed; cursor tools still missing" >&2
+            return 0
+        }
+    else
+        "${update_cmd[@]}" || {
+            echo "setup-cursor-control: apt-get update failed; cursor tools still missing" >&2
+            return 0
+        }
+        "${install_cmd[@]}" || {
+            echo "setup-cursor-control: apt-get install failed; cursor tools still missing" >&2
+            return 0
+        }
+    fi
+
+    changed=1
+}
+
+install_missing_cursor_tools
+
 if ! getent group input >/dev/null; then
     groupadd --system input
     changed=1
