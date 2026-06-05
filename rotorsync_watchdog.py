@@ -16,7 +16,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 CHECK_INTERVAL = 10
 FAIL_THRESHOLD = 2
 GATT_CLIENT_STALE_SECONDS = 120
-GATT_CLIENT_RESTART_COOLDOWN_SECONDS = 600
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'
 GATT_DEVICE_PATH_FILE = Path('/home/pi/rotorsync_gatt_device_path')
 GATT_ADVERTISING_READY_FILE = Path('/home/pi/rotorsync_gatt_advertising_ready.json')
@@ -132,7 +131,7 @@ def main():
     logging.info(f'Check interval: {CHECK_INTERVAL}s, Fail threshold: {FAIL_THRESHOLD}')
 
     consecutive_failures = 0
-    last_gatt_client_restart_at = 0
+    last_stale_client_log_at = 0
     time.sleep(30)
 
     expected_device_path = read_expected_device_path()
@@ -164,17 +163,13 @@ def main():
                 advertising_started_at,
                 client_seen_at,
             )
-            if stale_client_reason and (
-                now - last_gatt_client_restart_at < GATT_CLIENT_RESTART_COOLDOWN_SECONDS
-            ):
-                remaining = GATT_CLIENT_RESTART_COOLDOWN_SECONDS - (
-                    now - last_gatt_client_restart_at
-                )
+            if stale_client_reason and now - last_stale_client_log_at >= 60:
                 logging.info(
-                    f'Suppressing stale GATT client restart for {remaining:.0f}s: '
+                    'GATT client activity is stale, but leaving advertising up: '
                     f'{stale_client_reason}'
                 )
-                stale_client_reason = None
+                last_stale_client_log_at = now
+            stale_client_reason = None
 
             hci_changed = False
             if last_known_hci and current_hci and current_hci != last_known_hci:
@@ -203,8 +198,6 @@ def main():
                 )
 
                 if hci_changed or consecutive_failures >= FAIL_THRESHOLD:
-                    if stale_client_reason:
-                        last_gatt_client_restart_at = now
                     restart_rotorsync()
                     consecutive_failures = 0
                     time.sleep(30)

@@ -102,6 +102,37 @@ install_maintenance_secret() {
     log_warn "Maintenance relay secret missing. Admin maintenance commands will be rejected until /etc/rotorsync/maintenance.secret or $secret_path is provisioned."
 }
 
+configure_bluetooth_usb_power() {
+    local rule_path="/etc/udev/rules.d/98-rotorsync-bluetooth-power.rules"
+    local changed=0
+
+    sudo tee "$rule_path" > /dev/null <<'EOF'
+# Keep TrailerSync Bluetooth adapters awake for long-lived BLE GATT/sensor use.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2c0a", ATTR{idProduct}=="8761", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0b05", ATTR{idProduct}=="1bf6", TEST=="power/control", ATTR{power/control}="on"
+EOF
+    sudo udevadm control --reload-rules 2>/dev/null || true
+
+    for device in /sys/bus/usb/devices/*; do
+        [ -f "$device/idVendor" ] || continue
+        [ -f "$device/idProduct" ] || continue
+        [ -f "$device/power/control" ] || continue
+        local vendor product
+        vendor="$(cat "$device/idVendor" 2>/dev/null || true)"
+        product="$(cat "$device/idProduct" 2>/dev/null || true)"
+        case "${vendor}:${product}" in
+            2c0a:8761|0b05:1bf6)
+                if [ "$(cat "$device/power/control" 2>/dev/null || true)" != "on" ]; then
+                    echo on | sudo tee "$device/power/control" >/dev/null
+                    changed=1
+                fi
+                ;;
+        esac
+    done
+
+    log_info "Bluetooth USB power management configured (changed=$changed)."
+}
+
 install_boot_logo() {
     local image_path="$1"
     local theme_name="trailersync"
@@ -286,6 +317,7 @@ sudo apt install -y \
 
 sudo usermod -a -G dialout $INSTALL_USER
 sudo "$SCRIPT_DIR/deploy/setup-cursor-control.sh"
+configure_bluetooth_usb_power
 sudo systemctl enable ssh
 sudo systemctl start ssh
 
