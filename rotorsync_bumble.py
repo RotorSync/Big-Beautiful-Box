@@ -151,6 +151,7 @@ MAINTENANCE_SECRET_PATHS = (
     '/etc/rotorsync/maintenance.secret',
     '/home/pi/.rotorsync-maintenance-secret',
 )
+MAINTENANCE_DEVELOPMENT_SECRET = b'rotorsync-development-maintenance-secret'
 
 # Sensor data with timestamps
 sensor_data = {
@@ -1284,22 +1285,38 @@ def _parse_maintenance_payload(payload_bytes):
     return obj if isinstance(obj, dict) else None, payload_bytes
 
 
-def _maintenance_secret():
+def _maintenance_secret_source():
     for env_name in ('BBB_MAINTENANCE_SECRET', 'MAINTENANCE_RELAY_SECRET'):
         value = os.environ.get(env_name, '').strip()
         if value:
-            return value.encode('utf-8')
+            return f'env:{env_name}', value.encode('utf-8')
 
     for path in MAINTENANCE_SECRET_PATHS:
         try:
             with open(path, 'rb') as f:
                 value = f.read().strip()
             if value:
-                return value
+                return f'file:{path}', value
         except OSError:
             continue
 
-    return b'rotorsync-development-maintenance-secret'
+    return 'development-default', MAINTENANCE_DEVELOPMENT_SECRET
+
+
+def _maintenance_secret():
+    return _maintenance_secret_source()[1]
+
+
+def _log_maintenance_secret_status():
+    source, _secret = _maintenance_secret_source()
+    if source == 'development-default':
+        print(
+            'WARNING: maintenance relay secret missing; admin maintenance frames '
+            'signed with the fleet secret will be rejected',
+            flush=True,
+        )
+    else:
+        print(f'Maintenance relay secret source: {source}', flush=True)
 
 
 def _canonical_maintenance_payload(frame):
@@ -4470,6 +4487,7 @@ async def open_hci_socket_transport_with_retry(
 async def main():
     global ble_device, config_notify_char, maintenance_stdout_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
+    _log_maintenance_secret_status()
     # Initialize Mopeka gallon converter
     mopeka_init()
     reload_converter_if_calibration_changed(force=True)

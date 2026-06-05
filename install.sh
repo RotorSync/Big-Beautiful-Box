@@ -82,6 +82,26 @@ copy_tree_contents_if_needed() {
     cp -r "$src_dir/"* "$dst_dir/"
 }
 
+install_maintenance_secret() {
+    local secret_path="$INSTALL_HOME/.rotorsync-maintenance-secret"
+    local secret_value="${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}"
+
+    if [ -n "$secret_value" ]; then
+        umask 077
+        printf '%s' "$secret_value" > "$secret_path"
+        chmod 600 "$secret_path"
+        log_info "Installed maintenance relay secret at $secret_path"
+        return
+    fi
+
+    if [ -s "$secret_path" ] || [ -s /etc/rotorsync/maintenance.secret ]; then
+        log_info "Maintenance relay secret already present."
+        return
+    fi
+
+    log_warn "Maintenance relay secret missing. Admin maintenance commands will be rejected until /etc/rotorsync/maintenance.secret or $secret_path is provisioned."
+}
+
 install_boot_logo() {
     local image_path="$1"
     local theme_name="trailersync"
@@ -408,6 +428,8 @@ sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
+
+install_maintenance_secret
 
 # Step 6: Install systemd services
 log_step "6/7: Installing systemd service..."

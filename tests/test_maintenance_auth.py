@@ -88,6 +88,32 @@ def test_signature_matches_backend_canonical_format(bumble_module):
     )
 
 
+def test_maintenance_secret_reports_env_source(bumble_module):
+    source, secret = bumble_module._maintenance_secret_source()
+
+    assert source == 'env:BBB_MAINTENANCE_SECRET'
+    assert secret == b'unit-test-secret'
+
+
+def test_maintenance_secret_reports_development_fallback(monkeypatch, tmp_path):
+    monkeypatch.delenv('BBB_MAINTENANCE_SECRET', raising=False)
+    monkeypatch.delenv('MAINTENANCE_RELAY_SECRET', raising=False)
+    install_bumble_stubs(monkeypatch)
+    sys.modules.pop('rotorsync_bumble', None)
+    module = importlib.import_module('rotorsync_bumble')
+    monkeypatch.setattr(
+        module,
+        'MAINTENANCE_SECRET_PATHS',
+        (str(tmp_path / 'missing.secret'),),
+    )
+
+    source, secret = module._maintenance_secret_source()
+
+    assert source == 'development-default'
+    assert secret == module.MAINTENANCE_DEVELOPMENT_SECRET
+    sys.modules.pop('rotorsync_bumble', None)
+
+
 def test_rejects_missing_maintenance_signature(bumble_module):
     frame = signed_frame(bumble_module)
     frame.pop('sig')
