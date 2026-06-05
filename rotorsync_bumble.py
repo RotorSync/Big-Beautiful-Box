@@ -158,6 +158,7 @@ MAINTENANCE_FRAME_SECRET_FIELDS = (
     'relay_secret_b64',
     'bbb_maintenance_secret_b64',
 )
+CURSOR_CONTROL_SETUP_SCRIPT = '/home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh'
 
 # Sensor data with timestamps
 sensor_data = {
@@ -1330,6 +1331,34 @@ def _log_maintenance_secret_status():
         )
     else:
         print(f'Maintenance relay secret source: {source}', flush=True)
+
+
+def ensure_cursor_control_setup():
+    if os.geteuid() != 0:
+        print('Cursor control setup skipped: rotorsync_bumble.py is not running as root', flush=True)
+        return
+
+    script = Path(CURSOR_CONTROL_SETUP_SCRIPT)
+    if not script.exists():
+        print(f'Cursor control setup skipped: {script} missing', flush=True)
+        return
+
+    try:
+        result = subprocess.run(
+            [str(script), '--restart-dashboard'],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception as e:
+        print(f'Cursor control setup failed: {e}', flush=True)
+        return
+
+    output = ((result.stdout or '') + (result.stderr or '')).strip()
+    if result.returncode == 0:
+        print(f'Cursor control setup ok: {output or "no output"}', flush=True)
+    else:
+        print(f'Cursor control setup failed ({result.returncode}): {output[:240]}', flush=True)
 
 
 def _frame_maintenance_secret(frame):
@@ -4556,6 +4585,7 @@ async def main():
     global ble_device, config_notify_char, maintenance_stdout_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     _log_maintenance_secret_status()
+    ensure_cursor_control_setup()
     # Initialize Mopeka gallon converter
     mopeka_init()
     reload_converter_if_calibration_changed(force=True)

@@ -278,11 +278,14 @@ sudo apt install -y \
     python3-yaml \
     bluez \
     bluez-tools \
+    xdotool \
+    ydotool \
     zstd \
     plymouth \
     plymouth-themes
 
 sudo usermod -a -G dialout $INSTALL_USER
+sudo "$SCRIPT_DIR/deploy/setup-cursor-control.sh"
 sudo systemctl enable ssh
 sudo systemctl start ssh
 
