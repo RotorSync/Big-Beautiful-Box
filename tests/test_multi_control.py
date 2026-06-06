@@ -795,3 +795,16 @@ def test_self_scan_heartbeat_records_own_gatt_advertisement(
     assert payload['target_address'] == 'E8:EA:6A:BD:E5:0E'
     assert payload['address_match'] is True
     assert payload['name_match'] is True
+
+
+def test_self_scan_uses_active_scan_only_when_idle_and_stale(bumble_module):
+    bumble_module.last_gatt_self_adv_seen_write = 100.0
+    bumble_module.active_gatt_connections.clear()
+
+    assert bumble_module._should_use_active_self_adv_scan(219.0) is False
+    assert bumble_module._should_use_active_self_adv_scan(221.0) is True
+
+    bumble_module.active_gatt_connections.add('iphone')
+
+    assert bumble_module._should_use_active_self_adv_scan(221.0) is False
+    assert bumble_module._should_use_active_self_adv_scan(1000.0) is False

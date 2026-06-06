@@ -129,6 +129,8 @@ GATT_ADVERTISING_READY_FILE = '/home/pi/rotorsync_gatt_advertising_ready.json'
 GATT_CLIENT_SEEN_FILE = '/home/pi/rotorsync_gatt_client_seen'
 GATT_SELF_ADV_SEEN_FILE = '/home/pi/rotorsync_gatt_self_adv_seen.json'
 GATT_CONNECTION_STATE_FILE = '/home/pi/rotorsync_gatt_connections.json'
+GATT_SELF_ADV_ACTIVE_SCAN_STALE_SECONDS = 120
+GATT_SELF_ADV_DEBUG_LOG_SECONDS = 300
 DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
 MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
@@ -192,6 +194,7 @@ active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
 gatt_self_advertisement_target = {'address': '', 'name': ''}
 last_gatt_self_adv_seen_write = 0.0
+last_gatt_self_adv_debug_log_at = 0.0
 live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 last_mopeka_history_log_at = 0.0
@@ -834,6 +837,52 @@ def _advertisement_has_service_uuid(advertisement, service_uuid):
             if service_bytes in value_bytes:
                 return True
     return False
+
+
+def _advertisement_manufacturer_ids(advertisement):
+    ids = []
+    ad_type = getattr(AdvertisingData, 'MANUFACTURER_SPECIFIC_DATA', None)
+    if ad_type is None:
+        return ids
+    for item in _advertisement_values(advertisement, ad_type):
+        try:
+            company_id = item[0]
+        except Exception:
+            continue
+        ids.append(company_id)
+    return ids[:6]
+
+
+def _gatt_self_advertisement_debug_summary(advertisement):
+    target_address = _normalize_ble_address(gatt_self_advertisement_target.get('address'))
+    target_name = str(gatt_self_advertisement_target.get('name') or '')
+    address = _normalize_ble_address(getattr(advertisement, 'address', ''))
+    names = _advertisement_local_names(advertisement)
+    address_match = bool(target_address and address == target_address)
+    name_match = bool(target_name and target_name in names)
+    return {
+        'addr': address,
+        'names': names[:3],
+        'rssi': getattr(advertisement, 'rssi', None),
+        'mfg': _advertisement_manufacturer_ids(advertisement),
+        'svc': _advertisement_has_service_uuid(advertisement, SERVICE_UUID),
+        'addr_match': address_match,
+        'name_match': name_match,
+    }
+
+
+def _gatt_self_advertisement_matches(summary):
+    return bool(
+        summary.get('addr_match')
+        or summary.get('name_match')
+        or summary.get('svc')
+    )
+
+
+def _should_use_active_self_adv_scan(now):
+    if active_gatt_connections:
+        return False
+    return now - last_gatt_self_adv_seen_write > GATT_SELF_ADV_ACTIVE_SCAN_STALE_SECONDS
 
 
 def maybe_mark_gatt_self_advertisement_seen(advertisement, now=None):
@@ -4378,12 +4427,28 @@ def _cmd_get_fill_history(cmd, *, request_id=None):
 
 
 async def scan_mopeka(sensor_device, current_time):
+    global last_gatt_self_adv_debug_log_at
+
     mopeka_found = False
+    active_self_scan = _should_use_active_self_adv_scan(current_time)
+    debug_ad_count = 0
+    debug_ad_samples = []
+    debug_match_count = 0
+    debug_match_samples = []
 
     def on_advertisement(advertisement):
-        nonlocal mopeka_found
+        nonlocal mopeka_found, debug_ad_count, debug_ad_samples
+        nonlocal debug_match_count, debug_match_samples
 
         try:
+            debug_ad_count += 1
+            summary = _gatt_self_advertisement_debug_summary(advertisement)
+            if len(debug_ad_samples) < 10:
+                debug_ad_samples.append(summary)
+            if _gatt_self_advertisement_matches(summary):
+                debug_match_count += 1
+                if len(debug_match_samples) < 5:
+                    debug_match_samples.append(summary)
             maybe_mark_gatt_self_advertisement_seen(advertisement, current_time)
             addr = str(advertisement.address).upper()
             manufacturer_data = advertisement.data.get_all(
@@ -4415,7 +4480,7 @@ async def scan_mopeka(sensor_device, current_time):
     sensor_device.on('advertisement', on_advertisement)
     try:
         await asyncio.wait_for(
-            sensor_device.start_scanning(active=False),
+            sensor_device.start_scanning(active=active_self_scan),
             timeout=MOPEKA_SCAN_OPERATION_TIMEOUT,
         )
         await asyncio.sleep(SCAN_TIMEOUT)
@@ -4425,6 +4490,28 @@ async def scan_mopeka(sensor_device, current_time):
             print(f'Mopeka scan stop warning: {type(e).__name__}: {e!r}', flush=True)
     finally:
         sensor_device.remove_listener('advertisement', on_advertisement)
+
+    should_log_self_scan = (
+        active_self_scan
+        or debug_match_count > 0
+        or current_time - last_gatt_self_adv_debug_log_at >= GATT_SELF_ADV_DEBUG_LOG_SECONDS
+    )
+    if should_log_self_scan:
+        target = {
+            'address': gatt_self_advertisement_target.get('address') or '',
+            'name': gatt_self_advertisement_target.get('name') or '',
+        }
+        print(
+            'GATT self-scan: '
+            f'active={str(active_self_scan).lower()} '
+            f'target={json.dumps(target, separators=(",", ":"))} '
+            f'saw={debug_ad_count} '
+            f'matches={debug_match_count} '
+            f'match_samples={json.dumps(debug_match_samples, separators=(",", ":"))} '
+            f'samples={json.dumps(debug_ad_samples, separators=(",", ":"))}',
+            flush=True,
+        )
+        last_gatt_self_adv_debug_log_at = current_time
 
     return mopeka_found
 
