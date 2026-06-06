@@ -64,6 +64,7 @@ STATUS_HISTORY_POLL_INTERVAL = 10.0
 STATUS_HISTORY_POLL_CYCLES = max(1, int(STATUS_HISTORY_POLL_INTERVAL / STATUS_POLL_INTERVAL))
 LIVE_TELEMETRY_POLL_INTERVAL = 0.25
 LIVE_TELEMETRY_MULTIPOINT_NOTIFY_INTERVAL = 0.75
+LIVE_TELEMETRY_PILOT_PRIORITY_NOTIFY_INTERVAL = 0.75
 LIVE_TELEMETRY_FAST_READ_WINDOW = 2.0
 LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM = 0.05
 MOPEKA_HISTORY_LOG_PATH = '/home/pi/mopeka_history.csv'
@@ -186,11 +187,64 @@ connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
+gatt_client_metadata_by_connection = {}
 live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 last_mopeka_history_log_at = 0.0
 last_mopeka_history_snapshot = None
 last_history_prune_at = 0.0
+
+
+def _normalize_client_role(value):
+    role = str(value or '').strip().lower().replace('-', '_').replace(' ', '_')
+    if role in ('pilot', 'pilots'):
+        return 'pilot'
+    if role in ('ground', 'groundcrew', 'ground_crew', 'crew', 'groundcrew_member'):
+        return 'ground_crew'
+    if role in ('admin', 'administrator'):
+        return 'admin'
+    return 'unknown'
+
+
+def _client_role_for_connection_key(connection_key):
+    metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+    return _normalize_client_role(metadata.get('role'))
+
+
+def _is_pilot_connected():
+    for connection_key in active_gatt_connections:
+        if _client_role_for_connection_key(connection_key) == 'pilot':
+            return True
+    return False
+
+
+def _pilot_priority_active(state=None):
+    state = state if isinstance(state, dict) else dashboard_status.get('state') or {}
+    return (
+        len(active_gatt_connections) > 1
+        and _is_pilot_connected()
+        and _state_flow_gpm(state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+    )
+
+
+def _record_client_hello(connection, command):
+    connection_key = _connection_key(connection)
+    role = _normalize_client_role(command.get('role') or command.get('r'))
+    previous = gatt_client_metadata_by_connection.get(connection_key, {})
+    gatt_client_metadata_by_connection[connection_key] = {
+        **previous,
+        'role': role,
+        'user_id': str(command.get('user_id') or command.get('uid') or '')[:80],
+        'name': str(command.get('name') or '')[:80],
+        'device': str(command.get('device') or '')[:80],
+        'last_seen': time.time(),
+    }
+    print(
+        f'Client hello from {connection_key}: role={role}, '
+        f'pilot_connected={_is_pilot_connected()}',
+        flush=True,
+    )
+    query_dashboard_status()
 
 
 def _encode_ble_state_payload(state):
@@ -237,6 +291,8 @@ def _encode_ble_state_payload(state):
     put_bool_if_non_default(compact, 'rs', state.get('relay_slowdown_alarm'), False)
     put_bool_if_non_default(compact, 'fm_ok', state.get('flow_meter_connected'), True)
     put_bool_if_non_default(compact, 'sb_ok', state.get('switch_box_connected'), True)
+    put_bool_if_non_default(compact, 'pilot', _is_pilot_connected(), False)
+    put_bool_if_non_default(compact, 'prio', _pilot_priority_active(state), False)
     put_if_present(compact, 'cc', compact_curve_value(state.get('current_curve')))
     put_if_present(compact, 'pc', compact_curve_value(state.get('pending_curve')))
     return json.dumps(compact, separators=(',', ':'))
@@ -851,6 +907,7 @@ def install_gatt_advertising_resume_hook(
         else:
             active_gatt_connection_counts.pop(peer, None)
             active_gatt_connections.discard(peer)
+            gatt_client_metadata_by_connection.pop(peer, None)
 
         print(
             f'GATT client disconnected from {peer}; '
@@ -889,6 +946,14 @@ def install_gatt_advertising_resume_hook(
         previous_count = active_gatt_connection_counts.get(peer, 0)
         active_gatt_connection_counts[peer] = previous_count + 1
         active_gatt_connections.add(peer)
+        gatt_client_metadata_by_connection.setdefault(
+            peer,
+            {
+                'role': 'unknown',
+                'connected_at': time.time(),
+                'last_seen': time.time(),
+            },
+        )
         print(
             f'GATT client connected from {peer}; trying to keep advertising for '
             'additional controllers',
@@ -1017,6 +1082,9 @@ def make_live_telemetry_read_handler():
     def read_value(connection):
         global last_live_telemetry_client_read_at
         mark_gatt_client_seen()
+        connection_key = _connection_key(connection)
+        if connection_key in gatt_client_metadata_by_connection:
+            gatt_client_metadata_by_connection[connection_key]['last_seen'] = time.time()
         last_live_telemetry_client_read_at = time.time()
         query_live_telemetry()
         value = dashboard_status.get('live_json', '{}')
@@ -2317,6 +2385,10 @@ def command_write_handler(connection, value):
     command = str(cmd.get('cmd', '')).strip().lower()
     if not command:
         print('Command write ignored: missing cmd', flush=True)
+        return
+
+    if command in ('client_hello', 'hello'):
+        _record_client_hello(connection, cmd)
         return
 
     if command == 'pump_stop':
@@ -4351,8 +4423,16 @@ async def poll_dashboard_status(device, state_char):
         await asyncio.sleep(STATUS_POLL_INTERVAL)
 
 
-def _live_telemetry_notify_due(controller_count, now, last_notify_at, flow_active=False):
+def _live_telemetry_notify_due(
+    controller_count,
+    now,
+    last_notify_at,
+    flow_active=False,
+    pilot_priority_active=False,
+):
     if flow_active:
+        if controller_count > 1 and pilot_priority_active:
+            return now - last_notify_at >= LIVE_TELEMETRY_PILOT_PRIORITY_NOTIFY_INTERVAL
         return True
     if controller_count <= 1:
         return True
@@ -4391,6 +4471,7 @@ async def poll_live_telemetry(device, live_char):
                     now,
                     last_live_notify_at,
                     flow_active=flow_active,
+                    pilot_priority_active=_pilot_priority_active(current_state),
                 )
                 if updated and current_live_json != last_notified_live_json and notify_due:
                     await device.notify_subscribers(

@@ -369,6 +369,7 @@ def test_state_payload_stays_compact_with_curve_labels(bumble_module):
         'act': 0.0,
         'flow': 0.0,
         'mode': 'fill',
+        'bc': 1,
         'cc': '-0.10',
     }
     assert len(json.dumps(payload, separators=(',', ':'))) < 160
@@ -381,8 +382,38 @@ def test_live_telemetry_payload_includes_requested_actual_and_flow(bumble_module
         'req': 10.0,
         'act': 12.346,
         'flow': 78.9,
+        'rs': False,
     }
-    assert len(json.dumps(payload, separators=(',', ':'))) < 45
+    assert len(json.dumps(payload, separators=(',', ':'))) < 60
+
+
+def test_client_hello_marks_pilot_priority_state(bumble_module, monkeypatch):
+    queries = []
+    monkeypatch.setattr(bumble_module, 'query_dashboard_status', lambda: queries.append(True))
+
+    bumble_module.active_gatt_connections.update({'iphone', 'ipad'})
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({
+            'cmd': 'client_hello',
+            'role': 'pilot',
+            'user_id': 'pilot-1',
+            'device': 'Norman iPhone',
+        }).encode('utf-8'),
+    )
+
+    payload = json.loads(bumble_module._encode_ble_state_payload({
+        'version': 'V2.8',
+        'requested_gal': 20.0,
+        'actual_gal': 1.0,
+        'flow_gpm': 2.0,
+        'mode': 'fill',
+    }))
+
+    assert bumble_module.gatt_client_metadata_by_connection['iphone']['role'] == 'pilot'
+    assert payload['pilot'] is True
+    assert payload['prio'] is True
+    assert queries == [True]
 
 
 def test_state_notify_compare_can_ignore_live_only_fields(bumble_module):
@@ -445,6 +476,7 @@ def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monke
         'req': 12.0,
         'act': 4.321,
         'flow': 65.5,
+        'rs': False,
     }
     assert bumble_module.dashboard_status['requested'] == 12.0
     assert bumble_module.dashboard_status['actual'] == 4.321
@@ -479,6 +511,23 @@ def test_live_telemetry_active_flow_notify_is_immediate_for_multipoint(bumble_mo
         now=100.0,
         last_notify_at=99.99,
         flow_active=True,
+    )
+
+
+def test_live_telemetry_active_flow_notify_is_throttled_for_pilot_priority(bumble_module):
+    assert not bumble_module._live_telemetry_notify_due(
+        controller_count=2,
+        now=100.0,
+        last_notify_at=99.5,
+        flow_active=True,
+        pilot_priority_active=True,
+    )
+    assert bumble_module._live_telemetry_notify_due(
+        controller_count=2,
+        now=100.0,
+        last_notify_at=99.25,
+        flow_active=True,
+        pilot_priority_active=True,
     )
 
 
