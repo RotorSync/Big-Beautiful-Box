@@ -127,6 +127,8 @@ WATCHDOG_LOG_PATH = '/home/pi/rotorsync_watchdog.log'
 GATT_DEVICE_PATH_FILE = '/home/pi/rotorsync_gatt_device_path'
 GATT_ADVERTISING_READY_FILE = '/home/pi/rotorsync_gatt_advertising_ready.json'
 GATT_CLIENT_SEEN_FILE = '/home/pi/rotorsync_gatt_client_seen'
+GATT_SELF_ADV_SEEN_FILE = '/home/pi/rotorsync_gatt_self_adv_seen.json'
+GATT_CONNECTION_STATE_FILE = '/home/pi/rotorsync_gatt_connections.json'
 DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
 MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
@@ -188,6 +190,8 @@ connected_advertising_next_retry_at = 0.0
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
+gatt_self_advertisement_target = {'address': '', 'name': ''}
+last_gatt_self_adv_seen_write = 0.0
 live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 last_mopeka_history_log_at = 0.0
@@ -733,8 +737,20 @@ def _atomic_write_text(path, text):
     os.replace(tmp_path, path)
 
 
+def _normalize_ble_address(address):
+    return str(address or '').upper().split('/')[0].strip()
+
+
 def persist_gatt_advertising_ready(ble_name, address):
     """Tell the watchdog that Bumble reached the advertising-ready point."""
+    global gatt_self_advertisement_target
+
+    normalized_address = _normalize_ble_address(address)
+    gatt_self_advertisement_target = {
+        'address': normalized_address,
+        'name': str(ble_name or ''),
+    }
+
     try:
         payload = {
             'timestamp': time.time(),
@@ -748,6 +764,120 @@ def persist_gatt_advertising_ready(ble_name, address):
         )
     except Exception as e:
         print(f'Failed to persist GATT advertising ready state: {e}', flush=True)
+
+
+def persist_gatt_connection_state(reason=''):
+    """Record active GATT connection count for watchdog decisions."""
+    try:
+        payload = {
+            'timestamp': time.time(),
+            'pid': os.getpid(),
+            'count': len(active_gatt_connections),
+            'clients': sorted(str(peer) for peer in active_gatt_connections),
+            'reason': str(reason or '')[:80],
+        }
+        _atomic_write_text(
+            GATT_CONNECTION_STATE_FILE,
+            json.dumps(payload, separators=(',', ':')) + '\n',
+        )
+    except Exception as e:
+        print(f'Failed to persist GATT connection state: {e}', flush=True)
+
+
+def _advertisement_values(advertisement, ad_type):
+    try:
+        data = getattr(advertisement, 'data', None)
+        if data is None or not hasattr(data, 'get_all'):
+            return []
+        return data.get_all(ad_type) or []
+    except Exception:
+        return []
+
+
+def _decode_advertisement_text(value):
+    if isinstance(value, bytes):
+        try:
+            return value.decode('utf-8', errors='ignore').strip('\x00')
+        except Exception:
+            return ''
+    return str(value or '').strip()
+
+
+def _advertisement_local_names(advertisement):
+    names = []
+    for ad_type in (
+        getattr(AdvertisingData, 'COMPLETE_LOCAL_NAME', None),
+        getattr(AdvertisingData, 'SHORTENED_LOCAL_NAME', None),
+    ):
+        if ad_type is None:
+            continue
+        for value in _advertisement_values(advertisement, ad_type):
+            name = _decode_advertisement_text(value)
+            if name:
+                names.append(name)
+    return names
+
+
+def _advertisement_has_service_uuid(advertisement, service_uuid):
+    service_bytes = bytes(service_uuid)
+    for ad_type in (
+        getattr(AdvertisingData, 'INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS', None),
+        getattr(AdvertisingData, 'COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS', None),
+    ):
+        if ad_type is None:
+            continue
+        for value in _advertisement_values(advertisement, ad_type):
+            try:
+                value_bytes = bytes(value)
+            except Exception:
+                continue
+            if service_bytes in value_bytes:
+                return True
+    return False
+
+
+def maybe_mark_gatt_self_advertisement_seen(advertisement, now=None):
+    """Record proof that the sensor adapter heard this box's GATT advert."""
+    global last_gatt_self_adv_seen_write
+
+    target_address = _normalize_ble_address(gatt_self_advertisement_target.get('address'))
+    target_name = str(gatt_self_advertisement_target.get('name') or '')
+    if not target_address and not target_name:
+        return False
+
+    now = time.time() if now is None else now
+    address = _normalize_ble_address(getattr(advertisement, 'address', ''))
+    names = _advertisement_local_names(advertisement)
+    address_match = bool(target_address and address == target_address)
+    name_match = bool(target_name and target_name in names)
+    if not address_match and not name_match:
+        return False
+
+    if now - last_gatt_self_adv_seen_write < 15:
+        return True
+
+    service_match = _advertisement_has_service_uuid(advertisement, SERVICE_UUID)
+    try:
+        payload = {
+            'timestamp': now,
+            'pid': os.getpid(),
+            'address': address,
+            'target_address': target_address,
+            'name': names[0] if names else '',
+            'target_name': target_name,
+            'address_match': address_match,
+            'name_match': name_match,
+            'service_uuid_match': service_match,
+            'rssi': getattr(advertisement, 'rssi', None),
+        }
+        _atomic_write_text(
+            GATT_SELF_ADV_SEEN_FILE,
+            json.dumps(payload, separators=(',', ':')) + '\n',
+        )
+        last_gatt_self_adv_seen_write = now
+    except Exception as e:
+        print(f'Failed to persist GATT self-advertisement heartbeat: {e}', flush=True)
+    return True
 
 
 def _is_gatt_advertising(device):
@@ -914,6 +1044,7 @@ def install_gatt_advertising_resume_hook(
             f'{len(active_gatt_connections)} controller(s) remain',
             flush=True,
         )
+        persist_gatt_connection_state('disconnect')
         if active_gatt_connections:
             print(
                 'GATT advertising left untouched; anchor controller remains',
@@ -959,6 +1090,7 @@ def install_gatt_advertising_resume_hook(
             'additional controllers',
             flush=True,
         )
+        persist_gatt_connection_state('connect')
         if hasattr(connection, 'on'):
             connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
         else:
@@ -4252,6 +4384,7 @@ async def scan_mopeka(sensor_device, current_time):
         nonlocal mopeka_found
 
         try:
+            maybe_mark_gatt_self_advertisement_seen(advertisement, current_time)
             addr = str(advertisement.address).upper()
             manufacturer_data = advertisement.data.get_all(
                 AdvertisingData.MANUFACTURER_SPECIFIC_DATA
@@ -4891,6 +5024,7 @@ async def main():
         auto_restart=False,
     )
     persist_gatt_advertising_ready(ble_name, device.public_address)
+    persist_gatt_connection_state('advertising_ready')
     print('=== Rotorsync GATT Server Running ===', flush=True)
     print('Characteristics:', flush=True)
     print('  def1: BMS (read)        - {"voltage": x, "soc": y}', flush=True)

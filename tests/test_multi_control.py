@@ -734,3 +734,64 @@ def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):
         assert result is False
 
     asyncio.run(run())
+
+
+def test_self_scan_heartbeat_records_own_gatt_advertisement(
+    bumble_module,
+    monkeypatch,
+    tmp_path,
+):
+    class FakeAdvertisementData:
+        def __init__(self, values):
+            self.values = values
+
+        def get_all(self, ad_type):
+            return self.values.get(ad_type, [])
+
+    class FakeAdvertisement:
+        def __init__(self, address, values=None):
+            self.address = address
+            self.data = FakeAdvertisementData(values or {})
+            self.rssi = -42
+
+    monkeypatch.setattr(bumble_module.AdvertisingData, 'COMPLETE_LOCAL_NAME', 9, raising=False)
+    monkeypatch.setattr(bumble_module.AdvertisingData, 'SHORTENED_LOCAL_NAME', 8, raising=False)
+    monkeypatch.setattr(
+        bumble_module.AdvertisingData,
+        'INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS',
+        6,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bumble_module.AdvertisingData,
+        'COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS',
+        7,
+        raising=False,
+    )
+    heartbeat_path = tmp_path / 'self_adv.json'
+    ready_path = tmp_path / 'ready.json'
+    monkeypatch.setattr(bumble_module, 'GATT_SELF_ADV_SEEN_FILE', str(heartbeat_path))
+    monkeypatch.setattr(bumble_module, 'GATT_ADVERTISING_READY_FILE', str(ready_path))
+    monkeypatch.setattr(bumble_module, 'last_gatt_self_adv_seen_write', 0.0)
+
+    bumble_module.persist_gatt_advertising_ready('TrailerSync-TR6', 'E8:EA:6A:BD:E5:0E/P')
+
+    assert bumble_module.maybe_mark_gatt_self_advertisement_seen(
+        FakeAdvertisement('00:11:22:33:44:55'),
+        now=1000,
+    ) is False
+    assert not heartbeat_path.exists()
+
+    assert bumble_module.maybe_mark_gatt_self_advertisement_seen(
+        FakeAdvertisement(
+            'E8:EA:6A:BD:E5:0E',
+            values={9: [b'TrailerSync-TR6']},
+        ),
+        now=1001,
+    ) is True
+
+    payload = json.loads(heartbeat_path.read_text(encoding='utf-8'))
+    assert payload['address'] == 'E8:EA:6A:BD:E5:0E'
+    assert payload['target_address'] == 'E8:EA:6A:BD:E5:0E'
+    assert payload['address_match'] is True
+    assert payload['name_match'] is True
