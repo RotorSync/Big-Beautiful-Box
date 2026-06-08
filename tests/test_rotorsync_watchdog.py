@@ -110,17 +110,38 @@ def test_stale_recovery_requires_client_and_self_scan_stale():
     ) is None
 
 
-def test_stale_recovery_requires_zero_known_connections():
+def test_stale_recovery_allows_unknown_connections_without_fresh_controller_proof():
     assert rotorsync_watchdog.stale_gatt_recovery_reason(
         'no GATT client reads for 130s',
         'self-scan has not seen GATT advert for 100s',
         None,
-    ) is None
+        now=500,
+        connection_state_at=None,
+    ) == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
+
+
+def test_stale_recovery_blocks_fresh_connected_controller(monkeypatch):
+    monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_PROOF_STALE_SECONDS', 300)
+
     assert rotorsync_watchdog.stale_gatt_recovery_reason(
         'no GATT client reads for 130s',
         'self-scan has not seen GATT advert for 100s',
         1,
+        now=500,
+        connection_state_at=250,
     ) is None
+
+
+def test_stale_recovery_allows_stale_connected_controller_proof(monkeypatch):
+    monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_PROOF_STALE_SECONDS', 300)
+
+    assert rotorsync_watchdog.stale_gatt_recovery_reason(
+        'no GATT client reads for 130s',
+        'self-scan has not seen GATT advert for 100s',
+        1,
+        now=500,
+        connection_state_at=100,
+    ) == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
 
 
 def test_stale_recovery_combines_stale_signals_with_zero_connections():
@@ -129,3 +150,31 @@ def test_stale_recovery_combines_stale_signals_with_zero_connections():
         'self-scan has not seen GATT advert for 100s',
         0,
     ) == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
+
+
+def test_read_gatt_connection_state_ignores_state_from_previous_advertising_run(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / 'connections.json'
+    path.write_text(
+        json.dumps({'timestamp': 99, 'count': 1, 'reason': 'disconnect'}),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_STATE_FILE', path)
+
+    assert rotorsync_watchdog.read_gatt_connection_state(100) == (None, None)
+
+
+def test_read_gatt_connection_state_returns_fresh_count_and_timestamp(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / 'connections.json'
+    path.write_text(
+        json.dumps({'timestamp': 101.5, 'count': 1, 'reason': 'connect'}),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_STATE_FILE', path)
+
+    assert rotorsync_watchdog.read_gatt_connection_state(100) == (1, 101.5)

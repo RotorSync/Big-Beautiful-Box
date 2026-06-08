@@ -18,6 +18,7 @@ FAIL_THRESHOLD = 2
 GATT_CLIENT_STALE_SECONDS = 120
 GATT_SELF_ADV_STALE_SECONDS = 90
 GATT_SELF_ADV_MISSING_SECONDS = 600
+GATT_CONNECTION_PROOF_STALE_SECONDS = 300
 GATT_STALE_RECOVERY_MIN_INTERVAL_SECONDS = 900
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'
 GATT_DEVICE_PATH_FILE = Path('/home/pi/rotorsync_gatt_device_path')
@@ -114,19 +115,25 @@ def read_json_file(path):
         return None
 
 
-def read_gatt_connection_count(advertising_started_at):
-    """Return active GATT connection count when the state belongs to this run."""
+def read_gatt_connection_state(advertising_started_at):
+    """Return active GATT connection state when it belongs to this run."""
     payload = read_json_file(GATT_CONNECTION_STATE_FILE)
     if not isinstance(payload, dict):
-        return None
+        return None, None
     try:
         timestamp = float(payload.get('timestamp') or 0)
         if advertising_started_at and timestamp < advertising_started_at:
-            return None
-        return max(0, int(payload.get('count') or 0))
+            return None, None
+        return max(0, int(payload.get('count') or 0)), timestamp
     except Exception as e:
         logging.error(f'GATT connection state parse error: {e}')
-        return None
+        return None, None
+
+
+def read_gatt_connection_count(advertising_started_at):
+    """Return active GATT connection count when the state belongs to this run."""
+    count, _timestamp = read_gatt_connection_state(advertising_started_at)
+    return count
 
 
 def stale_gatt_client_reason(now, advertising_started_at, client_seen_at):
@@ -163,13 +170,32 @@ def stale_gatt_self_adv_reason(now, advertising_started_at, self_adv_seen_at):
     return None
 
 
-def stale_gatt_recovery_reason(stale_client_reason, stale_self_adv_reason, connection_count):
+def has_fresh_controller_proof(now, connection_count, connection_state_at):
+    """Return true only when connection bookkeeping is fresh enough to trust."""
+    if connection_count is None or connection_count <= 0:
+        return False
+    if not connection_state_at:
+        return False
+    return now - connection_state_at <= GATT_CONNECTION_PROOF_STALE_SECONDS
+
+
+def stale_gatt_recovery_reason(
+    stale_client_reason,
+    stale_self_adv_reason,
+    connection_count,
+    *,
+    now=None,
+    connection_state_at=None,
+):
     """Combine weak signals into a conservative advertising-wedge recovery reason."""
     if not stale_client_reason or not stale_self_adv_reason:
         return None
-    if connection_count is None:
+    if connection_count and connection_count > 0 and now is None:
         return None
-    if connection_count > 0:
+    if (
+        now is not None
+        and has_fresh_controller_proof(now, connection_count, connection_state_at)
+    ):
         return None
     return f'{stale_client_reason}; {stale_self_adv_reason}'
 
@@ -222,7 +248,9 @@ def main():
             advertising_started_at = read_timestamp_file(GATT_ADVERTISING_READY_FILE)
             client_seen_at = read_timestamp_file(GATT_CLIENT_SEEN_FILE)
             self_adv_seen_at = read_timestamp_file(GATT_SELF_ADV_SEEN_FILE)
-            connection_count = read_gatt_connection_count(advertising_started_at)
+            connection_count, connection_state_at = read_gatt_connection_state(
+                advertising_started_at
+            )
             stale_client_reason = stale_gatt_client_reason(
                 now,
                 advertising_started_at,
@@ -237,6 +265,8 @@ def main():
                 stale_client_reason,
                 stale_self_adv_reason,
                 connection_count,
+                now=now,
+                connection_state_at=connection_state_at,
             )
             if (stale_client_reason or stale_self_adv_reason) and now - last_stale_client_log_at >= 60:
                 logging.info(

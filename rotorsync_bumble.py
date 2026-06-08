@@ -192,7 +192,7 @@ connected_advertising_next_retry_at = 0.0
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
-gatt_self_advertisement_target = {'address': '', 'name': ''}
+gatt_self_advertisement_target = {'address': '', 'name': '', 'short_name': ''}
 last_gatt_self_adv_seen_write = 0.0
 last_gatt_self_adv_debug_log_at = 0.0
 live_telemetry_notify_task = None
@@ -749,9 +749,11 @@ def persist_gatt_advertising_ready(ble_name, address):
     global gatt_self_advertisement_target
 
     normalized_address = _normalize_ble_address(address)
+    short_name = _compute_short_ble_advertising_name(ble_name)
     gatt_self_advertisement_target = {
         'address': normalized_address,
         'name': str(ble_name or ''),
+        'short_name': short_name,
     }
 
     try:
@@ -759,6 +761,7 @@ def persist_gatt_advertising_ready(ble_name, address):
             'timestamp': time.time(),
             'pid': os.getpid(),
             'name': ble_name,
+            'short_name': short_name,
             'address': str(address),
         }
         _atomic_write_text(
@@ -856,10 +859,12 @@ def _advertisement_manufacturer_ids(advertisement):
 def _gatt_self_advertisement_debug_summary(advertisement):
     target_address = _normalize_ble_address(gatt_self_advertisement_target.get('address'))
     target_name = str(gatt_self_advertisement_target.get('name') or '')
+    target_short_name = str(gatt_self_advertisement_target.get('short_name') or '')
     address = _normalize_ble_address(getattr(advertisement, 'address', ''))
     names = _advertisement_local_names(advertisement)
     address_match = bool(target_address and address == target_address)
-    name_match = bool(target_name and target_name in names)
+    target_names = {name for name in (target_name, target_short_name) if name}
+    name_match = any(name in names for name in target_names)
     return {
         'addr': address,
         'names': names[:3],
@@ -891,21 +896,23 @@ def maybe_mark_gatt_self_advertisement_seen(advertisement, now=None):
 
     target_address = _normalize_ble_address(gatt_self_advertisement_target.get('address'))
     target_name = str(gatt_self_advertisement_target.get('name') or '')
-    if not target_address and not target_name:
+    target_short_name = str(gatt_self_advertisement_target.get('short_name') or '')
+    if not target_address and not target_name and not target_short_name:
         return False
 
     now = time.time() if now is None else now
     address = _normalize_ble_address(getattr(advertisement, 'address', ''))
     names = _advertisement_local_names(advertisement)
     address_match = bool(target_address and address == target_address)
-    name_match = bool(target_name and target_name in names)
-    if not address_match and not name_match:
+    target_names = {name for name in (target_name, target_short_name) if name}
+    name_match = any(name in names for name in target_names)
+    service_match = _advertisement_has_service_uuid(advertisement, SERVICE_UUID)
+    if not address_match and not name_match and not service_match:
         return False
 
     if now - last_gatt_self_adv_seen_write < 15:
         return True
 
-    service_match = _advertisement_has_service_uuid(advertisement, SERVICE_UUID)
     try:
         payload = {
             'timestamp': now,
@@ -914,6 +921,7 @@ def maybe_mark_gatt_self_advertisement_seen(advertisement, now=None):
             'target_address': target_address,
             'name': names[0] if names else '',
             'target_name': target_name,
+            'target_short_name': target_short_name,
             'address_match': address_match,
             'name_match': name_match,
             'service_uuid_match': service_match,
@@ -3033,6 +3041,14 @@ def _compute_ble_name(cfg=None):
     return display_name or DEFAULT_FLEET_BLE_NAME
 
 
+def _compute_short_ble_advertising_name(ble_name):
+    """Return a compact trailer identity that fits in legacy BLE advertising."""
+    match = re.fullmatch(r'TrailerSync-(TR\d+)', str(ble_name or '').strip())
+    if match:
+        return match.group(1)
+    return ''
+
+
 def _current_box_config():
     cfg = load_config()
     mode = _normalize_box_mode(cfg.get('box_mode'))
@@ -5090,9 +5106,16 @@ async def main():
     print(f'Device address: {device.public_address}', flush=True)
     print(f'BLE name: {ble_name}', flush=True)
 
-    adv_data = AdvertisingData([
+    short_ble_name = _compute_short_ble_advertising_name(ble_name)
+    advertising_fields = [
         (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes(SERVICE_UUID)),
-    ])
+    ]
+    if short_ble_name:
+        advertising_fields.append(
+            (AdvertisingData.SHORTENED_LOCAL_NAME, short_ble_name.encode('utf-8'))
+        )
+        print(f'BLE short advertising name: {short_ble_name}', flush=True)
+    adv_data = AdvertisingData(advertising_fields)
     scan_response = AdvertisingData([
         (AdvertisingData.COMPLETE_LOCAL_NAME, ble_name.encode('utf-8')),
     ])

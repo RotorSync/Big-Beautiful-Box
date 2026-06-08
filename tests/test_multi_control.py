@@ -736,6 +736,12 @@ def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):
     asyncio.run(run())
 
 
+def test_short_ble_advertising_name_uses_trailer_alias(bumble_module):
+    assert bumble_module._compute_short_ble_advertising_name('TrailerSync-TR6') == 'TR6'
+    assert bumble_module._compute_short_ble_advertising_name('TrailerSync-TR12') == 'TR12'
+    assert bumble_module._compute_short_ble_advertising_name('TrailerSync-Customer') == ''
+
+
 def test_self_scan_heartbeat_records_own_gatt_advertisement(
     bumble_module,
     monkeypatch,
@@ -795,6 +801,37 @@ def test_self_scan_heartbeat_records_own_gatt_advertisement(
     assert payload['target_address'] == 'E8:EA:6A:BD:E5:0E'
     assert payload['address_match'] is True
     assert payload['name_match'] is True
+
+    heartbeat_path.unlink()
+    bumble_module.last_gatt_self_adv_seen_write = 0.0
+    assert bumble_module.maybe_mark_gatt_self_advertisement_seen(
+        FakeAdvertisement(
+            'DC:7A:B1:5E:23:3D',
+            values={8: [b'TR6']},
+        ),
+        now=1017,
+    ) is True
+
+    payload = json.loads(heartbeat_path.read_text(encoding='utf-8'))
+    assert payload['address_match'] is False
+    assert payload['name_match'] is True
+    assert payload['name'] == 'TR6'
+    assert payload['target_short_name'] == 'TR6'
+
+    heartbeat_path.unlink()
+    bumble_module.last_gatt_self_adv_seen_write = 0.0
+    assert bumble_module.maybe_mark_gatt_self_advertisement_seen(
+        FakeAdvertisement(
+            'DC:7A:B1:5E:23:3D',
+            values={6: [bytes(bumble_module.SERVICE_UUID)]},
+        ),
+        now=1033,
+    ) is True
+
+    payload = json.loads(heartbeat_path.read_text(encoding='utf-8'))
+    assert payload['address_match'] is False
+    assert payload['name_match'] is False
+    assert payload['service_uuid_match'] is True
 
 
 def test_self_scan_uses_active_scan_only_when_idle_and_stale(bumble_module):
