@@ -239,6 +239,25 @@ def test_apply_tar_update_rolls_back_runtime_after_copy_failure(bumble_module, m
     assert not (repo / 'install.sh').exists()
 
 
+def test_restore_repo_runtime_ownership_chowns_runtime_paths(bumble_module, monkeypatch, tmp_path):
+    repo = tmp_path / 'repo'
+    write_runtime_tree(repo, 'current')
+    (repo / 'deploy').mkdir()
+    (repo / 'deploy' / 'bbb-logrotate.conf').write_text('rotate\n', encoding='utf-8')
+
+    calls = []
+    monkeypatch.setattr(bumble_module.os, 'chown', lambda path, uid, gid: calls.append((str(path), uid, gid)))
+
+    bumble_module._restore_repo_runtime_ownership(repo)
+
+    uid, gid = repo.stat().st_uid, repo.stat().st_gid
+    assert (str(repo / 'dashboard.py'), uid, gid) in calls
+    assert (str(repo / 'rotorsync_bumble.py'), uid, gid) in calls
+    assert (str(repo / 'src'), uid, gid) in calls
+    assert (str(repo / 'src' / 'marker.py'), uid, gid) in calls
+    assert (str(repo / 'deploy' / 'bbb-logrotate.conf'), uid, gid) in calls
+
+
 def test_apply_failure_marks_update_failed_and_reports_status(bumble_module, monkeypatch, tmp_path):
     updates = tmp_path / 'updates'
     monkeypatch.setattr(bumble_module, 'MAINTENANCE_UPDATE_DIR', str(updates))

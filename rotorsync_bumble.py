@@ -2097,6 +2097,36 @@ def _copy_path(src, dst):
         shutil.copy2(src, dst)
 
 
+def _path_owner(path):
+    stat = Path(path).stat()
+    return stat.st_uid, stat.st_gid
+
+
+def _chown_path_recursive(path, uid, gid):
+    path = Path(path)
+    if not path.exists():
+        return
+    os.chown(path, uid, gid)
+    if path.is_dir():
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                os.chown(Path(root) / name, uid, gid)
+
+
+def _restore_repo_runtime_ownership(repo):
+    try:
+        uid, gid = _path_owner(repo)
+    except OSError as e:
+        print(f'Could not read maintenance repo owner: {e}', flush=True)
+        return
+
+    for name in MAINTENANCE_RUNTIME_PATHS:
+        try:
+            _chown_path_recursive(Path(repo) / name, uid, gid)
+        except OSError as e:
+            print(f'Could not restore ownership for {name}: {e}', flush=True)
+
+
 def _backup_current_runtime(update_id):
     backup_dir = Path(MAINTENANCE_UPDATE_DIR) / update_id / 'backup'
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2190,12 +2220,14 @@ def _apply_tar_update(update_id, artifact_path):
             if src.exists():
                 _copy_path(src, repo / name)
 
+        _restore_repo_runtime_ownership(repo)
         _refresh_opt_runtime(repo)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
         subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
     except Exception as apply_error:
         try:
             _restore_runtime_backup(backup_dir)
+            _restore_repo_runtime_ownership(repo)
         except Exception as rollback_error:
             raise RuntimeError(
                 f'update apply failed and rollback failed: {apply_error}; rollback: {rollback_error}'
