@@ -79,7 +79,10 @@ STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
 GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS = 2.0
 GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS = 1.0
-GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 45.0
+GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 20.0
+GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS = 8.0
+GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS = 30.0
+GATT_CONNECTION_BOOKKEEPING_INTERVAL_SECONDS = 2.0
 GATT_SENSOR_SETTLE_QUIET_SECONDS = 12.0
 GATT_SENSOR_DEFER_LOG_INTERVAL_SECONDS = 10.0
 
@@ -195,12 +198,14 @@ last_calibration_reload_check = 0.0
 connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
 connected_advertising_maintainer_task = None
+gatt_connection_bookkeeping_task = None
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
 gatt_controller_changed_at = 0.0
 last_sensor_defer_log_at = 0.0
 gatt_self_advertisement_target = {'address': '', 'name': '', 'short_name': ''}
+last_gatt_advertising_ready_at = 0.0
 last_gatt_self_adv_seen_write = 0.0
 last_gatt_self_adv_debug_log_at = 0.0
 live_telemetry_notify_task = None
@@ -276,7 +281,7 @@ def prune_inactive_gatt_connections(*, now=None, reason=''):
         return []
 
     now = time.time() if now is None else float(now)
-    removed = []
+    stale_peers = []
     for peer in list(active_gatt_connections):
         metadata = gatt_client_metadata_by_connection.get(peer) or {}
         activity_at = float(
@@ -288,8 +293,15 @@ def prune_inactive_gatt_connections(*, now=None, reason=''):
             continue
         if now - activity_at <= GATT_INACTIVE_CONNECTION_PRUNE_SECONDS:
             continue
+        stale_peers.append((activity_at, str(peer), peer))
+
+    stale_peers.sort()
+    removable_count = max(0, len(active_gatt_connections) - 1)
+    removed = []
+    for _activity_at, _peer_text, peer in stale_peers[:removable_count]:
         active_gatt_connections.discard(peer)
         active_gatt_connection_counts.pop(peer, None)
+        gatt_client_metadata_by_connection.pop(peer, None)
         removed.append(peer)
 
     if removed:
@@ -301,6 +313,51 @@ def prune_inactive_gatt_connections(*, now=None, reason=''):
         persist_gatt_connection_state(reason or 'prune_inactive')
 
     return removed
+
+
+async def disconnect_unknown_gatt_client_if_no_hello(
+    connection,
+    peer,
+    connected_at,
+    *,
+    grace_seconds=GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS,
+):
+    """Disconnect a client that opened GATT but never identified with client_hello."""
+    await asyncio.sleep(grace_seconds)
+
+    metadata = gatt_client_metadata_by_connection.get(peer) or {}
+    if peer not in active_gatt_connections:
+        return False
+    if _normalize_client_role(metadata.get('role')) != 'unknown':
+        return False
+    if float(metadata.get('connected_at') or 0) != float(connected_at or 0):
+        return False
+
+    print(
+        f'Disconnecting unclassified GATT client {peer}: no client_hello '
+        f'within {grace_seconds:.0f}s',
+        flush=True,
+    )
+    try:
+        disconnect = getattr(connection, 'disconnect', None)
+        if disconnect is not None:
+            result = disconnect()
+            if asyncio.iscoroutine(result):
+                await result
+    except Exception as e:
+        print(
+            f'Failed to disconnect unclassified GATT client {peer}: '
+            f'{type(e).__name__}: {e}',
+            flush=True,
+        )
+
+    if peer in active_gatt_connections:
+        active_gatt_connections.discard(peer)
+        active_gatt_connection_counts.pop(peer, None)
+        gatt_client_metadata_by_connection.pop(peer, None)
+        mark_gatt_controller_changed()
+        persist_gatt_connection_state('unknown_client_no_hello')
+    return True
 
 
 def _record_client_hello(connection, command):
@@ -818,8 +875,9 @@ def _normalize_ble_address(address):
 
 def persist_gatt_advertising_ready(ble_name, address):
     """Tell the watchdog that Bumble reached the advertising-ready point."""
-    global gatt_self_advertisement_target
+    global gatt_self_advertisement_target, last_gatt_advertising_ready_at
 
+    now = time.time()
     normalized_address = _normalize_ble_address(address)
     short_name = _compute_short_ble_advertising_name(ble_name)
     gatt_self_advertisement_target = {
@@ -827,10 +885,11 @@ def persist_gatt_advertising_ready(ble_name, address):
         'name': str(ble_name or ''),
         'short_name': short_name,
     }
+    last_gatt_advertising_ready_at = now
 
     try:
         payload = {
-            'timestamp': time.time(),
+            'timestamp': now,
             'pid': os.getpid(),
             'name': ble_name,
             'short_name': short_name,
@@ -1032,6 +1091,70 @@ def _is_gatt_advertising(device):
     return False
 
 
+def connected_self_adv_refresh_due(now=None):
+    if len(active_gatt_connections) != 1:
+        return False
+    if not last_gatt_advertising_ready_at:
+        return False
+
+    now = time.time() if now is None else float(now)
+    advertising_age = now - last_gatt_advertising_ready_at
+    if advertising_age < GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS:
+        return False
+
+    if (
+        last_gatt_self_adv_seen_write
+        and last_gatt_self_adv_seen_write >= last_gatt_advertising_ready_at
+        and now - last_gatt_self_adv_seen_write < GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS
+    ):
+        return False
+
+    return True
+
+
+async def refresh_gatt_advertising_for_discoverability(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    reason,
+):
+    global connected_advertising_next_retry_at, connected_advertising_resume_succeeded
+
+    now = time.time()
+    if connected_advertising_next_retry_at > now:
+        return False
+    if len(active_gatt_connections) != 1:
+        return False
+
+    try:
+        if _is_gatt_advertising(device):
+            await device.stop_advertising()
+            await asyncio.sleep(0.05)
+        if len(active_gatt_connections) != 1:
+            return False
+        await device.start_advertising(
+            advertising_data=advertising_data,
+            scan_response_data=scan_response_data,
+            auto_restart=False,
+        )
+        persist_gatt_advertising_ready(ble_name, device.public_address)
+        connected_advertising_resume_succeeded = True
+        print(f'GATT advertising refreshed: {reason}', flush=True)
+        return True
+    except Exception as e:
+        connected_advertising_next_retry_at = (
+            time.time() + GATT_ADVERTISING_RESUME_FAILURE_BACKOFF_SECONDS
+        )
+        print(
+            'GATT advertising refresh failed; keeping existing connection: '
+            f'{type(e).__name__}: {e}',
+            flush=True,
+        )
+        return False
+
+
 async def restart_gatt_advertising_after_disconnect(
     device,
     advertising_data,
@@ -1148,6 +1271,18 @@ async def maintain_single_client_gatt_advertising(
         await asyncio.sleep(delay)
 
     while len(active_gatt_connections) == 1:
+        if connected_self_adv_refresh_due():
+            await refresh_gatt_advertising_for_discoverability(
+                device,
+                advertising_data,
+                scan_response_data,
+                ble_name,
+                reason='single controller connected but self-scan cannot hear advert',
+            )
+            await asyncio.sleep(GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS)
+            reason = 'single controller still connected'
+            continue
+
         if _is_gatt_advertising(device):
             connected_advertising_resume_succeeded = True
             await asyncio.sleep(GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS)
@@ -1221,6 +1356,74 @@ def schedule_single_client_gatt_advertising_maintenance(
     )
     connected_advertising_maintainer_task.add_done_callback(_handle_background_task_done)
     return connected_advertising_maintainer_task
+
+
+def reconcile_gatt_connection_bookkeeping(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    now=None,
+    reason='bookkeeping_maintainer',
+):
+    """Prune missed disconnects and restore single-client discoverability."""
+    before_count = len(active_gatt_connections)
+    removed = prune_inactive_gatt_connections(now=now, reason=reason)
+    if before_count > 1 and removed and len(active_gatt_connections) == 1:
+        schedule_single_client_gatt_advertising_maintenance(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+            reason='stale controller pruned; anchor remains',
+        )
+    return removed
+
+
+async def maintain_gatt_connection_bookkeeping(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    interval=GATT_CONNECTION_BOOKKEEPING_INTERVAL_SECONDS,
+):
+    """Continuously recover from missed disconnect events while one anchor remains."""
+    while True:
+        reconcile_gatt_connection_bookkeeping(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+        )
+        await asyncio.sleep(interval)
+
+
+def schedule_gatt_connection_bookkeeping_maintenance(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+):
+    global gatt_connection_bookkeeping_task
+
+    if (
+        gatt_connection_bookkeeping_task is not None
+        and not gatt_connection_bookkeeping_task.done()
+    ):
+        return gatt_connection_bookkeeping_task
+
+    gatt_connection_bookkeeping_task = asyncio.create_task(
+        maintain_gatt_connection_bookkeeping(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+        )
+    )
+    gatt_connection_bookkeeping_task.add_done_callback(_handle_background_task_done)
+    return gatt_connection_bookkeeping_task
 
 
 def install_gatt_advertising_resume_hook(
@@ -1303,6 +1506,10 @@ def install_gatt_advertising_resume_hook(
             flush=True,
         )
         persist_gatt_connection_state('connect')
+        hello_deadline_task = asyncio.create_task(
+            disconnect_unknown_gatt_client_if_no_hello(connection, peer, now)
+        )
+        hello_deadline_task.add_done_callback(_handle_background_task_done)
         if hasattr(connection, 'on'):
             connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
         else:
@@ -1340,6 +1547,12 @@ def install_gatt_advertising_resume_hook(
         )
 
     device.on('connection', on_connection)
+    schedule_gatt_connection_bookkeeping_maintenance(
+        device,
+        advertising_data,
+        scan_response_data,
+        ble_name,
+    )
     print('GATT advertising resume-on-connect hook installed', flush=True)
     return True
 
