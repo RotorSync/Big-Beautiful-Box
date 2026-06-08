@@ -15,7 +15,7 @@ def bumble_module(monkeypatch):
     install_bumble_stubs(monkeypatch)
     sys.modules.pop('rotorsync_bumble', None)
     module = importlib.import_module('rotorsync_bumble')
-    monkeypatch.setattr(module, 'mark_gatt_client_seen', lambda: None)
+    monkeypatch.setattr(module, 'mark_gatt_client_seen', lambda *_args, **_kwargs: None)
     yield module
     if module.control_command_worker_task:
         module.control_command_worker_task.cancel()
@@ -613,6 +613,234 @@ def test_gatt_advertising_stays_on_when_one_client_disconnects(
     assert device.stop_calls == []
 
 
+def test_gatt_advertising_maintainer_retries_while_one_client_connected(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS',
+        0.01,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS',
+        0.01,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda name, address: persisted.append((name, address)),
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        device.listeners['connection'](ipad)
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+        device.advertising = False
+        deadline = asyncio.get_running_loop().time() + 1
+        while len(device.start_calls) < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad'}
+    assert len(device.start_calls) == 2
+    assert device.stop_calls == []
+    assert persisted == [
+        ('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF'),
+        ('TrailerSync-TR2', 'AA:BB:CC:DD:EE:FF'),
+    ]
+
+
+def test_gatt_advertising_maintainer_pauses_when_second_client_connects(
+    bumble_module,
+    monkeypatch,
+):
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS',
+        0.01,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS',
+        0.01,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](ipad)
+        deadline = asyncio.get_running_loop().time() + 1
+        while not device.start_calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+        device.listeners['connection'](iphone)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad', 'iphone'}
+    assert len(device.start_calls) == 1
+    assert device.stop_calls == []
+
+
+def test_gatt_advertising_maintainer_does_not_start_if_second_client_arrives_during_delay(
+    bumble_module,
+    monkeypatch,
+):
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS',
+        0.01,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](ipad)
+        device.listeners['connection'](iphone)
+        await asyncio.sleep(bumble_module.GATT_ADVERTISING_RESUME_DELAY_SECONDS + 0.05)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad', 'iphone'}
+    assert device.start_calls == []
+    assert device.stop_calls == []
+
+
+def test_gatt_connected_advertising_helper_only_runs_for_one_client(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    device = FakeGattDevice()
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda name, address: persisted.append((name, address)),
+    )
+
+    async def run():
+        bumble_module.active_gatt_connections.update({'ipad', 'iphone'})
+        result = await bumble_module.keep_gatt_connected_advertising_on(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+            delay=0,
+        )
+        assert result is False
+
+    asyncio.run(run())
+
+    assert device.start_calls == []
+    assert persisted == []
+
+
+def test_find_sensor_peer_by_name_ignores_duplicate_matches(
+    bumble_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        bumble_module.AdvertisingData,
+        'Type',
+        types.SimpleNamespace(COMPLETE_LOCAL_NAME=9, SHORTENED_LOCAL_NAME=8),
+        raising=False,
+    )
+
+    class FakeAdData:
+        def get(self, key):
+            if key == 9:
+                return 'TR2-BMS'
+            return None
+
+    class FakeSensorDevice:
+        def __init__(self):
+            self.scanning = False
+            self.listener = None
+            self.removed = []
+            self.stop_calls = 0
+
+        def on(self, event, callback):
+            assert event == 'advertisement'
+            self.listener = callback
+
+        def remove_listener(self, event, callback):
+            self.removed.append((event, callback))
+
+        async def start_scanning(self, **_kwargs):
+            self.scanning = True
+            advertisement = types.SimpleNamespace(
+                address='AA:BB:CC:DD:EE:FF',
+                data=FakeAdData(),
+            )
+            self.listener(advertisement)
+            self.listener(advertisement)
+
+        async def stop_scanning(self):
+            self.stop_calls += 1
+            self.scanning = False
+
+    async def run():
+        device = FakeSensorDevice()
+        address = await bumble_module.find_sensor_peer_by_name(
+            device,
+            'TR2-BMS',
+            timeout=0.1,
+        )
+        assert address == 'AA:BB:CC:DD:EE:FF'
+        assert device.stop_calls == 1
+        assert len(device.removed) == 1
+
+    asyncio.run(run())
+
+
 def test_gatt_duplicate_connection_event_does_not_restart_advertising(
     bumble_module,
     monkeypatch,
@@ -734,6 +962,127 @@ def test_gatt_advertising_resume_failure_is_nonfatal(bumble_module):
         assert result is False
 
     asyncio.run(run())
+
+
+def test_gatt_connection_state_includes_client_activity_details(
+    bumble_module,
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / 'connections.json'
+    monkeypatch.setattr(bumble_module, 'GATT_CONNECTION_STATE_FILE', str(state_path))
+
+    bumble_module.active_gatt_connections.update({'ipad', 'iphone'})
+    bumble_module.gatt_client_metadata_by_connection.update({
+        'ipad': {
+            'role': 'pilot',
+            'connected_at': 100.0,
+            'last_seen': 200.0,
+        },
+        'iphone': {
+            'role': 'ground_crew',
+            'connected_at': 110.0,
+            'last_seen': 150.0,
+        },
+    })
+
+    bumble_module.persist_gatt_connection_state('test')
+
+    payload = json.loads(state_path.read_text(encoding='utf-8'))
+    assert payload['count'] == 2
+    assert payload['clients'] == ['ipad', 'iphone']
+    assert payload['client_details'] == [
+        {'id': 'ipad', 'role': 'pilot', 'connected_at': 100.0, 'last_seen': 200.0},
+        {
+            'id': 'iphone',
+            'role': 'ground_crew',
+            'connected_at': 110.0,
+            'last_seen': 150.0,
+        },
+    ]
+
+
+def test_inactive_gatt_prune_removes_stale_extra_client(bumble_module, monkeypatch):
+    persisted = []
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda reason='': persisted.append((reason, sorted(bumble_module.active_gatt_connections))),
+    )
+    bumble_module.active_gatt_connections.update({'fresh', 'stale'})
+    bumble_module.active_gatt_connection_counts.update({'fresh': 1, 'stale': 1})
+    bumble_module.gatt_client_metadata_by_connection.update({
+        'fresh': {'role': 'pilot', 'connected_at': 100.0, 'last_seen': 190.0},
+        'stale': {'role': 'ground_crew', 'connected_at': 90.0, 'last_seen': 120.0},
+    })
+
+    removed = bumble_module.prune_inactive_gatt_connections(
+        now=200.0,
+        reason='test_prune',
+    )
+
+    assert removed == ['stale']
+    assert bumble_module.active_gatt_connections == {'fresh'}
+    assert 'stale' not in bumble_module.active_gatt_connection_counts
+    assert persisted == [('test_prune', ['fresh'])]
+
+
+def test_inactive_gatt_prune_keeps_last_client(bumble_module, monkeypatch):
+    persisted = []
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda reason='': persisted.append(reason),
+    )
+    bumble_module.active_gatt_connections.add('stale')
+    bumble_module.active_gatt_connection_counts['stale'] = 1
+    bumble_module.gatt_client_metadata_by_connection['stale'] = {
+        'role': 'pilot',
+        'connected_at': 100.0,
+        'last_seen': 100.0,
+    }
+
+    removed = bumble_module.prune_inactive_gatt_connections(now=200.0)
+
+    assert removed == []
+    assert bumble_module.active_gatt_connections == {'stale'}
+    assert persisted == []
+
+
+def test_gatt_client_seen_recovers_pruned_active_client(bumble_module, monkeypatch, tmp_path):
+    bumble_module = importlib.reload(bumble_module)
+    heartbeat_path = tmp_path / 'seen'
+    state_path = tmp_path / 'connections.json'
+    monkeypatch.setattr(bumble_module, 'GATT_CLIENT_SEEN_FILE', str(heartbeat_path))
+    monkeypatch.setattr(bumble_module, 'GATT_CONNECTION_STATE_FILE', str(state_path))
+    monkeypatch.setattr(bumble_module.time, 'time', lambda: 200.0)
+
+    bumble_module.mark_gatt_client_seen(FakeConnection('iphone'))
+
+    assert bumble_module.active_gatt_connections == {'iphone'}
+    assert bumble_module.active_gatt_connection_counts['iphone'] == 1
+    payload = json.loads(state_path.read_text(encoding='utf-8'))
+    assert payload['clients'] == ['iphone']
+
+
+def test_sensor_defer_reason_waits_after_gatt_controller_change(bumble_module):
+    bumble_module.active_gatt_connections.add('iphone')
+    bumble_module.gatt_controller_changed_at = 100.0
+
+    assert bumble_module.gatt_sensor_defer_reason('mopeka', now=105.0) == (
+        'GATT controller settling (7s)'
+    )
+    assert bumble_module.gatt_sensor_defer_reason('mopeka', now=113.0) == ''
+
+
+def test_sensor_defer_reason_skips_bms_during_multipoint(bumble_module):
+    bumble_module.active_gatt_connections.update({'ipad', 'iphone'})
+    bumble_module.gatt_controller_changed_at = 100.0
+
+    assert bumble_module.gatt_sensor_defer_reason('mopeka', now=120.0) == ''
+    assert bumble_module.gatt_sensor_defer_reason('bms', now=120.0) == (
+        'multipoint GATT active'
+    )
 
 
 def test_short_ble_advertising_name_uses_trailer_alias(bumble_module):

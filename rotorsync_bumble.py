@@ -77,6 +77,11 @@ HISTORY_PRUNE_INTERVAL = 3600.0
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
+GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS = 2.0
+GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS = 1.0
+GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 45.0
+GATT_SENSOR_SETTLE_QUIET_SECONDS = 12.0
+GATT_SENSOR_DEFER_LOG_INTERVAL_SECONDS = 10.0
 
 # Recovery settings
 MAX_CONSECUTIVE_FAILURES = 5
@@ -189,9 +194,12 @@ calibration_mtime_snapshot = None
 last_calibration_reload_check = 0.0
 connected_advertising_resume_succeeded = False
 connected_advertising_next_retry_at = 0.0
+connected_advertising_maintainer_task = None
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
+gatt_controller_changed_at = 0.0
+last_sensor_defer_log_at = 0.0
 gatt_self_advertisement_target = {'address': '', 'name': '', 'short_name': ''}
 last_gatt_self_adv_seen_write = 0.0
 last_gatt_self_adv_debug_log_at = 0.0
@@ -234,8 +242,70 @@ def _pilot_priority_active(state=None):
     )
 
 
+def mark_gatt_controller_changed(now=None):
+    global gatt_controller_changed_at
+    gatt_controller_changed_at = time.time() if now is None else float(now)
+
+
+def gatt_sensor_defer_reason(kind, *, now=None):
+    now = time.time() if now is None else float(now)
+    if active_gatt_connections and gatt_controller_changed_at:
+        age = now - gatt_controller_changed_at
+        if age < GATT_SENSOR_SETTLE_QUIET_SECONDS:
+            remaining = max(1, int(GATT_SENSOR_SETTLE_QUIET_SECONDS - age))
+            return f'GATT controller settling ({remaining}s)'
+    if kind == 'bms' and len(active_gatt_connections) > 1:
+        return 'multipoint GATT active'
+    return ''
+
+
+def maybe_log_sensor_defer(kind, reason, *, now=None):
+    global last_sensor_defer_log_at
+    if not reason:
+        return
+    now = time.time() if now is None else float(now)
+    if now - last_sensor_defer_log_at < GATT_SENSOR_DEFER_LOG_INTERVAL_SECONDS:
+        return
+    last_sensor_defer_log_at = now
+    print(f'Deferred {kind} sensor scan: {reason}', flush=True)
+
+
+def prune_inactive_gatt_connections(*, now=None, reason=''):
+    """Drop stale bookkeeping entries when Bumble misses a disconnect event."""
+    if len(active_gatt_connections) <= 1:
+        return []
+
+    now = time.time() if now is None else float(now)
+    removed = []
+    for peer in list(active_gatt_connections):
+        metadata = gatt_client_metadata_by_connection.get(peer) or {}
+        activity_at = float(
+            metadata.get('last_seen')
+            or metadata.get('connected_at')
+            or 0
+        )
+        if not activity_at:
+            continue
+        if now - activity_at <= GATT_INACTIVE_CONNECTION_PRUNE_SECONDS:
+            continue
+        active_gatt_connections.discard(peer)
+        active_gatt_connection_counts.pop(peer, None)
+        removed.append(peer)
+
+    if removed:
+        print(
+            'Pruned inactive GATT controller(s) from bookkeeping '
+            f'({reason or "stale"}): {", ".join(sorted(removed))}',
+            flush=True,
+        )
+        persist_gatt_connection_state(reason or 'prune_inactive')
+
+    return removed
+
+
 def _record_client_hello(connection, command):
     connection_key = _connection_key(connection)
+    now = time.time()
     role = _normalize_client_role(command.get('role') or command.get('r'))
     previous = gatt_client_metadata_by_connection.get(connection_key, {})
     gatt_client_metadata_by_connection[connection_key] = {
@@ -244,8 +314,10 @@ def _record_client_hello(connection, command):
         'user_id': str(command.get('user_id') or command.get('uid') or '')[:80],
         'name': str(command.get('name') or '')[:80],
         'device': str(command.get('device') or '')[:80],
-        'last_seen': time.time(),
+        'last_seen': now,
+        'connected_at': float(previous.get('connected_at') or now),
     }
+    persist_gatt_connection_state('client_hello')
     print(
         f'Client hello from {connection_key}: role={role}, '
         f'pilot_connected={_is_pilot_connected()}',
@@ -775,11 +847,21 @@ def persist_gatt_advertising_ready(ble_name, address):
 def persist_gatt_connection_state(reason=''):
     """Record active GATT connection count for watchdog decisions."""
     try:
+        client_details = []
+        for peer in sorted(str(peer) for peer in active_gatt_connections):
+            metadata = gatt_client_metadata_by_connection.get(peer) or {}
+            client_details.append({
+                'id': peer,
+                'role': _normalize_client_role(metadata.get('role')),
+                'connected_at': float(metadata.get('connected_at') or 0),
+                'last_seen': float(metadata.get('last_seen') or 0),
+            })
         payload = {
             'timestamp': time.time(),
             'pid': os.getpid(),
             'count': len(active_gatt_connections),
             'clients': sorted(str(peer) for peer in active_gatt_connections),
+            'client_details': client_details,
             'reason': str(reason or '')[:80],
         }
         _atomic_write_text(
@@ -1000,13 +1082,13 @@ async def keep_gatt_connected_advertising_on(
     delay=GATT_ADVERTISING_RESUME_DELAY_SECONDS,
     reason='controller connected',
 ):
-    """Keep advertising active while one or more controllers are connected."""
+    """Try once to keep advertising active while a controller is connected."""
     global connected_advertising_resume_succeeded, connected_advertising_next_retry_at
 
     if delay > 0:
         await asyncio.sleep(delay)
 
-    if not active_gatt_connections:
+    if len(active_gatt_connections) != 1:
         return False
 
     now = time.time()
@@ -1050,6 +1132,49 @@ async def keep_gatt_connected_advertising_on(
         return False
 
 
+async def maintain_single_client_gatt_advertising(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    delay=GATT_ADVERTISING_RESUME_DELAY_SECONDS,
+    reason='controller connected',
+):
+    """Maintain the invariant that one connected controller remains discoverable."""
+    global connected_advertising_resume_succeeded
+
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    while len(active_gatt_connections) == 1:
+        if _is_gatt_advertising(device):
+            connected_advertising_resume_succeeded = True
+            await asyncio.sleep(GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS)
+            reason = 'single controller still connected'
+            continue
+
+        await keep_gatt_connected_advertising_on(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+            delay=0,
+            reason=reason,
+        )
+        if len(active_gatt_connections) != 1:
+            break
+        interval = (
+            GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS
+            if _is_gatt_advertising(device)
+            else GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS
+        )
+        await asyncio.sleep(interval)
+        reason = 'single controller still connected'
+
+    return False
+
+
 async def resume_gatt_advertising_after_connection(
     device,
     advertising_data,
@@ -1067,6 +1192,35 @@ async def resume_gatt_advertising_after_connection(
         delay=delay,
         reason='controller connected',
     )
+
+
+def schedule_single_client_gatt_advertising_maintenance(
+    device,
+    advertising_data,
+    scan_response_data,
+    ble_name,
+    *,
+    reason,
+):
+    global connected_advertising_maintainer_task
+
+    if (
+        connected_advertising_maintainer_task is not None
+        and not connected_advertising_maintainer_task.done()
+    ):
+        return connected_advertising_maintainer_task
+
+    connected_advertising_maintainer_task = asyncio.create_task(
+        maintain_single_client_gatt_advertising(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+            reason=reason,
+        )
+    )
+    connected_advertising_maintainer_task.add_done_callback(_handle_background_task_done)
+    return connected_advertising_maintainer_task
 
 
 def install_gatt_advertising_resume_hook(
@@ -1088,6 +1242,7 @@ def install_gatt_advertising_resume_hook(
         return False
 
     def on_disconnection(peer):
+        mark_gatt_controller_changed()
         current_count = active_gatt_connection_counts.get(peer, 0)
         if current_count > 1:
             active_gatt_connection_counts[peer] = current_count - 1
@@ -1108,16 +1263,13 @@ def install_gatt_advertising_resume_hook(
                 flush=True,
             )
             if len(active_gatt_connections) == 1:
-                task = asyncio.create_task(
-                    keep_gatt_connected_advertising_on(
-                        device,
-                        advertising_data,
-                        scan_response_data,
-                        ble_name,
-                        reason='controller disconnected; anchor remains',
-                    )
+                schedule_single_client_gatt_advertising_maintenance(
+                    device,
+                    advertising_data,
+                    scan_response_data,
+                    ble_name,
+                    reason='controller disconnected; anchor remains',
                 )
-                task.add_done_callback(_handle_background_task_done)
         else:
             task = asyncio.create_task(
                 restart_gatt_advertising_after_disconnect(
@@ -1131,6 +1283,9 @@ def install_gatt_advertising_resume_hook(
 
     def on_connection(connection):
         peer = _connection_key(connection)
+        now = time.time()
+        prune_inactive_gatt_connections(now=now, reason='new_connection')
+        mark_gatt_controller_changed(now)
         previous_count = active_gatt_connection_counts.get(peer, 0)
         active_gatt_connection_counts[peer] = previous_count + 1
         active_gatt_connections.add(peer)
@@ -1138,8 +1293,8 @@ def install_gatt_advertising_resume_hook(
             peer,
             {
                 'role': 'unknown',
-                'connected_at': time.time(),
-                'last_seen': time.time(),
+                'connected_at': now,
+                'last_seen': now,
             },
         )
         print(
@@ -1164,20 +1319,25 @@ def install_gatt_advertising_resume_hook(
             )
             return
         if len(active_gatt_connections) > 1:
+            global connected_advertising_maintainer_task
+            if (
+                connected_advertising_maintainer_task is not None
+                and not connected_advertising_maintainer_task.done()
+            ):
+                connected_advertising_maintainer_task.cancel()
+                connected_advertising_maintainer_task = None
             print(
                 'GATT multipoint connected; advertising state left untouched',
                 flush=True,
             )
             return
-        task = asyncio.create_task(
-            resume_gatt_advertising_after_connection(
-                device,
-                advertising_data,
-                scan_response_data,
-                ble_name,
-            )
+        schedule_single_client_gatt_advertising_maintenance(
+            device,
+            advertising_data,
+            scan_response_data,
+            ble_name,
+            reason='controller connected',
         )
-        task.add_done_callback(_handle_background_task_done)
 
     device.on('connection', on_connection)
     print('GATT advertising resume-on-connect hook installed', flush=True)
@@ -1192,17 +1352,45 @@ def _handle_background_task_done(task):
         print(f'Background task error: {type(exc).__name__}: {exc}', flush=True)
 
 
-def mark_gatt_client_seen():
+def mark_gatt_client_seen(connection=None):
     """Record recent GATT client activity without touching the Bluetooth adapter."""
     global last_gatt_client_seen_write
 
     now = time.time()
+    peer = _connection_key(connection) if connection is not None else None
+    if peer:
+        was_tracked = peer in active_gatt_connections
+        if not was_tracked:
+            active_gatt_connections.add(peer)
+            active_gatt_connection_counts[peer] = max(
+                1,
+                active_gatt_connection_counts.get(peer, 0),
+            )
+            mark_gatt_controller_changed(now)
+        metadata = gatt_client_metadata_by_connection.setdefault(
+            peer,
+            {
+                'role': 'unknown',
+                'connected_at': now,
+                'last_seen': now,
+            },
+        )
+        metadata['last_seen'] = now
+        if not was_tracked:
+            print(
+                f'Recovered active GATT controller from client activity: {peer}',
+                flush=True,
+            )
+        prune_inactive_gatt_connections(now=now, reason='client_seen')
+
     if now - last_gatt_client_seen_write < 5:
         return
 
     try:
         _atomic_write_text(GATT_CLIENT_SEEN_FILE, f'{now:.3f}\n')
         last_gatt_client_seen_write = now
+        if peer:
+            persist_gatt_connection_state('client_seen')
     except Exception as e:
         print(f'Failed to persist GATT client heartbeat: {e}', flush=True)
 
@@ -1233,7 +1421,7 @@ async def monitor_gatt_adapter(expected_adapter, expected_device_path):
 
 def make_read_handler(data_key):
     def read_value(connection):
-        mark_gatt_client_seen()
+        mark_gatt_client_seen(connection)
         data = sensor_data[data_key].copy()
         data.pop('last_update', None)
         value = json.dumps(data)
@@ -1243,7 +1431,7 @@ def make_read_handler(data_key):
 
 def make_history_read_handler():
     def read_value(connection):
-        mark_gatt_client_seen()
+        mark_gatt_client_seen(connection)
         value = dashboard_status['history']
         print(f'ReadValue history: {value[:50]}...', flush=True)
         return bytes(value, 'utf-8')
@@ -1251,7 +1439,7 @@ def make_history_read_handler():
 
 def make_dashboard_read_handler(field):
     def read_value(connection):
-        mark_gatt_client_seen()
+        mark_gatt_client_seen(connection)
         value = str(dashboard_status[field])
         print(f'ReadValue {field}: {value}', flush=True)
         return bytes(value, 'utf-8')
@@ -1260,7 +1448,7 @@ def make_dashboard_read_handler(field):
 
 def make_state_read_handler():
     def read_value(connection):
-        mark_gatt_client_seen()
+        mark_gatt_client_seen(connection)
         value = dashboard_status.get('state_json', '{}')
         print(f'ReadValue state: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
@@ -1270,10 +1458,7 @@ def make_state_read_handler():
 def make_live_telemetry_read_handler():
     def read_value(connection):
         global last_live_telemetry_client_read_at
-        mark_gatt_client_seen()
-        connection_key = _connection_key(connection)
-        if connection_key in gatt_client_metadata_by_connection:
-            gatt_client_metadata_by_connection[connection_key]['last_seen'] = time.time()
+        mark_gatt_client_seen(connection)
         last_live_telemetry_client_read_at = time.time()
         query_live_telemetry()
         value = dashboard_status.get('live_json', '{}')
@@ -1284,7 +1469,7 @@ def make_live_telemetry_read_handler():
 
 def make_config_notify_read_handler():
     def read_value(connection):
-        mark_gatt_client_seen()
+        mark_gatt_client_seen(connection)
         value = _next_config_response_read_value(connection)
         print(f'ReadValue config_notify: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
@@ -1347,7 +1532,7 @@ def start_control_command_worker():
 
 
 def _enqueue_control_actions(connection, source, actions, *, refresh=True):
-    mark_gatt_client_seen()
+    mark_gatt_client_seen(connection)
     if isinstance(actions, str):
         actions = [actions]
     actions = [action for action in actions if action]
@@ -2584,6 +2769,7 @@ def _set_paginated_config_response(items, *, request_id=None, op=None, page_size
 
 def pump_write_handler(connection, value):
     """Handle pump control writes. Write '1' or 'PS' to stop pump."""
+    mark_gatt_client_seen(connection)
     cmd = value.decode('utf-8').strip().upper()
     print(f'Pump write from {_connection_key(connection)}: {cmd}', flush=True)
     if cmd in ['1', 'PS', 'STOP']:
@@ -2593,6 +2779,7 @@ def pump_write_handler(connection, value):
 
 def command_write_handler(connection, value):
     """Handle compact JSON commands from the iOS app."""
+    mark_gatt_client_seen(connection)
     try:
         payload = value.decode('utf-8').strip()
         print(f'Command write from {_connection_key(connection)}: {payload[:200]}', flush=True)
@@ -2736,6 +2923,7 @@ def command_write_handler(connection, value):
 
 def gallons_write_handler(connection, value):
     """Handle gallons adjustment. Write '+1', '-1', '+10', '-10'."""
+    mark_gatt_client_seen(connection)
     cmd = value.decode('utf-8').strip()
     print(f'Gallons write from {_connection_key(connection)}: {cmd}', flush=True)
 
@@ -4025,6 +4213,7 @@ def config_cmd_write_handler(connection, value):
     """Handle config command writes. Supports chunked writes via CHUNK:X/Y:data pattern."""
     global config_cmd_chunks
 
+    mark_gatt_client_seen(connection)
     try:
         data_str = value.decode('utf-8').strip()
         connection_key = _connection_key(connection)
@@ -4070,6 +4259,7 @@ def config_cmd_write_handler(connection, value):
 
 def config_data_read_handler(connection):
     """Read the response from the last config command."""
+    mark_gatt_client_seen(connection)
     value = config_response_by_connection.get(_connection_key(connection), config_response)
     print(f'ReadValue config_data: {value[:80]}...', flush=True)
     return value.encode('utf-8')
@@ -4563,6 +4753,56 @@ async def scan_mopeka(sensor_device, current_time):
 
     return mopeka_found
 
+
+def _advertising_data_name(ad_data):
+    data_type = getattr(AdvertisingData, 'Type', AdvertisingData)
+    for attr in ('COMPLETE_LOCAL_NAME', 'SHORTENED_LOCAL_NAME'):
+        key = getattr(data_type, attr, None)
+        if key is None:
+            key = getattr(AdvertisingData, attr, None)
+        if key is None:
+            continue
+        try:
+            value = ad_data.get(key)
+        except Exception:
+            value = None
+        if value:
+            return value
+    return None
+
+
+async def find_sensor_peer_by_name(sensor_device, name, timeout):
+    """Resolve a sensor name without Bumble's duplicate-advertisement race."""
+    loop = asyncio.get_running_loop()
+    peer_address = loop.create_future()
+
+    def on_advertisement(advertisement):
+        if peer_address.done():
+            return
+        if _advertising_data_name(advertisement.data) == name:
+            peer_address.set_result(advertisement.address)
+
+    was_scanning = getattr(sensor_device, 'scanning', False)
+    sensor_device.on('advertisement', on_advertisement)
+    try:
+        if not was_scanning:
+            await sensor_device.start_scanning(filter_duplicates=True)
+        return await asyncio.wait_for(peer_address, timeout=timeout)
+    finally:
+        try:
+            sensor_device.remove_listener('advertisement', on_advertisement)
+        except Exception:
+            pass
+        if not was_scanning:
+            try:
+                await sensor_device.stop_scanning()
+            except Exception as e:
+                print(
+                    f'Sensor name scan stop warning: {type(e).__name__}: {e!r}',
+                    flush=True,
+                )
+
+
 async def read_bms(sensor_device, current_time):
     response_buffer = bytearray()
     notification_received = asyncio.Event()
@@ -4576,8 +4816,15 @@ async def read_bms(sensor_device, current_time):
         connect_errors = []
         for target in (BMS_MAC, BMS_NAME):
             try:
+                connect_target = target
+                if target == BMS_NAME:
+                    connect_target = await find_sensor_peer_by_name(
+                        sensor_device,
+                        target,
+                        BMS_TIMEOUT,
+                    )
                 connection = await sensor_device.connect(
-                    target,
+                    connect_target,
                     own_address_type=hci.OwnAddressType.RANDOM,
                     timeout=BMS_TIMEOUT,
                 )
@@ -4797,7 +5044,10 @@ async def read_sensors(sensor_device, sensor_adapter):
                 bms_failures = 0
                 last_adapter_reset = current_time
 
-        if mopeka_enabled:
+        mopeka_defer_reason = gatt_sensor_defer_reason('mopeka', now=current_time)
+        if mopeka_enabled and mopeka_defer_reason:
+            maybe_log_sensor_defer('Mopeka', mopeka_defer_reason, now=current_time)
+        elif mopeka_enabled:
             try:
                 mopeka_found = await asyncio.wait_for(
                     scan_mopeka(sensor_device, current_time),
@@ -4840,21 +5090,25 @@ async def read_sensors(sensor_device, sensor_adapter):
 
         sensor_loop_heartbeat = time.time()
         if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
-            try:
-                if await asyncio.wait_for(
-                    read_bms(sensor_device, current_time),
-                    timeout=BMS_READ_OPERATION_TIMEOUT,
-                ):
-                    bms_failures = 0
-                    bms = sensor_data["bms"]
-                    send_dashboard_command(f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
-            except Exception as e:
-                bms_failures += 1
-                print(
-                    f'BMS error ({bms_failures}/{MAX_CONSECUTIVE_FAILURES}) '
-                    f'{type(e).__name__}: {e!r}',
-                    flush=True,
-                )
+            bms_defer_reason = gatt_sensor_defer_reason('bms', now=time.time())
+            if bms_defer_reason:
+                maybe_log_sensor_defer('BMS', bms_defer_reason, now=time.time())
+            else:
+                try:
+                    if await asyncio.wait_for(
+                        read_bms(sensor_device, current_time),
+                        timeout=BMS_READ_OPERATION_TIMEOUT,
+                    ):
+                        bms_failures = 0
+                        bms = sensor_data["bms"]
+                        send_dashboard_command(f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
+                except Exception as e:
+                    bms_failures += 1
+                    print(
+                        f'BMS error ({bms_failures}/{MAX_CONSECUTIVE_FAILURES}) '
+                        f'{type(e).__name__}: {e!r}',
+                        flush=True,
+                    )
 
         await asyncio.sleep(SCAN_INTERVAL)
 
