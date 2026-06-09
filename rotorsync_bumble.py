@@ -16,6 +16,7 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -524,6 +525,16 @@ def _bounded_int(value, minimum, maximum, default=0):
         value = int(value)
     except Exception:
         return default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_float(value, minimum, maximum):
+    try:
+        value = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(value):
+        return None
     return max(minimum, min(maximum, value))
 
 
@@ -3084,6 +3095,22 @@ def command_write_handler(connection, value):
             _enqueue_control_actions(connection, 'command:adjust', allowed[delta])
         else:
             print(f'Command write ignored: invalid delta {delta!r}', flush=True)
+        return
+
+    if command in ('set_target', 'set_requested_gallons', 'set_gallons'):
+        gallons = _bounded_float(
+            cmd.get('gallons', cmd.get('target', cmd.get('value'))),
+            0.0,
+            2140.0,
+        )
+        if gallons is None:
+            print('Command write ignored: invalid requested gallons', flush=True)
+            return
+        _enqueue_control_actions(
+            connection,
+            'command:set_target',
+            f'SET_REQUESTED_GALLONS:{gallons:.3f}',
+        )
         return
 
     if command == 'set_override':

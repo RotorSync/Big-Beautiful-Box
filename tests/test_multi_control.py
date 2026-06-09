@@ -206,6 +206,64 @@ def test_ov_command_forwards_dashboard_ov(bumble_module, monkeypatch):
     assert queries == ['query']
 
 
+def test_set_target_command_forwards_absolute_dashboard_target(bumble_module, monkeypatch):
+    sent = []
+    queries = []
+
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'query_dashboard_status',
+        lambda: queries.append('query') or True,
+    )
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'set_target', 'gallons': 87}).encode('utf-8'),
+    )
+
+    assert sent == ['SET_REQUESTED_GALLONS:87.000']
+    assert queries == ['query']
+
+
+def test_set_target_command_clamps_picker_range(bumble_module, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(bumble_module, 'query_dashboard_status', lambda: True)
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'set_target', 'gallons': 3000}).encode('utf-8'),
+    )
+
+    assert sent == ['SET_REQUESTED_GALLONS:2140.000']
+
+
+def test_set_target_command_ignores_invalid_numbers(bumble_module, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: sent.append(cmd) or 'OK',
+    )
+    monkeypatch.setattr(bumble_module, 'query_dashboard_status', lambda: True)
+
+    bumble_module.command_write_handler(
+        connection('iphone'),
+        json.dumps({'cmd': 'set_target', 'gallons': 'nope'}).encode('utf-8'),
+    )
+
+    assert sent == []
+
+
 @pytest.mark.parametrize(
     ('command', 'expected_action'),
     [
