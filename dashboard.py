@@ -6613,13 +6613,26 @@ def update_relay_slowdown_alarm_flash():
             else config.RELAY_SLOWDOWN_ALARM_COLOR_B
         )
         canvas.delete("relay_slowdown_alarm")
+        width = _canvas_width()
+        height = _canvas_height()
         canvas.create_rectangle(
             0,
             0,
-            _canvas_width(),
-            _canvas_height(),
+            width,
+            height,
             fill=color,
             outline="",
+            tags="relay_slowdown_alarm",
+        )
+        # Keep a steady red caution symbol centered over the flashing background.
+        # The background still flashes black/white to show the pump-stop failure,
+        # but the warning glyph itself does not alternate color.
+        canvas.create_text(
+            width // 2,
+            height // 2,
+            text="⚠",
+            font=("Helvetica", max(160, int(min(width, height) * 0.55)), "bold"),
+            fill="red",
             tags="relay_slowdown_alarm",
         )
         canvas.tag_raise("relay_slowdown_alarm")
