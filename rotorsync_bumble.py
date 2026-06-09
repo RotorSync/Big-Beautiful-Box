@@ -1092,24 +1092,12 @@ def _is_gatt_advertising(device):
 
 
 def connected_self_adv_refresh_due(now=None):
-    if len(active_gatt_connections) != 1:
-        return False
-    if not last_gatt_advertising_ready_at:
-        return False
-
-    now = time.time() if now is None else float(now)
-    advertising_age = now - last_gatt_advertising_ready_at
-    if advertising_age < GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS:
-        return False
-
-    if (
-        last_gatt_self_adv_seen_write
-        and last_gatt_self_adv_seen_write >= last_gatt_advertising_ready_at
-        and now - last_gatt_self_adv_seen_write < GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS
-    ):
-        return False
-
-    return True
+    # Do not tear down/recreate an extended advertising set while a controller is
+    # connected. Some adapters/Bumble versions can lose the advertising handle
+    # during that sequence and then reject subsequent enable/disable commands with
+    # UNKNOWN_ADVERTISING_IDENTIFIER_ERROR. The watchdog remains responsible for
+    # bounded recovery if discoverability is truly wedged.
+    return False
 
 
 async def refresh_gatt_advertising_for_discoverability(

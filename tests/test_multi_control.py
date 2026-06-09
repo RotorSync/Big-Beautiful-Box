@@ -791,13 +791,13 @@ def test_gatt_connected_advertising_helper_only_runs_for_one_client(
     assert persisted == []
 
 
-def test_connected_self_adv_refresh_due_for_one_stale_anchor(bumble_module):
+def test_connected_self_adv_refresh_does_not_run_while_anchor_connected(bumble_module):
     bumble_module.active_gatt_connections.add('ipad')
     bumble_module.last_gatt_advertising_ready_at = 100.0
     bumble_module.last_gatt_self_adv_seen_write = 0.0
 
     assert bumble_module.connected_self_adv_refresh_due(now=129.0) is False
-    assert bumble_module.connected_self_adv_refresh_due(now=131.0) is True
+    assert bumble_module.connected_self_adv_refresh_due(now=300.0) is False
 
 
 def test_connected_self_adv_refresh_waits_for_recent_self_scan(bumble_module):
@@ -806,7 +806,7 @@ def test_connected_self_adv_refresh_waits_for_recent_self_scan(bumble_module):
     bumble_module.last_gatt_self_adv_seen_write = 170.0
 
     assert bumble_module.connected_self_adv_refresh_due(now=199.0) is False
-    assert bumble_module.connected_self_adv_refresh_due(now=201.0) is True
+    assert bumble_module.connected_self_adv_refresh_due(now=300.0) is False
 
 
 def test_connected_self_adv_refresh_does_not_run_for_multipoint(bumble_module):
