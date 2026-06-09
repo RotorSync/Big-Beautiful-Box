@@ -138,7 +138,7 @@ GATT_ADVERTISING_READY_FILE = '/home/pi/rotorsync_gatt_advertising_ready.json'
 GATT_CLIENT_SEEN_FILE = '/home/pi/rotorsync_gatt_client_seen'
 GATT_SELF_ADV_SEEN_FILE = '/home/pi/rotorsync_gatt_self_adv_seen.json'
 GATT_CONNECTION_STATE_FILE = '/home/pi/rotorsync_gatt_connections.json'
-GATT_SELF_ADV_ACTIVE_SCAN_STALE_SECONDS = 120
+GATT_SELF_ADV_ACTIVE_SCAN_STALE_SECONDS = 30
 GATT_SELF_ADV_DEBUG_LOG_SECONDS = 300
 DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
@@ -232,6 +232,31 @@ def _client_role_for_connection_key(connection_key):
     return _normalize_client_role(metadata.get('role'))
 
 
+def _gatt_connection_is_known_closed(connection):
+    """Return true only when Bumble exposes a clearly closed connection state."""
+    if connection is None:
+        return False
+
+    for attr in ('connected', 'is_connected'):
+        value = getattr(connection, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        if isinstance(value, bool):
+            return not value
+
+    state = str(getattr(connection, 'state', '') or '').strip().lower()
+    if state:
+        if any(token in state for token in ('disconnect', 'closed', 'closing')):
+            return True
+        if any(token in state for token in ('connect', 'open', 'active')):
+            return False
+
+    return False
+
+
 def _is_pilot_connected():
     for connection_key in active_gatt_connections:
         if _client_role_for_connection_key(connection_key) == 'pilot':
@@ -285,6 +310,9 @@ def prune_inactive_gatt_connections(*, now=None, reason=''):
     stale_peers = []
     for peer in list(active_gatt_connections):
         metadata = gatt_client_metadata_by_connection.get(peer) or {}
+        if not _gatt_connection_is_known_closed(metadata.get('connection')):
+            if metadata.get('connection') is not None:
+                continue
         activity_at = float(
             metadata.get('last_seen')
             or metadata.get('connected_at')
@@ -1489,9 +1517,9 @@ def install_gatt_advertising_resume_hook(
         prune_inactive_gatt_connections(now=now, reason='new_connection')
         mark_gatt_controller_changed(now)
         previous_count = active_gatt_connection_counts.get(peer, 0)
-        active_gatt_connection_counts[peer] = previous_count + 1
+        active_gatt_connection_counts[peer] = 1
         active_gatt_connections.add(peer)
-        gatt_client_metadata_by_connection.setdefault(
+        metadata = gatt_client_metadata_by_connection.setdefault(
             peer,
             {
                 'role': 'unknown',
@@ -1499,6 +1527,9 @@ def install_gatt_advertising_resume_hook(
                 'last_seen': now,
             },
         )
+        metadata['connected_at'] = now
+        metadata['last_seen'] = now
+        metadata['connection'] = connection
         print(
             f'GATT client connected from {peer}; trying to keep advertising for '
             'additional controllers',
@@ -1588,6 +1619,7 @@ def mark_gatt_client_seen(connection=None):
             },
         )
         metadata['last_seen'] = now
+        metadata['connection'] = connection
         if not was_tracked:
             print(
                 f'Recovered active GATT controller from client activity: {peer}',

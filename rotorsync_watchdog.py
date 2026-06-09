@@ -15,14 +15,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 CHECK_INTERVAL = 10
 FAIL_THRESHOLD = 2
-GATT_CLIENT_STALE_SECONDS = 120
-GATT_SELF_ADV_STALE_SECONDS = 90
-GATT_SELF_ADV_MISSING_SECONDS = 120
-GATT_CONNECTED_DISCOVERABILITY_RECOVERY_ENABLED = False
-GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS = 180
+GATT_CLIENT_STALE_SECONDS = 60
+GATT_SELF_ADV_STALE_SECONDS = 45
+GATT_SELF_ADV_MISSING_SECONDS = 60
+GATT_CONNECTED_DISCOVERABILITY_RECOVERY_ENABLED = True
+GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS = 75
 GATT_CONNECTED_CLIENT_DETAIL_STALE_SECONDS = 45
 GATT_CONNECTION_PROOF_STALE_SECONDS = 300
-GATT_STALE_RECOVERY_MIN_INTERVAL_SECONDS = 900
+GATT_STALE_RECOVERY_MIN_INTERVAL_SECONDS = 180
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'
 GATT_DEVICE_PATH_FILE = Path('/home/pi/rotorsync_gatt_device_path')
 GATT_ADVERTISING_READY_FILE = Path('/home/pi/rotorsync_gatt_advertising_ready.json')
@@ -233,6 +233,8 @@ def stale_gatt_recovery_reason(
     """Combine weak signals into a conservative advertising-wedge recovery reason."""
     if not stale_client_reason or not stale_self_adv_reason:
         return None
+    if has_fresh_controller_proof(now, connection_count, connection_state_at):
+        return None
     return f'{stale_client_reason}; {stale_self_adv_reason}'
 
 
@@ -291,12 +293,9 @@ def connected_discoverability_recovery_reason(
     connection_count = int(connection_payload.get('count') or 0)
     if connection_count <= 0:
         return None
-
-    if connection_count == 1:
-        return (
-            f'{self_adv_reason}; one controller remains connected, '
-            'recovering discoverability'
-        )
+    connection_state_at = float(connection_payload.get('timestamp') or 0)
+    if has_fresh_controller_proof(now, connection_count, connection_state_at):
+        return None
 
     stale_clients = _stale_connected_client_details(now, connection_payload)
     if stale_clients:

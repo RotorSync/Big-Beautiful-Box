@@ -326,7 +326,7 @@ sudo systemctl start ssh
 # available to the system interpreter rather than only the pi user's site-packages.
 # Do not self-upgrade distro-managed pip here. Ubuntu's deb-packaged pip does
 # not carry uninstall metadata that pip expects for a replace-in-place upgrade.
-sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble
+sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229
 
 # Step 3: Install vendored IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."

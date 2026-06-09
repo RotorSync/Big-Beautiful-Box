@@ -25,6 +25,12 @@ def test_write_timestamp_file_round_trips(tmp_path):
     assert rotorsync_watchdog.read_timestamp_file(path) == 123.457
 
 
+def test_connected_discoverability_recovery_defaults_are_field_bounded():
+    assert rotorsync_watchdog.GATT_CONNECTED_DISCOVERABILITY_RECOVERY_ENABLED is True
+    assert rotorsync_watchdog.GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS == 75
+    assert rotorsync_watchdog.GATT_STALE_RECOVERY_MIN_INTERVAL_SECONDS == 180
+
+
 def test_stale_gatt_client_detects_no_reads_after_advertising(monkeypatch):
     monkeypatch.setattr(rotorsync_watchdog, 'GATT_CLIENT_STALE_SECONDS', 120)
 
@@ -164,19 +170,16 @@ def test_stale_recovery_allows_unknown_connections_without_fresh_controller_proo
     ) == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
 
 
-def test_stale_recovery_allows_fresh_connected_controller_when_reads_are_stale(monkeypatch):
+def test_stale_recovery_keeps_fresh_connected_controller_when_reads_are_stale(monkeypatch):
     monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_PROOF_STALE_SECONDS', 300)
 
-    assert (
-        rotorsync_watchdog.stale_gatt_recovery_reason(
-            'no GATT client reads for 130s',
-            'self-scan has not seen GATT advert for 100s',
-            1,
-            now=500,
-            connection_state_at=250,
-        )
-        == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
-    )
+    assert rotorsync_watchdog.stale_gatt_recovery_reason(
+        'no GATT client reads for 130s',
+        'self-scan has not seen GATT advert for 100s',
+        1,
+        now=500,
+        connection_state_at=250,
+    ) is None
 
 
 def test_fresh_controller_proof_still_requires_recent_connection_state(monkeypatch):
@@ -221,7 +224,7 @@ def test_stale_recovery_combines_stale_signals_with_zero_connections():
     ) == 'no GATT client reads for 130s; self-scan has not seen GATT advert for 100s'
 
 
-def test_connected_discoverability_recovers_one_connected_reader(monkeypatch):
+def test_connected_discoverability_keeps_one_fresh_reader_connected(monkeypatch):
     monkeypatch.setattr(
         rotorsync_watchdog,
         'GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS',
@@ -241,10 +244,7 @@ def test_connected_discoverability_recovers_one_connected_reader(monkeypatch):
         },
     )
 
-    assert reason == (
-        'self-scan has not seen GATT advert for 250s; '
-        'one controller remains connected, recovering discoverability'
-    )
+    assert reason is None
 
 
 def test_connected_discoverability_waits_for_longer_connected_grace(monkeypatch):
@@ -295,7 +295,7 @@ def test_connected_discoverability_keeps_two_fresh_readers_connected(monkeypatch
     ) is None
 
 
-def test_connected_discoverability_recovers_stale_extra_connection(monkeypatch):
+def test_connected_discoverability_keeps_stale_extra_connection_with_fresh_state(monkeypatch):
     monkeypatch.setattr(
         rotorsync_watchdog,
         'GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS',
@@ -314,6 +314,36 @@ def test_connected_discoverability_recovers_stale_extra_connection(monkeypatch):
         connection_payload={
             'count': 2,
             'timestamp': 395,
+            'client_details': [
+                {'id': 'ipad', 'last_seen': 395, 'role': 'pilot'},
+                {'id': 'iphone', 'last_seen': 300, 'role': 'pilot'},
+            ],
+        },
+    )
+
+    assert reason is None
+
+
+def test_connected_discoverability_recovers_stale_extra_connection_after_state_stales(monkeypatch):
+    monkeypatch.setattr(
+        rotorsync_watchdog,
+        'GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS',
+        180,
+    )
+    monkeypatch.setattr(
+        rotorsync_watchdog,
+        'GATT_CONNECTED_CLIENT_DETAIL_STALE_SECONDS',
+        45,
+    )
+    monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_PROOF_STALE_SECONDS', 300)
+
+    reason = rotorsync_watchdog.connected_discoverability_recovery_reason(
+        now=400,
+        advertising_started_at=100,
+        self_adv_seen_at=150,
+        connection_payload={
+            'count': 2,
+            'timestamp': 50,
             'client_details': [
                 {'id': 'ipad', 'last_seen': 395, 'role': 'pilot'},
                 {'id': 'iphone', 'last_seen': 300, 'role': 'pilot'},

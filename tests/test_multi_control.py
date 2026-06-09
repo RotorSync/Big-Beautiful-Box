@@ -1004,8 +1004,43 @@ def test_gatt_duplicate_connection_event_does_not_restart_advertising(
     asyncio.run(run())
 
     assert bumble_module.active_gatt_connections == {'ipad', 'iphone'}
-    assert bumble_module.active_gatt_connection_counts['iphone'] == 2
+    assert bumble_module.active_gatt_connection_counts['iphone'] == 1
     assert len(device.start_calls) == 1
+
+
+def test_gatt_duplicate_connection_event_disconnect_does_not_leave_phantom_anchor(
+    bumble_module,
+    monkeypatch,
+):
+    device = FakeGattDevice()
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+
+    async def run():
+        installed = bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR2',
+        )
+        assert installed is True
+
+        ipad = FakeConnection('ipad')
+        iphone = FakeConnection('iphone')
+        device.listeners['connection'](ipad)
+        device.listeners['connection'](iphone)
+        device.listeners['connection'](iphone)
+        iphone.listeners['disconnection']()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == {'ipad'}
+    assert 'iphone' not in bumble_module.active_gatt_connection_counts
 
 
 def test_gatt_advertising_restarts_after_all_clients_disconnect(
@@ -1153,6 +1188,74 @@ def test_inactive_gatt_prune_removes_stale_extra_client(bumble_module, monkeypat
     assert bumble_module.active_gatt_connections == {'fresh'}
     assert 'stale' not in bumble_module.active_gatt_connection_counts
     assert persisted == [('test_prune', ['fresh'])]
+
+
+def test_inactive_gatt_prune_keeps_stale_open_connection_object(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda reason='': persisted.append(reason),
+    )
+    stale_connection = FakeConnection('iphone')
+    stale_connection.connected = True
+    bumble_module.active_gatt_connections.update({'ipad', 'iphone'})
+    bumble_module.active_gatt_connection_counts.update({'ipad': 1, 'iphone': 1})
+    bumble_module.gatt_client_metadata_by_connection.update({
+        'ipad': {'role': 'ground_crew', 'connected_at': 100.0, 'last_seen': 190.0},
+        'iphone': {
+            'role': 'pilot',
+            'connected_at': 90.0,
+            'last_seen': 100.0,
+            'connection': stale_connection,
+        },
+    })
+
+    removed = bumble_module.prune_inactive_gatt_connections(
+        now=200.0,
+        reason='test_open_connection',
+    )
+
+    assert removed == []
+    assert bumble_module.active_gatt_connections == {'ipad', 'iphone'}
+    assert persisted == []
+
+
+def test_inactive_gatt_prune_removes_stale_closed_connection_object(
+    bumble_module,
+    monkeypatch,
+):
+    persisted = []
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda reason='': persisted.append((reason, sorted(bumble_module.active_gatt_connections))),
+    )
+    stale_connection = FakeConnection('iphone')
+    stale_connection.connected = False
+    bumble_module.active_gatt_connections.update({'ipad', 'iphone'})
+    bumble_module.active_gatt_connection_counts.update({'ipad': 1, 'iphone': 1})
+    bumble_module.gatt_client_metadata_by_connection.update({
+        'ipad': {'role': 'ground_crew', 'connected_at': 100.0, 'last_seen': 190.0},
+        'iphone': {
+            'role': 'pilot',
+            'connected_at': 90.0,
+            'last_seen': 100.0,
+            'connection': stale_connection,
+        },
+    })
+
+    removed = bumble_module.prune_inactive_gatt_connections(
+        now=200.0,
+        reason='test_closed_connection',
+    )
+
+    assert removed == ['iphone']
+    assert bumble_module.active_gatt_connections == {'ipad'}
+    assert persisted == [('test_closed_connection', ['ipad'])]
 
 
 def test_inactive_gatt_prune_keeps_one_anchor_when_all_clients_are_stale(
@@ -1445,10 +1548,10 @@ def test_self_scan_uses_active_scan_only_when_idle_and_stale(bumble_module):
     bumble_module.last_gatt_self_adv_seen_write = 100.0
     bumble_module.active_gatt_connections.clear()
 
-    assert bumble_module._should_use_active_self_adv_scan(219.0) is False
-    assert bumble_module._should_use_active_self_adv_scan(221.0) is True
+    assert bumble_module._should_use_active_self_adv_scan(129.0) is False
+    assert bumble_module._should_use_active_self_adv_scan(131.0) is True
 
     bumble_module.active_gatt_connections.add('iphone')
 
-    assert bumble_module._should_use_active_self_adv_scan(221.0) is False
+    assert bumble_module._should_use_active_self_adv_scan(131.0) is False
     assert bumble_module._should_use_active_self_adv_scan(1000.0) is False
