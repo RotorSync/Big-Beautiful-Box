@@ -995,6 +995,10 @@ def update_batch_mix_overlay():
         update_mix_mode_indicator()
         if batch_mix_layout_active:
             deactivate_batch_mix_layout()
+        if current_mode == "mix":
+            place_mix_mode_indicator()
+        elif mode_indicator_label:
+            mode_indicator_label.place_forget()
 
 
 def clear_batch_mix_screen(reason="clear"):
@@ -1490,16 +1494,26 @@ def update_mix_mode_indicator():
     )
 
 def place_mix_mode_indicator():
-    """Place the Mix badge across the left panel up to the divider."""
+    """Place the Mix badge for the active mix screen."""
     if not mode_indicator_label:
         return
 
-    if current_mode != "mix" or batch_mix_data is None:
+    if current_mode != "mix":
         mode_indicator_label.place_forget()
         return
 
     _sync_canvas_geometry()
     update_mix_mode_indicator()
+    if batch_mix_data is None:
+        mode_indicator_label.place(
+            x=10,
+            y=10,
+            width=150,
+            height=58,
+            anchor="nw",
+        )
+        return
+
     mode_indicator_label.place(
         x=0,
         y=0,
