@@ -346,6 +346,10 @@ season_total = 0.0  # Total gallons pumped this season (until manually reset)
 last_reset_date = None  # Track last daily reset date
 last_loads_gallons = []  # Most recent recorded load sizes (newest first)
 pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up confirmation
+current_pilot_name = ""  # Name of the most recent pilot (role='pilot') reported by BLE server
+current_pilot_connected = False  # True while that pilot is actively connected
+last_pilot_disconnect_at = 0.0  # Wall time the pilot last disconnected
+PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS = 99 * 60  # Stop attributing loads after this gap
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
@@ -1911,6 +1915,34 @@ def update_flow_rate_display(flow_rate_gpm):
     last_flow_rate_text = flow_text
     last_flow_rate_mode = current_mode
 
+def update_pilot_status(connected, name):
+    """Update the tracked pilot identity reported by the BLE server."""
+    global current_pilot_name, current_pilot_connected, last_pilot_disconnect_at
+    name = (name or "").strip()
+    if connected:
+        if name:
+            current_pilot_name = name
+        current_pilot_connected = True
+    else:
+        if name:
+            current_pilot_name = name
+        current_pilot_connected = False
+        last_pilot_disconnect_at = time.time()
+
+
+def current_pilot_label():
+    """Pilot name to stamp on a load (see record_pending_fill)."""
+    if current_pilot_connected and current_pilot_name:
+        return current_pilot_name
+    if current_pilot_name and last_pilot_disconnect_at > 0:
+        elapsed = time.time() - last_pilot_disconnect_at
+        if 0 <= elapsed <= PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS:
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            return f"{current_pilot_name}/disconnected-({minutes}m{seconds}sec)"
+    return "Unknown"
+
+
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
@@ -1930,6 +1962,7 @@ def record_pending_fill():
         )
 
         # Write to fill history log
+        pilot_label = current_pilot_label()
         with open(fill_log, 'a') as f:
             f.write(
                 f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
@@ -1937,7 +1970,8 @@ def record_pending_fill():
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
                 f" | {pending_fill_shutoff_type}"
                 f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
-                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}\n"
+                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
+                f" | Pilot: {pilot_label}\n"
             )
 
         # Write detailed calibration record with flow snapshot and threshold in one line
@@ -5499,6 +5533,18 @@ def socket_command_listener():
 
                             elif line == "TU":
                                 root.after(0, lambda: handle_thumbs_up_press("socket TU"))
+
+                            elif line.startswith("PILOT_CONNECTED:"):
+                                pilot_name = line[len("PILOT_CONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_pilot_status(True, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
+
+                            elif line.startswith("PILOT_DISCONNECTED:"):
+                                pilot_name = line[len("PILOT_DISCONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_pilot_status(False, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
 
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))

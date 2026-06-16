@@ -410,6 +410,48 @@ def _record_client_hello(connection, command):
         flush=True,
     )
     query_dashboard_status()
+    push_pilot_status_to_dashboard()
+
+
+_last_pushed_pilot_name = None
+
+
+def _current_pilot_name():
+    """Name of the connected client whose role is 'pilot' (most recent), or None."""
+    best_name = None
+    best_seen = -1.0
+    for connection_key in active_gatt_connections:
+        metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+        if _normalize_client_role(metadata.get('role')) != 'pilot':
+            continue
+        seen = float(metadata.get('last_seen') or 0.0)
+        if seen >= best_seen:
+            best_seen = seen
+            best_name = (metadata.get('name') or '').strip()
+    return best_name or None
+
+
+def _sanitize_pilot_name(name):
+    return (name or '').replace('\n', ' ').replace('\r', ' ').replace('|', '/').strip()[:80]
+
+
+def push_pilot_status_to_dashboard(force=False):
+    """Tell the dashboard which role='pilot' client is connected.
+
+    Emits PILOT_CONNECTED:<name> while a pilot is connected and
+    PILOT_DISCONNECTED:<name> once the last pilot drops, so the dashboard can
+    stamp the pilot onto recorded loads. Only emits on change.
+    """
+    global _last_pushed_pilot_name
+    name = _current_pilot_name()
+    if name == _last_pushed_pilot_name and not force:
+        return
+    previous = _last_pushed_pilot_name
+    _last_pushed_pilot_name = name
+    if name:
+        send_dashboard_command(f'PILOT_CONNECTED:{_sanitize_pilot_name(name)}')
+    elif previous:
+        send_dashboard_command(f'PILOT_DISCONNECTED:{_sanitize_pilot_name(previous)}')
 
 
 def _encode_ble_state_payload(state):
@@ -1487,6 +1529,7 @@ def install_gatt_advertising_resume_hook(
             flush=True,
         )
         persist_gatt_connection_state('disconnect')
+        push_pilot_status_to_dashboard()
         if active_gatt_connections:
             print(
                 'GATT advertising left untouched; anchor controller remains',
@@ -2180,12 +2223,15 @@ async def _read_maintenance_shell_stdout(process, session_id):
                 break
             _emit_maintenance_text(
                 chunk.decode('utf-8', errors='replace'),
-                session_id=session_id,
+                session_id=_maintenance_session_id(session_id),
             )
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        _emit_maintenance_text(f'\n[maintenance stdout error: {e}]\n', session_id=session_id)
+        _emit_maintenance_text(
+            f'\n[maintenance stdout error: {e}]\n',
+            session_id=_maintenance_session_id(session_id),
+        )
     finally:
         if maintenance_shell_process is process:
             await _stop_maintenance_shell('shell exited')
@@ -4734,6 +4780,7 @@ def _fill_history_item_from_line(line):
         'st': shutoff_type,
         'tf': _parse_float_token(_history_named_field(parts, 'Temp')),
         's2t': _parse_float_token(_history_named_field(parts, 'StopToThumb')),
+        'pl': _history_named_field(parts, 'Pilot').strip() or None,
     }
 
 
