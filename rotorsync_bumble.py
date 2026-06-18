@@ -49,7 +49,7 @@ DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 9999
 
 BMS_MAC = 'A5:C2:37:31:77:C0'
-BMS_NAME = 'TR2-BMS'
+BMS_NAME = 'Unconfigured-BMS'
 BMS_NOTIFY_UUID = UUID('0000ff01-0000-1000-8000-00805f9b34fb')
 BMS_WRITE_UUID = UUID('0000ff02-0000-1000-8000-00805f9b34fb')
 MOPEKA1_MAC_SUFFIX = ''  # Set by trailer selection (defa) or restored from mopeka_config.json
@@ -140,7 +140,7 @@ GATT_SELF_ADV_SEEN_FILE = '/home/pi/rotorsync_gatt_self_adv_seen.json'
 GATT_CONNECTION_STATE_FILE = '/home/pi/rotorsync_gatt_connections.json'
 GATT_SELF_ADV_ACTIVE_SCAN_STALE_SECONDS = 30
 GATT_SELF_ADV_DEBUG_LOG_SECONDS = 300
-DEFAULT_FLEET_BLE_NAME = 'TrailerSync-TR2'
+DEFAULT_FLEET_BLE_NAME = 'TrailerSync-Unconfigured'
 DEFAULT_CUSTOMER_BLE_NAME = 'TrailerSync-Customer'
 MAINTENANCE_UPDATE_DIR = '/home/pi/rotorsync-maintenance-updates'
 MAINTENANCE_REPO_DIR = '/home/pi/Big-Beautiful-Box'
@@ -3606,6 +3606,37 @@ def enforce_bumble_only_stack():
 # Trailer Selection Logic
 # =============================================================================
 
+def clear_trailer_assignment():
+    """Clear fleet trailer assignment without overwriting adapter settings."""
+    global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX, BMS_NAME
+    cfg = load_config()
+    cfg.update({
+        'box_mode': _normalize_box_mode(cfg.get('box_mode')),
+        'assigned_trailer': None,
+        'trailer': None,
+        'display_name': '',
+        'front_id': '',
+        'back_id': '',
+    })
+    save_config(cfg)
+    MOPEKA1_MAC_SUFFIX = ''
+    MOPEKA2_MAC_SUFFIX = ''
+    BMS_NAME = _compute_bms_name(cfg)
+    try:
+        mopeka_reload()
+    except Exception as e:
+        print(f'mopeka_converter reload: {e}', flush=True)
+    print('Cleared trailer assignment; box is unconfigured', flush=True)
+    return _current_trailer_info()
+
+
+def _is_clear_trailer_value(value):
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in ('', '0', 'none', 'null', 'unconfigured', 'unassigned', 'clear')
+
+
 def apply_trailer(trailer_num):
     """Look up trailer in sensor CSV, set MOPEKA1/2_MAC_SUFFIX globals,
     save config, reload mopeka_converter, return trailer info dict."""
@@ -4143,9 +4174,22 @@ def _cmd_select_trailer(cmd, *, request_id=None):
         })
         return
 
-    trailer_num = cmd.get('trailer')
+    trailer_value = cmd.get('trailer')
+    if _is_clear_trailer_value(trailer_value):
+        result = clear_trailer_assignment()
+        config_response_pages = []
+        _set_config_response_obj({
+            'ok': True,
+            'op': 'SELECT_TRAILER',
+            'request_id': request_id,
+            'current': result,
+            'box': _current_box_config(),
+        })
+        _schedule_identity_restart('Trailer cleared; restarting to refresh BLE identity')
+        return
+
     try:
-        trailer_num = int(trailer_num)
+        trailer_num = int(trailer_value)
     except Exception:
         config_response_pages = []
         _set_config_response_obj({'ok': False, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'error': 'Invalid trailer'})
@@ -4187,7 +4231,16 @@ def _cmd_list_trailers(*, request_id=None):
         elif tank == 'Back':
             trailers[t]['back'] = mid
 
-    items = sorted(trailers.values(), key=lambda x: x.get('trailer', 0))
+    items = [
+        {
+            'trailer': 0,
+            'man': 'Unconfigured',
+            'label': 'Unconfigured',
+            'display_name': DEFAULT_FLEET_BLE_NAME,
+            'front': '',
+            'back': '',
+        }
+    ] + sorted(trailers.values(), key=lambda x: x.get('trailer', 0))
     _set_paginated_config_response(items, request_id=request_id, op='LIST_TRAILERS')
 
 
@@ -4500,6 +4553,11 @@ def trailer_write_handler(connection, value):
 
     trailer_str = value.decode('utf-8').strip()
     print(f'Trailer write: {trailer_str}', flush=True)
+    if _is_clear_trailer_value(trailer_str):
+        clear_trailer_assignment()
+        _schedule_identity_restart('Trailer write cleared assignment; restarting to refresh BLE identity')
+        return
+
     try:
         trailer_num = int(trailer_str)
     except ValueError:

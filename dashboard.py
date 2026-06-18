@@ -2099,6 +2099,21 @@ def get_ip_address():
     except Exception:
         return "No IP"
 
+def get_assigned_trailer_label():
+    """Return the trailer assignment shown in the system menu."""
+    try:
+        with open(_mopeka_config_path()) as f:
+            cfg = json.load(f)
+        trailer = cfg.get("assigned_trailer", cfg.get("trailer"))
+        if trailer not in (None, ""):
+            return f"TR{trailer}"
+        display_name = str(cfg.get("display_name") or "").strip()
+        if display_name:
+            return display_name
+    except Exception:
+        pass
+    return "Unconfigured"
+
 def get_username():
     """Get the current username"""
     try:
@@ -4329,6 +4344,12 @@ def show_menu():
     ip_label = tk.Label(left_info_frame, text=f"IP: {ip_address}",
                        font=("Helvetica", 22), fg="#00d4ff", bg="#1a1a1a")
     ip_label.pack(anchor='w', pady=2)
+
+    # Assigned trailer
+    assigned_trailer = get_assigned_trailer_label()
+    trailer_label = tk.Label(left_info_frame, text=f"Trailer: {assigned_trailer}",
+                             font=("Helvetica", 22), fg="#00d4ff", bg="#1a1a1a")
+    trailer_label.pack(anchor='w', pady=2)
 
     # Username
     username = get_username()
