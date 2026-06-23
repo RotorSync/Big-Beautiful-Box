@@ -11,6 +11,8 @@ import asyncio
 import base64
 import contextlib
 import csv
+import ctypes
+import ctypes.util
 import hashlib
 import hmac
 import io
@@ -82,6 +84,27 @@ GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS = 2.0
 GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS = 1.0
 GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 20.0
 GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS = 8.0
+# Time-sync from client hello: when the box boots with no network (no NTP since
+# boot), a connecting RotorSync app can hand us the current wall-clock time so
+# the box clock (and load timestamps) are right. An NTP-synced clock (chrony) is
+# always more accurate than an iPad time delivered over BLE, so NTP wins: we only
+# set the clock when the kernel reports it is NOT synchronized. One set per boot.
+TIME_SYNC_LOG_PATH = '/home/pi/time_sync.log'
+# Sanity window for an accepted hello time (epoch seconds, UTC):
+# 2024-01-01 .. 2035-01-01. Anything outside is treated as garbage and ignored.
+TIME_SYNC_MIN_EPOCH = 1704067200.0
+TIME_SYNC_MAX_EPOCH = 2051222400.0
+# If the clock IS already synced and a hello disagrees by more than this, log a
+# discrepancy note (no clock change — NTP stays authoritative).
+TIME_SYNC_DISCREPANCY_LOG_SECONDS = 120.0
+# adjtimex status bit: clock is not synchronized.
+_STA_UNSYNC = 0x0040
+# adjtimex() return code TIME_ERROR (clock not synchronized / unusable).
+_TIME_ERROR = 5
+
+# Set True once we've applied a hello time this boot, so repeated hellos /
+# reconnects don't keep nudging the clock.
+pi_time_set_from_hello = False
 GATT_CONNECTED_SELF_ADV_REFRESH_SECONDS = 30.0
 GATT_CONNECTION_BOOKKEEPING_INTERVAL_SECONDS = 2.0
 GATT_SENSOR_SETTLE_QUIET_SECONDS = 12.0
@@ -389,6 +412,140 @@ async def disconnect_unknown_gatt_client_if_no_hello(
     return True
 
 
+class _Timex(ctypes.Structure):
+    # struct timex (Linux). We only read .status plus the adjtimex() return code,
+    # but the full layout must match so the kernel writes status to the right slot.
+    _fields_ = [
+        ("modes", ctypes.c_int), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+        ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+        ("constant", ctypes.c_long), ("precision", ctypes.c_long), ("tolerance", ctypes.c_long),
+        ("time_sec", ctypes.c_long), ("time_usec", ctypes.c_long), ("tick", ctypes.c_long),
+        ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long), ("shift", ctypes.c_int),
+        ("stabil", ctypes.c_long), ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
+        ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int),
+        ("pad", ctypes.c_int * 11),
+    ]
+
+
+def _kernel_clock_is_synchronized():
+    """True if the kernel considers the system clock NTP-synchronized.
+
+    Daemon-agnostic (works with chrony/ntpd/timesyncd): reads adjtimex(). When no
+    time source has disciplined the clock since boot, adjtimex returns TIME_ERROR
+    and/or STA_UNSYNC is set. On any error reading the status we conservatively
+    report False (treat clock as untrustworthy) so the hello path can help.
+    """
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)
+        t = _Timex()
+        ret = libc.adjtimex(ctypes.byref(t))
+        if ret < 0:
+            return False
+        if ret == _TIME_ERROR:
+            return False
+        return not bool(t.status & _STA_UNSYNC)
+    except Exception as e:
+        print(f'adjtimex check failed ({type(e).__name__}: {e}); '
+              f'treating clock as unsynchronized', flush=True)
+        return False
+
+
+def _log_time_sync(line):
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    try:
+        with open(TIME_SYNC_LOG_PATH, 'a') as f:
+            f.write(f'{stamp} | {line}\n')
+    except Exception as e:
+        print(f'Failed to write time sync log: {type(e).__name__}: {e}', flush=True)
+    print(f'[TIME SYNC] {line}', flush=True)
+
+
+def _client_hello_identity(command, metadata):
+    """Human-readable 'who gave us the time' label for the log."""
+    name = str(command.get('name') or (metadata or {}).get('name') or '').strip()
+    user_id = str(command.get('user_id') or command.get('uid')
+                  or (metadata or {}).get('user_id') or '').strip()
+    device = str(command.get('device') or (metadata or {}).get('device') or '').strip()
+    role = _normalize_client_role(command.get('role') or command.get('r')
+                                  or (metadata or {}).get('role'))
+    who = name or 'Unknown user'
+    extra = []
+    if user_id:
+        extra.append(f'id={user_id}')
+    if device:
+        extra.append(f'device={device}')
+    extra.append(f'role={role}')
+    return f'{who} ({", ".join(extra)})'
+
+
+def _maybe_apply_hello_time(command, metadata):
+    """Set the box clock from a client_hello time, but only when it makes sense.
+
+    Rules (accuracy-first):
+      * No/invalid/out-of-range time in the hello -> do nothing, no error.
+      * Kernel clock already NTP-synchronized -> NTP is authoritative (sub-second,
+        beats an iPad time delivered over BLE); do NOT touch the clock. If the
+        hello disagrees by a large margin, log a discrepancy note for visibility.
+      * Already set from a hello this boot -> do nothing.
+      * Otherwise (clock unsynchronized since boot) -> set the clock and log it.
+    """
+    global pi_time_set_from_hello
+
+    raw = command.get('time')
+    if raw is None:
+        raw = command.get('epoch')
+    if raw is None:
+        return  # App didn't send time; that's fine — ignore silently.
+
+    try:
+        epoch = float(raw)
+    except (TypeError, ValueError):
+        print(f'Ignoring client_hello time: not a number ({raw!r})', flush=True)
+        return
+
+    if not (TIME_SYNC_MIN_EPOCH <= epoch <= TIME_SYNC_MAX_EPOCH):
+        print(f'Ignoring client_hello time {epoch}: outside sane range', flush=True)
+        return
+
+    now = time.time()
+    delta = epoch - now  # how far the hello says we're off (provided - current)
+    who = _client_hello_identity(command, metadata)
+
+    if _kernel_clock_is_synchronized():
+        # NTP wins. Only surface a note if the disagreement is large.
+        if abs(delta) >= TIME_SYNC_DISCREPANCY_LOG_SECONDS:
+            _log_time_sync(
+                f'DISCREPANCY (clock kept, NTP authoritative): app time differs '
+                f'by {delta:+.1f}s. App said '
+                f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))} from {who}'
+            )
+        return
+
+    if pi_time_set_from_hello:
+        return  # one-shot per boot
+
+    # Clock is not synchronized -> trust the app. Apply as close to receipt as
+    # possible to keep it within ~a second.
+    try:
+        time.clock_settime(time.CLOCK_REALTIME, epoch)
+    except PermissionError:
+        _log_time_sync(
+            f'FAILED to set clock (need root/CAP_SYS_TIME). Wanted '
+            f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))} from {who}'
+        )
+        return
+    except Exception as e:
+        _log_time_sync(f'FAILED to set clock ({type(e).__name__}: {e}) from {who}')
+        return
+
+    pi_time_set_from_hello = True
+    new_local = time.strftime('%A %Y-%m-%d %H:%M:%S %Z', time.localtime(epoch))
+    _log_time_sync(
+        f'Clock set to {new_local} (corrected {delta:+.1f}s, source=client_hello) '
+        f'by {who}'
+    )
+
+
 def _record_client_hello(connection, command):
     connection_key = _connection_key(connection)
     now = time.time()
@@ -404,6 +561,12 @@ def _record_client_hello(connection, command):
         'connected_at': float(previous.get('connected_at') or now),
     }
     persist_gatt_connection_state('client_hello')
+    # If this hello carries a wall-clock time and our box clock isn't
+    # NTP-synchronized, use it to set the box clock (see _maybe_apply_hello_time).
+    try:
+        _maybe_apply_hello_time(command, gatt_client_metadata_by_connection.get(connection_key))
+    except Exception as e:
+        print(f'client_hello time handling error: {type(e).__name__}: {e}', flush=True)
     print(
         f'Client hello from {connection_key}: role={role}, '
         f'pilot_connected={_is_pilot_connected()}',
