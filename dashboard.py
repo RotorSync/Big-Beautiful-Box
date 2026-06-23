@@ -296,6 +296,7 @@ last_flow_read_was_fresh = False  # True only when latest IO-Link data changed
 last_fresh_flow_read_time = 0.0  # Monotonic-ish wall time of latest changed IO-Link data
 was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
 new_fill_flow_started_at = None  # Time flow first exceeded the new-fill threshold
+current_fill_flow_started_at = 0.0  # Epoch when flow started for the in-progress fill segment (0 = none)
 new_fill_last_fresh_at = None  # Last fresh high-flow sample during new-fill clearing
 new_fill_cycle_cleared = False  # True after prior fill state is cleared for this cycle
 colors_are_green = False  # Track if colors have been changed to green
@@ -356,6 +357,8 @@ pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
 pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
 pending_fill_temp_f = None  # Flow-meter temperature snapshot associated with the completed fill
 pending_fill_stop_to_thumb_start_at = 0.0  # Relay activation time for the completed fill
+pending_fill_flow_started_at = 0.0  # Epoch when flow first started for the completed fill (0 = unknown)
+pending_fill_flow_ended_at = 0.0  # Epoch when flow stopped for the completed fill (0 = unknown)
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
@@ -620,6 +623,22 @@ def _format_stop_to_thumb_field(seconds):
     if seconds is None:
         return ""
     return f" | StopToThumb: {seconds:.1f} s"
+
+
+def _format_flow_window_fields(start_epoch, end_epoch):
+    """FlowStart/FlowEnd fields for a fill-history line.
+
+    Each is emitted as a 'YYYY-MM-DD HH:MM:SS' local timestamp (matching the
+    leading record timestamp) only when known (epoch > 0). A field is omitted
+    when its time is unknown, so the iPad app can detect missing flow times and
+    flag the record loudly instead of silently inventing one.
+    """
+    fields = ""
+    if start_epoch:
+        fields += " | FlowStart: " + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_epoch))
+    if end_epoch:
+        fields += " | FlowEnd: " + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_epoch))
+    return fields
 
 
 def _history_named_field(parts, name):
@@ -1948,6 +1967,7 @@ def record_pending_fill():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
     global pending_fill_stop_to_thumb_start_at
+    global pending_fill_flow_started_at, pending_fill_flow_ended_at
     global thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
@@ -1971,6 +1991,7 @@ def record_pending_fill():
                 f" | {pending_fill_shutoff_type}"
                 f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
                 f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
+                f"{_format_flow_window_fields(pending_fill_flow_started_at, pending_fill_flow_ended_at)}"
                 f" | Pilot: {pilot_label}\n"
             )
 
@@ -1982,6 +2003,7 @@ def record_pending_fill():
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
                 f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
                 f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
+                f"{_format_flow_window_fields(pending_fill_flow_started_at, pending_fill_flow_ended_at)}"
                 f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
                 f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
                 f" | TriggerActual: {last_trigger_actual:.3f} gal"
@@ -2006,6 +2028,8 @@ def record_pending_fill():
         pending_fill_trigger_threshold = 0.0
         pending_fill_temp_f = None
         pending_fill_stop_to_thumb_start_at = 0.0
+        pending_fill_flow_started_at = 0.0
+        pending_fill_flow_ended_at = 0.0
 
     else:
         print("No pending fill to record")
@@ -7071,6 +7095,7 @@ def update_dashboard():
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
     global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
     global pending_fill_stop_to_thumb_start_at
+    global pending_fill_flow_started_at, pending_fill_flow_ended_at, current_fill_flow_started_at
     global last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
     global last_trigger_predicted_actual, last_trigger_loop_dt_ms
@@ -7172,6 +7197,8 @@ def update_dashboard():
             pending_fill_trigger_threshold = 0.0
             pending_fill_temp_f = None
             pending_fill_stop_to_thumb_start_at = 0.0
+            pending_fill_flow_started_at = 0.0
+            pending_fill_flow_ended_at = 0.0
             last_trigger_flow_gpm = 0.0
             last_trigger_threshold = 0.0
             last_trigger_actual = 0.0
@@ -7196,6 +7223,12 @@ def update_dashboard():
             pending_fill_shutoff_type = shutoff_type
             pending_fill_temp_f = last_flow_meter_temp_f
             pending_fill_stop_to_thumb_start_at = last_pump_stop_relay_activated_at
+            # Flow window for this fill: start was captured at the flow rising edge
+            # (current_fill_flow_started_at); end is now, the moment flow stopped.
+            # If the start was never observed (e.g. box restarted mid-fill) it stays
+            # 0.0 and is omitted from the log so the app flags the record.
+            pending_fill_flow_started_at = current_fill_flow_started_at
+            pending_fill_flow_ended_at = now
 
             print(
                 f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
@@ -7211,6 +7244,9 @@ def update_dashboard():
     if not was_flowing and is_flowing:
         colors_are_green = False
         new_fill_cycle_cleared = False
+        # Flow just started for this fill segment — stamp the start time so it can
+        # be recorded alongside the flow-end time when the fill completes.
+        current_fill_flow_started_at = now
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
@@ -7245,6 +7281,8 @@ def update_dashboard():
         pending_fill_trigger_threshold = 0.0
         pending_fill_temp_f = None
         pending_fill_stop_to_thumb_start_at = 0.0
+        pending_fill_flow_started_at = 0.0
+        pending_fill_flow_ended_at = 0.0
         new_fill_cycle_cleared = True
         print("Sustained high-flow fill cycle detected - thumbs up hidden, pending fill cleared")
 
