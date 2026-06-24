@@ -107,7 +107,8 @@ class RotorLinkServer:
             logger.error("state broadcaster died unexpectedly: %r", exc)
 
     # --- per-connection ----------------------------------------------------
-    async def _handle(self, websocket) -> None:
+    async def _handle(self, websocket, path=None) -> None:
+        # `path` is passed by websockets <11 and omitted by >=11 — accept both.
         state = ClientState(websocket)
         self.clients[websocket] = state
         logger.info("client connected: %s (%d total)", state.peer, len(self.clients))
