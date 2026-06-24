@@ -23,6 +23,7 @@ import websockets
 from . import command_translator, config, protocol, state_encoder
 from .config_handler import ConfigHandler, _current_trailer_info
 from .dashboard_client import DashboardClient
+from .maintenance_handler import MaintenanceHandler, log_maintenance_secret_status
 
 logger = logging.getLogger("rotorlink.server")
 
@@ -58,6 +59,9 @@ class ClientState:
         self.user: Optional[str] = None
         self.device: Optional[dict] = None
         self.hello_received = False
+        # One remote-maintenance PTY shell per connection, lazily created on the
+        # first maintenance frame; torn down on disconnect. None until then.
+        self.maintenance: Optional[MaintenanceHandler] = None
 
     @property
     def peer(self) -> str:
@@ -92,6 +96,9 @@ class RotorLinkServer:
             config.DASHBOARD_HOST,
             config.DASHBOARD_PORT,
         )
+        # Surface where the maintenance relay secret is coming from (or warn if
+        # only the dev default is available) at startup, like bumble does.
+        log_maintenance_secret_status()
         broadcaster = asyncio.create_task(self._state_loop())
         broadcaster.add_done_callback(self._on_broadcaster_done)
         try:
@@ -148,6 +155,14 @@ class RotorLinkServer:
             self.clients.pop(websocket, None)
             if self._controller is state:
                 self._controller = None
+            # Terminate this connection's maintenance shell (if any) so a dropped
+            # WiFi link never strands a live root shell on the Pi.
+            if state.maintenance is not None:
+                try:
+                    await state.maintenance.shutdown()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("maintenance teardown error for %s: %s", state.peer, e)
+                state.maintenance = None
             logger.info(
                 "client disconnected: %s (%d total)", state.peer, len(self.clients)
             )
@@ -172,6 +187,10 @@ class RotorLinkServer:
             await self._handle_command(state, message)
         elif mtype == "config_command":
             await self._handle_config_command(state, message)
+        elif mtype == "maintenance_control":
+            await self._handle_maintenance(state, message, kind="control")
+        elif mtype == "maintenance_input":
+            await self._handle_maintenance(state, message, kind="input")
         elif mtype == "ping":
             await self._send(state, {"type": "pong"})
         else:
@@ -243,6 +262,30 @@ class RotorLinkServer:
         # A write op may have changed the trailer assignment / offsets — re-emit
         # trailer_config to every client if so (cheap; only broadcasts on change).
         await self._broadcast_trailer_config()
+
+    async def _handle_maintenance(self, state: ClientState, message: dict, *, kind: str) -> None:
+        """Relay a signed remote-maintenance frame to this connection's PTY shell.
+
+        The admin server signs control/stdin/resize frames and the iPad forwards
+        the SAME bytes verbatim under `frame` (we verify, never re-sign). Output
+        (PTY bytes full-rate, status events) is pushed back as `maintenance_output`
+        on THIS connection only — the relay is point-to-point per session."""
+        # The signed frame rides under `frame`; tolerate a flat frame too
+        # (everything except the envelope `type`) for forward-compat.
+        frame = message.get("frame")
+        if not isinstance(frame, dict):
+            frame = {k: v for k, v in message.items() if k != "type"}
+
+        if state.maintenance is None:
+            async def _emit(out_frame: dict) -> None:
+                await self._send(state, protocol.build_maintenance_output(out_frame))
+
+            state.maintenance = MaintenanceHandler(_emit, asyncio.get_running_loop())
+
+        if kind == "control":
+            await state.maintenance.handle_control(frame)
+        else:
+            await state.maintenance.handle_input(frame)
 
     def _read_trailer_config(self) -> Optional[dict]:
         """Current trailer config (bumble: _current_trailer_info) read from the

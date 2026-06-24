@@ -17,11 +17,25 @@ Pi  -> app:  hello            device descriptor + capability manifest (on connec
              mopeka           {index, mopeka: {...}}  per-tank level, on change
              trailer_config   {trailer: {...}}  current trailer config, on connect/change
              config_response  {op, request_id, response: {...}}  reply to a config_command
+             maintenance_output  {frame: {...}}  remote-maintenance shell output
+                                 (PTY bytes: frame.enc="pty", frame.text=base64)
              error            {message}
 app -> Pi :  client_hello     {role, user, device}  who is connecting
              command          {id?, command, args?}  a dashboard command line
              config_command   {op, request_id, ...}  a config-system command (whole-JSON reply)
+             maintenance_control {frame: {...}}  signed control frame (open/close/
+                                 resize/heartbeat/stdin), verbatim from the admin server
+             maintenance_input   {frame: {...}}  signed stdin/resize frame (keystrokes)
              ping             ->  pong
+
+Remote maintenance (WiFi PTY relay)
+-----------------------------------
+The admin server HMAC-SHA256-signs control frames and the iPad relays the SAME
+signed bytes here unchanged (we verify, never re-sign). `maintenance_control`
+and `maintenance_input` carry that signed frame under `frame`. Outbound
+`maintenance_output` carries a maintenance-frame dict under `frame`; PTY output
+sets `frame.enc = "pty"` with base64(raw PTY bytes) in `frame.text`, streamed
+full-rate. The BLE leg (rotorsync_bumble.py) is the untouched fallback.
 """
 
 import json
@@ -79,6 +93,17 @@ def build_config_response(op, request_id, response: dict) -> dict:
 
 def build_command_result(cmd_id: Optional[str], ok: bool, response: Any) -> dict:
     return {"type": "command_result", "id": cmd_id, "ok": ok, "response": response}
+
+
+def build_maintenance_output(frame: dict) -> dict:
+    """Wrap a remote-maintenance output frame for the app.
+
+    `frame` is the maintenance-frame dict (type/seq/session_id/text/...). For
+    PTY data it carries enc="pty" with base64(raw PTY bytes) in `text`; for
+    status events (session_opened/closed/error/heartbeat) `enc` is absent and
+    `text` is plain. Full-rate; the app feeds `frame` to its existing MQTT
+    publish path unchanged."""
+    return {"type": "maintenance_output", "frame": frame}
 
 
 def build_error(message: str) -> dict:
