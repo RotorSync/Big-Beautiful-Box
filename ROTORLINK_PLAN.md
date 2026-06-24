@@ -98,6 +98,27 @@ and gates features by `sw`/capability version.
   freely, but **never rename/retype/remove** in place (a rename silently decodes
   to nil); bump the capability `v` for breaking changes.
 
+### Feature placement (WiFi-first, BLE is the core subset)
+The two transports are **not symmetric**, and that's deliberate — you can add
+features to WiFi without touching BLE:
+- **`rotorlink` (WiFi) is a transparent pass-through.** It forwards command
+  frames verbatim and broadcasts the *whole* state/telemetry payload. A new
+  dashboard command verb or a new field in the state blob reaches WiFi clients
+  with **zero `rotorlink` change** — it's just another key the app already gets.
+- **BLE (`bumble`) is an explicit per-characteristic mapping.** Every value is
+  hand-wired to a fixed GATT characteristic + encoder, so a new field/command
+  needs an explicit BLE change **every time**.
+- **Rule — gate features by the capability manifest.** BLE and WiFi may advertise
+  *different* capability sets; the app shows/enables a feature only when the
+  *currently-connected* transport advertises it. So a WiFi-only feature simply
+  doesn't appear on BLE — no BLE code change, nothing breaks.
+- **So:** BLE = the stable **core/safety subset** (fill state, requested gallons,
+  pump-stop) that pilots need over Bluetooth; **WiFi = where richer features
+  land** for ground crew. Keep `rotorlink` a dumb pass-through and iterate there.
+- **App-side enabler:** once features are written against `DeviceTransport`
+  (P2) and gated on `transport.capabilities`, "add to WiFi only" is fully real
+  on the app too — add the UI, gate it, leave `bumble` untouched.
+
 ### Multi-client + control arbitration
 The Pi broadcasts state to all clients. **Many viewers, one controller** — reuse
 `client_hello` role + pilot-priority to grant control to one device; consider
