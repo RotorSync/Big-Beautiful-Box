@@ -20,7 +20,7 @@ from typing import Dict, Optional, Set
 
 import websockets
 
-from . import command_translator, config, protocol
+from . import command_translator, config, protocol, state_encoder
 from .dashboard_client import DashboardClient
 
 logger = logging.getLogger("rotorlink.server")
@@ -218,8 +218,11 @@ class RotorLinkServer:
                     state_json = json.dumps(state, sort_keys=True, separators=(",", ":"))
                     if state_json != self._last_state_json:
                         self._last_state_json = state_json
-                        self._last_state = state
-                        await self._broadcast(protocol.build_state(state))
+                        # Emit the compact BLE-format payload so the app decodes
+                        # WiFi state with its existing RaspberryPiLiveState model.
+                        compact = state_encoder.encode_ble_state(state, len(self.clients))
+                        self._last_state = compact
+                        await self._broadcast(protocol.build_state(compact))
 
                 cycles += 1
                 if cycles >= HISTORY_POLL_CYCLES:
