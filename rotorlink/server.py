@@ -165,6 +165,18 @@ class RotorLinkServer:
         # sends over BLE — translated to a dashboard line. Fallback: a raw
         # dashboard line in `command` (read commands like STATE_JSON, or debug).
         if message.get("cmd"):
+            # The app reuses its BLE {"cmd":"client_hello",...} over WiFi (rich
+            # identity: role/name/user_id). Record it as a client_hello rather
+            # than trying to translate it to a dashboard line.
+            if str(message.get("cmd", "")).strip().lower() in ("client_hello", "hello"):
+                state.role = str(message.get("role", state.role or "viewer"))
+                state.user = message.get("name") or message.get("user") or state.user
+                state.device = message.get("device") or state.device
+                logger.info(
+                    "client_hello (cmd) from %s role=%s user=%s", state.peer, state.role, state.user
+                )
+                await self._send(state, protocol.build_command_result(cmd_id, True, "hello"))
+                return
             command = command_translator.translate(message)
             if command is None:
                 await self._send(
