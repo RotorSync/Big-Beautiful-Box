@@ -1335,19 +1335,29 @@ def set_requested_gallons(value, source):
     return True, requested_gallons
 
 def _format_batch_mix_product_amount(ounces):
-    """Format product volume as gallons and ounces for display."""
+    """Format product volume as gallons and ounces for display.
+
+    The ounces are shown to 2 decimal places for a fractional amount (the iPad
+    sends amounts at full precision; we no longer round to whole ounces) and as
+    a clean integer when whole.
+    """
     try:
-        total_ounces = int(round(max(0.0, float(ounces))))
+        total_ounces = max(0.0, float(ounces))
     except (TypeError, ValueError):
-        total_ounces = 0
+        total_ounces = 0.0
 
-    whole_gallons, ounces = divmod(total_ounces, 128)
+    whole_gallons = int(total_ounces // 128)
+    remainder_ounces = total_ounces % 128
+    if remainder_ounces == int(remainder_ounces):
+        oz_text = str(int(remainder_ounces))
+    else:
+        oz_text = f"{remainder_ounces:.2f}"
 
-    if whole_gallons and ounces:
-        return f"{whole_gallons} gal {ounces} oz"
+    if whole_gallons and remainder_ounces:
+        return f"{whole_gallons} gal {oz_text} oz"
     if whole_gallons:
         return f"{whole_gallons} gal"
-    return f"{ounces} oz"
+    return f"{oz_text} oz"
 
 def _format_batch_mix_product_display_amount(prod):
     """Format the product amount from the BatchMix payload."""
@@ -1361,7 +1371,7 @@ def _format_batch_mix_product_display_amount(prod):
 
     if pounds == int(pounds):
         return f"{int(pounds)} lb"
-    return f"{pounds:.1f} lb"
+    return f"{pounds:.2f} lb"
 
 def _format_batch_mix_product_rate(prod):
     """Format the optional product rate from the BatchMix payload."""
