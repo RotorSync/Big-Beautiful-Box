@@ -12,6 +12,7 @@ import signal
 
 from . import config
 from .mdns import MDNSAdvertiser
+from .network_manager import NetworkManager
 from .server import RotorLinkServer
 
 
@@ -37,6 +38,9 @@ async def _amain() -> None:
     mdns = MDNSAdvertiser()
     await mdns.start()
     server_task = asyncio.create_task(RotorLinkServer().run())
+    # AP/STA field-mode manager (disabled unless ROTORLINK_AP_ENABLED=1 — it only
+    # dry-run-logs its decisions otherwise, so it never disrupts the network).
+    network_task = asyncio.create_task(NetworkManager().run())
     try:
         done, _ = await asyncio.wait(
             {server_task, asyncio.create_task(stop.wait())},
@@ -44,10 +48,12 @@ async def _amain() -> None:
         )
     finally:
         server_task.cancel()
-        try:
-            await server_task
-        except asyncio.CancelledError:
-            pass
+        network_task.cancel()
+        for t in (server_task, network_task):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         await mdns.stop()
 
 
