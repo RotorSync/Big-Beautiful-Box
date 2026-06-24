@@ -20,7 +20,7 @@ from typing import Dict, Optional, Set
 
 import websockets
 
-from . import config, protocol
+from . import command_translator, config, protocol
 from .dashboard_client import DashboardClient
 
 logger = logging.getLogger("rotorlink.server")
@@ -36,7 +36,9 @@ _CONTROL_CAP = next(
     c for c in config.capability_manifest() if c["id"] == "trailer.fill.control"
 )
 READ_COMMANDS: Set[str] = set(_CONTROL_CAP.get("read_commands", []))
-EMERGENCY_COMMANDS: Set[str] = {"STOP"}
+# Dashboard verbs always allowed even under arbitration: STOP (raw) and PS (the
+# pump-stop line the app's {"cmd":"pump_stop"} translates to).
+EMERGENCY_COMMANDS: Set[str] = {"STOP", "PS"}
 
 
 def _command_verb(command: str) -> str:
@@ -158,12 +160,27 @@ class RotorLinkServer:
 
     async def _handle_command(self, state: ClientState, message: dict) -> None:
         cmd_id = message.get("id")
-        command = message.get("command")
-        if not isinstance(command, str) or not command:
-            await self._send(
-                state, protocol.build_command_result(cmd_id, False, "missing command")
-            )
-            return
+
+        # Preferred: an app `{"cmd": ...}` dict — the SAME vocabulary the app
+        # sends over BLE — translated to a dashboard line. Fallback: a raw
+        # dashboard line in `command` (read commands like STATE_JSON, or debug).
+        if message.get("cmd"):
+            command = command_translator.translate(message)
+            if command is None:
+                await self._send(
+                    state,
+                    protocol.build_command_result(cmd_id, False, "unknown or invalid cmd"),
+                )
+                logger.info("ignored unknown cmd %r from %s", message.get("cmd"), state.peer)
+                return
+        else:
+            command = message.get("command")
+            if not isinstance(command, str) or not command:
+                await self._send(
+                    state,
+                    protocol.build_command_result(cmd_id, False, "missing command"),
+                )
+                return
 
         verb = _command_verb(command)
         if not self._authorize(state, verb):
