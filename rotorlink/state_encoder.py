@@ -78,3 +78,41 @@ def encode_live_telemetry(requested, actual, flow, relay_slowdown_alarm=False) -
         "flow": round(float(flow), 2),
         "rs": bool(relay_slowdown_alarm),
     }
+
+
+def encode_bms(state: dict):
+    """Battery payload matching the BLE BMS characteristic ({voltage, soc}), from
+    the dashboard's bms_voltage/bms_soc. Returns None when no BMS is reporting."""
+    voltage = state.get("bms_voltage")
+    soc = state.get("bms_soc")
+    if voltage is None and soc is None:
+        return None
+    out = {}
+    if voltage is not None:
+        out["voltage"] = voltage
+    if soc is not None:
+        out["soc"] = soc
+    return out
+
+
+def encode_mopeka(state: dict, index: int):
+    """Tank payload matching the BLE MOPEKA characteristic, from the dashboard's
+    per-tank gallons + quality. The mm/inch fields the BLE sensor path provides
+    aren't in the dashboard snapshot, so they're omitted (the app decodes them as
+    nil). index 1 = front tank, 2 = back tank. Returns None when mopeka is off."""
+    if not state.get("mopeka_enabled"):
+        return None
+    if index == 1:
+        gallons = state.get("front_tank_gal")
+        quality = state.get("front_tank_quality")
+    else:
+        gallons = state.get("back_tank_gal")
+        quality = state.get("back_tank_quality")
+    if gallons is None and quality is None:
+        return None
+    out = {}
+    if gallons is not None:
+        out["gallons"] = gallons
+    if quality is not None:
+        out["quality"] = quality
+    return out

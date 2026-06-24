@@ -46,6 +46,14 @@ def build_history(history: str) -> dict:
     return {"type": "history", "history": history}
 
 
+def build_bms(bms: dict) -> dict:
+    return {"type": "bms", "bms": bms}
+
+
+def build_mopeka(index: int, mopeka: dict) -> dict:
+    return {"type": "mopeka", "index": index, "mopeka": mopeka}
+
+
 def build_command_result(cmd_id: Optional[str], ok: bool, response: Any) -> dict:
     return {"type": "command_result", "id": cmd_id, "ok": ok, "response": response}
 

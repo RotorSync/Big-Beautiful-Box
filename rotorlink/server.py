@@ -74,6 +74,8 @@ class RotorLinkServer:
         self._last_state: Optional[dict] = None
         self._last_state_json: Optional[str] = None
         self._last_history: Optional[str] = None
+        self._last_bms: Optional[dict] = None
+        self._last_mopeka: Dict[int, Optional[dict]] = {1: None, 2: None}
 
     # --- lifecycle ---------------------------------------------------------
     async def run(self) -> None:
@@ -120,6 +122,11 @@ class RotorLinkServer:
             # until the next change.
             if self._last_state is not None:
                 await self._send(state, protocol.build_state(self._last_state))
+            if self._last_bms is not None:
+                await self._send(state, protocol.build_bms(self._last_bms))
+            for index in (1, 2):
+                if self._last_mopeka[index] is not None:
+                    await self._send(state, protocol.build_mopeka(index, self._last_mopeka[index]))
             async for raw in websocket:
                 await self._on_message(state, raw)
         except websockets.ConnectionClosed:
@@ -235,6 +242,9 @@ class RotorLinkServer:
                         compact = state_encoder.encode_ble_state(state, len(self.clients))
                         self._last_state = compact
                         await self._broadcast(protocol.build_state(compact))
+                        # Battery + tank sensors ride the same dashboard snapshot;
+                        # broadcast each in its BLE-characteristic shape on change.
+                        await self._broadcast_sensors(state)
 
                 cycles += 1
                 if cycles >= HISTORY_POLL_CYCLES:
@@ -248,6 +258,21 @@ class RotorLinkServer:
             except Exception as e:
                 logger.warning("state loop error: %s", e)
             await asyncio.sleep(config.STATE_POLL_INTERVAL)
+
+    async def _broadcast_sensors(self, state: dict) -> None:
+        """Broadcast BMS + per-tank Mopeka payloads (BLE-characteristic shape)
+        when they change, derived from the same dashboard snapshot as state."""
+        bms = state_encoder.encode_bms(state)
+        if bms != self._last_bms:
+            self._last_bms = bms
+            if bms is not None:
+                await self._broadcast(protocol.build_bms(bms))
+        for index in (1, 2):
+            mopeka = state_encoder.encode_mopeka(state, index)
+            if mopeka != self._last_mopeka[index]:
+                self._last_mopeka[index] = mopeka
+                if mopeka is not None:
+                    await self._broadcast(protocol.build_mopeka(index, mopeka))
 
     async def _broadcast(self, message: dict) -> None:
         if not self.clients:
