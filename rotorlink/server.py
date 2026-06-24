@@ -21,6 +21,7 @@ from typing import Dict, Optional, Set
 import websockets
 
 from . import command_translator, config, protocol, state_encoder
+from .config_handler import ConfigHandler, _current_trailer_info
 from .dashboard_client import DashboardClient
 
 logger = logging.getLogger("rotorlink.server")
@@ -69,6 +70,7 @@ class ClientState:
 class RotorLinkServer:
     def __init__(self) -> None:
         self.dashboard = DashboardClient()
+        self.config_handler = ConfigHandler(self.dashboard)
         self.clients: Dict[object, ClientState] = {}
         self._controller: Optional[ClientState] = None
         self._last_state: Optional[dict] = None
@@ -76,6 +78,9 @@ class RotorLinkServer:
         self._last_history: Optional[str] = None
         self._last_bms: Optional[dict] = None
         self._last_mopeka: Dict[int, Optional[dict]] = {1: None, 2: None}
+        # Last broadcast trailer-config JSON, so we only re-emit `trailer_config`
+        # when the trailer assignment / sensor offsets actually change.
+        self._last_trailer_config_json: Optional[str] = None
 
     # --- lifecycle ---------------------------------------------------------
     async def run(self) -> None:
@@ -127,6 +132,12 @@ class RotorLinkServer:
             for index in (1, 2):
                 if self._last_mopeka[index] is not None:
                     await self._send(state, protocol.build_mopeka(index, self._last_mopeka[index]))
+            # Current trailer config (read from the same Pi files bumble uses) so
+            # a fresh client's config UI is populated immediately, not blank
+            # until the next change.
+            trailer = self._read_trailer_config()
+            if trailer is not None:
+                await self._send(state, protocol.build_trailer_config(trailer))
             async for raw in websocket:
                 await self._on_message(state, raw)
         except websockets.ConnectionClosed:
@@ -159,6 +170,8 @@ class RotorLinkServer:
             )
         elif mtype == "command":
             await self._handle_command(state, message)
+        elif mtype == "config_command":
+            await self._handle_config_command(state, message)
         elif mtype == "ping":
             await self._send(state, {"type": "pong"})
         else:
@@ -214,6 +227,42 @@ class RotorLinkServer:
         ok = response is not None
         await self._send(state, protocol.build_command_result(cmd_id, ok, response))
 
+    async def _handle_config_command(self, state: ClientState, message: dict) -> None:
+        """Dispatch an inbound config-system command and reply with the WHOLE
+        response JSON (no chunking, no compression). The app builds a ConfigCommand
+        and the fields ride at the top level of this message; we forward them to
+        the config handler verbatim, then echo op + request_id back so the app can
+        correlate the reply with its pending request."""
+        op = message.get("op", "")
+        request_id = message.get("request_id")
+        # Pass the message straight through (minus the envelope `type`). Unknown
+        # fields are harmless; the handler keys off the ones it knows.
+        cmd = {k: v for k, v in message.items() if k != "type"}
+        response = await self.config_handler.handle(cmd)
+        await self._send(state, protocol.build_config_response(op, request_id, response))
+        # A write op may have changed the trailer assignment / offsets — re-emit
+        # trailer_config to every client if so (cheap; only broadcasts on change).
+        await self._broadcast_trailer_config()
+
+    def _read_trailer_config(self) -> Optional[dict]:
+        """Current trailer config (bumble: _current_trailer_info) read from the
+        shared Pi files. Returns None only if reading raises."""
+        try:
+            return _current_trailer_info()
+        except Exception as e:
+            logger.warning("trailer config read failed: %s", e)
+            return None
+
+    async def _broadcast_trailer_config(self) -> None:
+        """Broadcast trailer_config when the current trailer config changes."""
+        trailer = self._read_trailer_config()
+        if trailer is None:
+            return
+        trailer_json = json.dumps(trailer, sort_keys=True, separators=(",", ":"))
+        if trailer_json != self._last_trailer_config_json:
+            self._last_trailer_config_json = trailer_json
+            await self._broadcast(protocol.build_trailer_config(trailer))
+
     def _authorize(self, state: ClientState, verb: str) -> bool:
         """Read commands and emergencies are always allowed; control commands
         require being the controller when arbitration is on."""
@@ -249,6 +298,10 @@ class RotorLinkServer:
                 cycles += 1
                 if cycles >= HISTORY_POLL_CYCLES:
                     cycles = 0
+                    # Trailer config rarely changes (only on a SELECT_TRAILER /
+                    # config-file edit, by us or bumble) — poll it on the same
+                    # slow cadence as history and broadcast only on change.
+                    await self._broadcast_trailer_config()
                     response = await self.dashboard.send_command("HISTORY")
                     if response and response.startswith("HIST:"):
                         history = response[5:]

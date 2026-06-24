@@ -13,9 +13,14 @@ Pi  -> app:  hello            device descriptor + capability manifest (on connec
              state            {state: {...}}  live dashboard snapshot, on change
              command_result   {id, ok, response}  reply to a command
              history          {history: "..."}  last-fills blob, on change
+             bms              {bms: {...}}  battery snapshot, on change
+             mopeka           {index, mopeka: {...}}  per-tank level, on change
+             trailer_config   {trailer: {...}}  current trailer config, on connect/change
+             config_response  {op, request_id, response: {...}}  reply to a config_command
              error            {message}
 app -> Pi :  client_hello     {role, user, device}  who is connecting
              command          {id?, command, args?}  a dashboard command line
+             config_command   {op, request_id, ...}  a config-system command (whole-JSON reply)
              ping             ->  pong
 """
 
@@ -52,6 +57,24 @@ def build_bms(bms: dict) -> dict:
 
 def build_mopeka(index: int, mopeka: dict) -> dict:
     return {"type": "mopeka", "index": index, "mopeka": mopeka}
+
+
+def build_trailer_config(trailer: dict) -> dict:
+    """The TRAILER characteristic payload (bumble: _current_trailer_info),
+    emitted on connect and on change. Feeds the app's parseTrailerConfig."""
+    return {"type": "trailer_config", "trailer": trailer}
+
+
+def build_config_response(op, request_id, response: dict) -> dict:
+    """Reply to an inbound `config_command`. The WHOLE response JSON rides in
+    `response`; `op`/`request_id` are surfaced at the envelope level too so the
+    app can correlate even before decoding the body."""
+    return {
+        "type": "config_response",
+        "op": op,
+        "request_id": request_id,
+        "response": response,
+    }
 
 
 def build_command_result(cmd_id: Optional[str], ok: bool, response: Any) -> dict:

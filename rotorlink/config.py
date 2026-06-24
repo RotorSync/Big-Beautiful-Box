@@ -45,6 +45,36 @@ STATE_POLL_INTERVAL = _env_float("ROTORLINK_STATE_POLL_INTERVAL", 0.5)
 MDNS_SERVICE_TYPE = "_rotorlink._tcp"
 MDNS_ENABLED = _env("ROTORLINK_MDNS", "1") not in ("0", "false", "no")
 
+# --- Config-system data files ----------------------------------------------
+# These point at the SAME files the BLE server (rotorsync_bumble.py) reads and
+# writes, so RotorLink and bumble stay consistent. The running bumble lives at
+# /opt/rotorsync_bumble.py, so its SCRIPT_DIR is /opt and its mopeka data dir is
+# /opt/mopeka; the history logs live under /home/pi. All overridable via env so
+# the same module works on a box laid out differently.
+MOPEKA_DIR = _env("ROTORLINK_MOPEKA_DIR", "/opt/mopeka")
+SENSOR_CSV_PATH = _env(
+    "ROTORLINK_SENSOR_CSV", os.path.join(MOPEKA_DIR, "mopeka-sensor-details.csv")
+)
+CALIBRATION_CSV_PATH = _env(
+    "ROTORLINK_CALIBRATION_CSV",
+    os.path.join(MOPEKA_DIR, "calibration-points-1070gal-tank.csv"),
+)
+CALIBRATION_PROFILE_DIR = _env(
+    "ROTORLINK_CALIBRATION_DIR", os.path.join(MOPEKA_DIR, "calibrations")
+)
+MOPEKA_CONFIG_PATH = _env(
+    "ROTORLINK_MOPEKA_CONFIG", os.path.join(MOPEKA_DIR, "mopeka_config.json")
+)
+MOPEKA_HISTORY_LOG_PATH = _env(
+    "ROTORLINK_MOPEKA_HISTORY", "/home/pi/mopeka_history.csv"
+)
+FILL_HISTORY_LOG_PATH = _env("ROTORLINK_FILL_HISTORY", "/home/pi/fill_history.log")
+
+# Same retention/window bounds bumble enforces on history queries.
+HISTORY_RETENTION_SECONDS = _env_int(
+    "ROTORLINK_HISTORY_RETENTION_SECONDS", 366 * 24 * 3600
+)
+
 
 def device_descriptor() -> dict:
     """
