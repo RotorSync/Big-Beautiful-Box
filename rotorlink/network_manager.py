@@ -32,38 +32,38 @@ AP_IFACE = os.environ.get("ROTORLINK_AP_IFACE", "wlan0")
 AP_CON_NAME = os.environ.get("ROTORLINK_AP_CON", "rotorlink-ap")
 
 
-def _device_type_name() -> str:
-    """'TrailerSync' / 'HeliSync' from this box's app type — so the iPad can tell
-    a trailer AP from a HeliSync AP by the SSID alone (before mDNS)."""
+# The file bumble persists with the live BLE advertised name (e.g. TrailerSync-TR7).
+BLE_NAME_FILE = os.environ.get(
+    "ROTORLINK_BLE_NAME_FILE", "/home/pi/rotorsync_gatt_advertising_ready.json"
+)
+
+
+def _ble_advertised_name() -> str:
+    """The trailer's BLE advertised name (e.g. 'TrailerSync-TR7'), REUSED as the
+    AP SSID so the iPad keeps ONE device identity for BLE + WiFi (its existing
+    device list). Read from the file bumble persists; fall back to the config
+    display_name, then the hostname."""
+    import json
     try:
-        from . import config
-        app = (config.device_descriptor().get("app") or "").strip().lower()
+        with open(BLE_NAME_FILE) as f:
+            name = str(json.load(f).get("name") or "").strip()
+        if name:
+            return name
     except Exception:
-        app = ""
-    return {"trailersync": "TrailerSync", "helisync": "HeliSync"}.get(app, "RotorLink")
-
-
-def _assigned_identity() -> str:
-    """The box's assigned id: the trailer number (from the same config file the
-    config system reads) for a trailer, else the hostname."""
+        pass
     try:
-        import json
         from . import config
         with open(config.MOPEKA_CONFIG_PATH) as f:
-            cfg = json.load(f)
-        n = cfg.get("assigned_trailer", cfg.get("trailer"))
-        if n not in (None, ""):
-            return str(n)
+            dn = str(json.load(f).get("display_name") or "").strip()
+        if dn:
+            return dn
     except Exception:
         pass
     return socket.gethostname()
 
 
-# AP SSID = "<DeviceType>-<id>", e.g. "TrailerSync-7" / "HeliSync-3", so an iPad
-# joins only the right TYPE (pilot↔HeliSync, crew↔TrailerSync) and the right box.
-AP_SSID = os.environ.get("ROTORLINK_AP_SSID") or (
-    "%s-%s" % (_device_type_name(), _assigned_identity())
-)
+# AP SSID == the trailer's BLE name (one identity for BLE + WiFi); SSIDs cap at 32.
+AP_SSID = (os.environ.get("ROTORLINK_AP_SSID") or _ble_advertised_name())[:32]
 AP_BAND = os.environ.get("ROTORLINK_AP_BAND", "bg")  # 2.4GHz for range
 # WPA2 PSK: env, or a file the deploy drops in. Must be 8..63 chars to be used.
 AP_PSK = os.environ.get("ROTORLINK_AP_PSK", "")
