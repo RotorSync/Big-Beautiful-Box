@@ -30,7 +30,40 @@ logger = logging.getLogger("rotorlink.network")
 AP_ENABLED = os.environ.get("ROTORLINK_AP_ENABLED", "0") in ("1", "true", "yes")
 AP_IFACE = os.environ.get("ROTORLINK_AP_IFACE", "wlan0")
 AP_CON_NAME = os.environ.get("ROTORLINK_AP_CON", "rotorlink-ap")
-AP_SSID = os.environ.get("ROTORLINK_AP_SSID", "RotorLink-%s" % socket.gethostname())
+
+
+def _device_type_name() -> str:
+    """'TrailerSync' / 'HeliSync' from this box's app type — so the iPad can tell
+    a trailer AP from a HeliSync AP by the SSID alone (before mDNS)."""
+    try:
+        from . import config
+        app = (config.device_descriptor().get("app") or "").strip().lower()
+    except Exception:
+        app = ""
+    return {"trailersync": "TrailerSync", "helisync": "HeliSync"}.get(app, "RotorLink")
+
+
+def _assigned_identity() -> str:
+    """The box's assigned id: the trailer number (from the same config file the
+    config system reads) for a trailer, else the hostname."""
+    try:
+        import json
+        from . import config
+        with open(config.MOPEKA_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        n = cfg.get("assigned_trailer", cfg.get("trailer"))
+        if n not in (None, ""):
+            return str(n)
+    except Exception:
+        pass
+    return socket.gethostname()
+
+
+# AP SSID = "<DeviceType>-<id>", e.g. "TrailerSync-7" / "HeliSync-3", so an iPad
+# joins only the right TYPE (pilot↔HeliSync, crew↔TrailerSync) and the right box.
+AP_SSID = os.environ.get("ROTORLINK_AP_SSID") or (
+    "%s-%s" % (_device_type_name(), _assigned_identity())
+)
 AP_BAND = os.environ.get("ROTORLINK_AP_BAND", "bg")  # 2.4GHz for range
 # WPA2 PSK: env, or a file the deploy drops in. Must be 8..63 chars to be used.
 AP_PSK = os.environ.get("ROTORLINK_AP_PSK", "")
