@@ -63,11 +63,11 @@ class TestFlowThreshold:
     
     def test_calibration_points(self):
         """Test against known calibration data points."""
-        # From config: 22 GPM → 0.45 gal coast, 70 GPM → 1.92 gal coast
+        # From config: 22 GPM -> ~0.63 gal coast, 70 GPM -> ~1.98 gal coast
         # 22 GPM = 22 / 15.85 = 1.388 L/s
         threshold_22gpm = calculate_trigger_threshold(22 / config.LITERS_PER_SEC_TO_GPM)
-        # Should be close to 0.45 (within calibration tolerance)
-        assert 0.3 < threshold_22gpm < 0.6
+        # Should be close to the fitted factory curve (within calibration tolerance)
+        assert 0.5 < threshold_22gpm < 0.8
         
         # 70 GPM = 70 / 15.85 = 4.416 L/s
         threshold_70gpm = calculate_trigger_threshold(70 / config.LITERS_PER_SEC_TO_GPM)
@@ -77,6 +77,13 @@ class TestFlowThreshold:
 
 class TestFlowDetection:
     """Tests for flow state detection."""
+
+    def test_stopped_threshold_stays_near_zero(self):
+        assert config.FLOW_STOPPED_THRESHOLD < (1 / config.LITERS_PER_SEC_TO_GPM)
+
+    def test_new_fill_clear_threshold_is_10gpm_and_debounced(self):
+        assert abs(config.NEW_FILL_CYCLE_THRESHOLD * config.LITERS_PER_SEC_TO_GPM - 10) < 0.001
+        assert config.NEW_FILL_CYCLE_HOLD_SECONDS == 3.0
     
     def test_flow_stopped_at_zero(self):
         assert is_flow_stopped(0) is True

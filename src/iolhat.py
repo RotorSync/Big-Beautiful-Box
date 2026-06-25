@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 TCP_IP = '127.0.0.1'
 BUFFER_SIZE = 1024
+SOCKET_TIMEOUT_SECONDS = 2.0
 
 # TCP ports for IOL master (both set to 12011 for single-master setup)
 TCP_PORT1 = 12011
@@ -30,6 +31,13 @@ CMD_FAIL = 0
 
 # Logging verbosity
 verbose = False
+
+
+def _open_socket() -> socket.socket:
+    """Return an IOL-HAT TCP socket that cannot block the safety loop indefinitely."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(SOCKET_TIMEOUT_SECONDS)
+    return s
 
 
 def set_verbose(enabled: bool) -> None:
@@ -74,7 +82,7 @@ def power(port: int, status: int) -> int:
     tcp_port, adj_port = _get_tcp_port(port)
     message = struct.pack("!BBB", 1, adj_port, status)
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
         s.send(message)
@@ -131,7 +139,7 @@ def pd(port: int, len_out: int, len_in: int, pd_out: bytes) -> bytes:
     if verbose:
         logger.debug(f"PD: sending {out_buffer.hex()}")
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
         s.send(out_buffer)
@@ -182,7 +190,7 @@ def led(port: int, status: int) -> int:
     tcp_port, adj_port = _get_tcp_port(port)
     message = struct.pack("!BBB", 2, adj_port, status)
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
         s.send(message)
@@ -236,7 +244,7 @@ def read(port: int, index: int, subindex: int, length: int) -> bytes:
     tcp_port, adj_port = _get_tcp_port(port)
     message = struct.pack("!BBHBB", 4, adj_port, index, subindex, length)
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
         s.send(message)
@@ -300,7 +308,7 @@ def write(port: int, index: int, subindex: int, length: int, write_data: bytes) 
         5, adj_port, index, subindex, length, write_data
     )
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
 
@@ -402,7 +410,7 @@ def read_status(port: int) -> IolStatus:
     tcp_port, adj_port = _get_tcp_port(port)
     message = struct.pack("!BB", 6, adj_port)
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _open_socket()
     try:
         s.connect((TCP_IP, tcp_port))
         s.send(message)

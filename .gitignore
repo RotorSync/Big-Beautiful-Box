@@ -1,4 +1,8 @@
 __pycache__/
+.venv/
+.pytest_cache/
 *.pyc
 *.log
 .lgd-*
+.sim-data/
+dist/

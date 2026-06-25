@@ -59,7 +59,7 @@ Check for v1.2 branch or updated documentation before use with newer hardware.
 | Raspberry Pi 5 | Main controller (Ubuntu) |
 | IOL HAT | IO-Link master for flow meter (SPI) |
 | Picomag Flow Meter | IO-Link industrial flow sensor |
-| 7" HDMI Display | 1024x600 touchscreen |
+| HDMI Display | 1920x1080 @ 30 Hz field dashboard |
 | Switch Box | Pico-based pilot remote control |
 | BLE Adapters | CSR (GATT server) + Realtek (sensors) |
 
@@ -82,6 +82,7 @@ The Pico-based Switch Box connects via RJ45 and sends serial commands:
 | Encoder + modifier | `+10` / `-10` | Coarse adjustment |
 | Pump Stop button | `PS` | Emergency pump stop |
 | Override button | `OV` | Toggle auto-alert |
+| Reset button | `RST` / `RESET` | Reset flow totalizer |
 | Fill/Mix toggle | `FILL` / `MIX` | Switch modes |
 | Thumbs Up button | `TU` | Pilot acknowledgment |
 
@@ -107,6 +108,53 @@ The system runs a BLE GATT server using [Bumble](https://github.com/google/bumbl
 | `def9` | BatchMix | WRITE | JSON batch mix data from iPad |
 
 ### BatchMix Format
+
+Liquid product amounts are sent in ounces only. Each liquid product entry should
+include `amount_oz`; do not send jug count or jug-size fields for liquid
+products. Dry products use `amount_lb`. Product rate fields are optional, but
+when sent they must include both `rate_per_acre` and `rate_unit`. Liquid rates
+use `oz/ac`; dry rates use `lb/ac`.
+
+Product row colors are sent in the parallel `field_colors` list, using either
+solid `#RRGGBB` strings or two-color striped `#RRGGBB/#RRGGBB` strings. The
+first color entry is shown as the upper-left Mix badge color. If no color is
+present, the badge shows `NO COLOR MIX` with white/gray striping.
+
+When this BatchMix screen is active, knob adjustments change `water_needed`.
+The box scales `total_acres`, product amounts, and `total_liquid` from that
+gallon change. If a product includes rate fields, its amount is recalculated
+from `rate_per_acre * total_acres`; otherwise the older proportional amount
+scaling is used. `gallons_per_acre` remains unchanged, and `water_needed`
+remains the pump target.
+
+```json
+{
+  "product_count": 2,
+  "products": [
+    {
+      "name": "Miravis Ace",
+      "amount_oz": 265,
+      "rate_per_acre": 26.5,
+      "rate_unit": "oz/ac"
+    },
+    {
+      "name": "AMS",
+      "amount_lb": 20,
+      "rate_per_acre": 2,
+      "rate_unit": "lb/ac"
+    }
+  ],
+  "field_colors": [
+    {"color": "#00FF00"},
+    {"color": "#FF0000/#0000FF"}
+  ],
+  "water_needed": 36.0,
+  "total_acres": 19.3,
+  "gallons_per_acre": 2.0,
+  "total_liquid": 38.7,
+  "timestamp": "2026-05-28T21:08:00Z"
+}
+```
 
 For large payloads, BatchMix supports chunked writes:
 ```
@@ -142,6 +190,37 @@ The BLE server also reads nearby sensors via a second Bluetooth adapter:
 | `rotorsync.service` | BLE GATT server |
 | `rotorsync_watchdog.service` | BLE server monitor |
 
+### Local GUI Simulator
+
+For GUI work away from the trailer/Pi hardware, run:
+
+```bash
+./run_tk_sim_mac.sh
+```
+
+Simulator mode opens the real native Tkinter dashboard plus a control panel for
+flow rate, switch-box commands, IO-Link disconnects, tank levels, and BMS state.
+The simulator uses the same `dashboard.py` canvas code as the field box with a
+virtual 1920x1080 field coordinate system, scaled down only to fit the Mac
+screen. This keeps GUI sizing and spacing tied to the native Tk renderer instead
+of the browser mock.
+
+Simulator mode redirects `/home/pi` dashboard state and logs into `.sim-data/`
+so local GUI testing does not touch production Pi files. Production startup is
+unchanged; the simulator is enabled only by `BBB_SIM_MODE=1`.
+
+The browser workbench is secondary and should not be used as the visual
+authority for field GUI sizing:
+
+```bash
+python3 web-sim/server.py
+```
+
+Then open `http://127.0.0.1:8765/`. The browser workbench mirrors the main
+dashboard layout and provides the same basic flow, switch-box, and sensor
+controls for rough iteration only. Verify final GUI work in the native Tk
+simulator.
+
 ### Configuration
 
 Edit `config.py` to adjust:
@@ -153,15 +232,27 @@ Edit `config.py` to adjust:
 
 ### Flow Shutoff Curve
 
-The system predicts coast distance based on flow rate:
+The system predicts coast distance with the piecewise flow curve in `config.py`.
+The factory curve remains in the repo and is the fallback on every boot.
 
-```
-coast_gallons = 0.030625 × GPM - 0.22375
-```
+Auto-shutoff timing is handled by a dedicated flow-control thread, enabled by
+`FLOW_CONTROL_THREAD_ENABLED` in `config.py`. That thread owns normal IO-Link
+process-data reads, updates the latest flow/totalizer state, and fires the pump
+stop relay when the flow curve threshold is reached. The Tk dashboard reads the
+cached state for display so GUI rendering jitter does not move the shutoff
+decision point. `FLOW_CONTROL_INTERVAL` controls the safety loop period; the
+default is 50 ms.
 
-Calibration data:
-- 22 GPM → 0.45 gal coast
-- 70 GPM → 1.92 gal coast
+Confirmed Auto fills can also learn a conservative field correction. After the
+last three thumbs-up-confirmed Auto fills, the box saves a pending proposal to
+`/home/pi/flow_curve_proposal.json` and keeps the samples in
+`/home/pi/flow_curve_samples.json`. The learned curve shifts the factory
+intercepts by a clamped offset; it does not rewrite `config.py` and does not
+become active automatically.
+
+Use `ACCEPT CURVE` in the on-screen system menu to manually activate a pending
+proposal. Use `FACTORY CURVE` to archive learned files and immediately return to
+the factory curve.
 
 ## Installation
 
@@ -203,6 +294,23 @@ The install script configures:
 
 Production devices use the on-screen updater to pull from `origin/master`.
 Development can continue on `main`, but anything intended for field updates must also be pushed to `master`.
+
+### Maintenance Update Bundle
+
+RotorSync admin maintenance updates expect a verified BBB tar bundle. Build one
+from committed runtime files with:
+
+```bash
+python3 scripts/build_update_bundle.py
+```
+
+The helper writes `dist/Big-Beautiful-Box-<VERSION>-<commit>.tar.gz`, prints the
+SHA-256 and size used by the admin relay, and refuses uncommitted changes in the
+included runtime paths unless `--allow-dirty` is supplied for a test bundle.
+The bundle intentionally contains only the bounded runtime set that the Pi-side
+maintenance updater can apply: `dashboard.py`, `rotorsync_bumble.py`,
+`rotorsync_watchdog.py`, `start_iol_dashboard.sh`, `VERSION`, `config.py`,
+`install.sh`, `src`, and `deploy`.
 
 ## Operational Workflow
 

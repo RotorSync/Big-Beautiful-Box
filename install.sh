@@ -82,6 +82,57 @@ copy_tree_contents_if_needed() {
     cp -r "$src_dir/"* "$dst_dir/"
 }
 
+install_maintenance_secret() {
+    local secret_path="$INSTALL_HOME/.rotorsync-maintenance-secret"
+    local secret_value="${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}"
+
+    if [ -n "$secret_value" ]; then
+        umask 077
+        printf '%s' "$secret_value" > "$secret_path"
+        chmod 600 "$secret_path"
+        log_info "Installed maintenance relay secret at $secret_path"
+        return
+    fi
+
+    if [ -s "$secret_path" ] || [ -s /etc/rotorsync/maintenance.secret ]; then
+        log_info "Maintenance relay secret already present."
+        return
+    fi
+
+    log_warn "Maintenance relay secret missing. Admin maintenance commands will be rejected until /etc/rotorsync/maintenance.secret or $secret_path is provisioned."
+}
+
+configure_bluetooth_usb_power() {
+    local rule_path="/etc/udev/rules.d/98-rotorsync-bluetooth-power.rules"
+    local changed=0
+
+    sudo tee "$rule_path" > /dev/null <<'EOF'
+# Keep TrailerSync Bluetooth adapters awake for long-lived BLE GATT/sensor use.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2c0a", ATTR{idProduct}=="8761", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0b05", ATTR{idProduct}=="1bf6", TEST=="power/control", ATTR{power/control}="on"
+EOF
+    sudo udevadm control --reload-rules 2>/dev/null || true
+
+    for device in /sys/bus/usb/devices/*; do
+        [ -f "$device/idVendor" ] || continue
+        [ -f "$device/idProduct" ] || continue
+        [ -f "$device/power/control" ] || continue
+        local vendor product
+        vendor="$(cat "$device/idVendor" 2>/dev/null || true)"
+        product="$(cat "$device/idProduct" 2>/dev/null || true)"
+        case "${vendor}:${product}" in
+            2c0a:8761|0b05:1bf6)
+                if [ "$(cat "$device/power/control" 2>/dev/null || true)" != "on" ]; then
+                    echo on | sudo tee "$device/power/control" >/dev/null
+                    changed=1
+                fi
+                ;;
+        esac
+    done
+
+    log_info "Bluetooth USB power management configured (changed=$changed)."
+}
+
 install_boot_logo() {
     local image_path="$1"
     local theme_name="trailersync"
@@ -258,11 +309,15 @@ sudo apt install -y \
     python3-yaml \
     bluez \
     bluez-tools \
+    xdotool \
+    ydotool \
     zstd \
     plymouth \
     plymouth-themes
 
 sudo usermod -a -G dialout $INSTALL_USER
+sudo "$SCRIPT_DIR/deploy/setup-cursor-control.sh"
+configure_bluetooth_usb_power
 sudo systemctl enable ssh
 sudo systemctl start ssh
 
@@ -271,7 +326,7 @@ sudo systemctl start ssh
 # available to the system interpreter rather than only the pi user's site-packages.
 # Do not self-upgrade distro-managed pip here. Ubuntu's deb-packaged pip does
 # not carry uninstall metadata that pip expects for a replace-in-place upgrade.
-sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble
+sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229
 
 # Step 3: Install vendored IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."
@@ -387,8 +442,7 @@ copy_if_needed "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/install.sh"
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
 sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
-sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
-sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
+sudo cp -r "$SCRIPT_DIR/src/." "$OPT_DIR/src/"
 for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
     [ -f "$mopeka_file" ] || continue
     base_name="$(basename "$mopeka_file")"
@@ -408,6 +462,8 @@ sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 chmod +x "$INSTALL_DIR/start_iol_dashboard.sh"
 chmod +x "$INSTALL_DIR/dashboard.py"
+
+install_maintenance_secret
 
 # Step 6: Install systemd services
 log_step "6/7: Installing systemd service..."
