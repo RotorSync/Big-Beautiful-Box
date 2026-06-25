@@ -1,0 +1,21 @@
+[Unit]
+Description=RotorLink local WiFi link (iPad <-> dashboard bridge)
+# Bridges the dashboard command socket; start after it and the network are up.
+After=network-online.target iol_dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Big-Beautiful-Box
+ExecStart=/usr/bin/python3 -m rotorlink
+Restart=always
+RestartSec=3
+# Tunables (see rotorlink/config.py for the full list):
+# Environment=ROTORLINK_WS_PORT=8765
+# Environment=ROTORLINK_NAME=Trailer 1
+# Environment=ROTORLINK_SERIAL=TS-01
+# Environment=ROTORLINK_ARBITRATION=0
+
+[Install]
+WantedBy=multi-user.target

@@ -974,6 +974,7 @@ def switch_mode(new_mode):
     # Update the display
     draw_requested_number(f"{requested_gallons:.0f}", "red")
     update_mopeka_display()
+    update_bms_display()
     update_last_load_display()
     update_bms_display()
 
@@ -1038,6 +1039,7 @@ def clear_batch_mix_screen(reason="clear"):
     msg = f"Batch mix screen cleared: {reason}"
     print(msg)
     log_serial_debug(msg)
+
 
 def show_batchmix_error(error_msg):
     """Display a BatchMix error message on screen"""
@@ -1151,7 +1153,7 @@ def refresh_batch_mix_totals():
         canvas.create_text(x, bottom_y, text=value, font=value_font,
                           fill="cyan", tags="totals")
         # Label below - smaller gray text
-        canvas.create_text(x, label_y, text=label, font=label_font,
+        canvas.create_text(x, label_y, text=label, font=("Helvetica", 24, "bold"),
                           fill="#d0d0d0", tags="totals")
 
 def _mopeka_quality_color(q):
@@ -7326,14 +7328,7 @@ def update_dashboard():
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
-    if (
-        not control_active
-        and is_flowing
-        and not override_mode
-        and not flow_meter_disconnected
-        and actual >= requested_gallons - trigger_threshold
-        and not last_alert_triggered
-    ):
+    if is_flowing and not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
         last_alert_triggered = True
         auto_shutoff_latched = True
         last_trigger_flow_gpm = flow_rate_gpm
