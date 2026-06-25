@@ -36,6 +36,12 @@ SERIAL_BAUD = 115200          # Serial baud rate (must match sender device)
 # Duration settings for relay activation (in seconds)
 PUMP_STOP_DURATION = 5       # How long to hold relay on for PS (Pump Stop) command
 AUTO_ALERT_DURATION = 5      # How long to hold relay on for auto-alert
+RELAY_SLOWDOWN_CHECK_SECONDS = 2.0  # seconds after auto-stop to verify flow is slowing
+RELAY_SLOWDOWN_MIN_DROP_GPM = 10.0  # GPM drop required after relay trigger
+RELAY_SLOWDOWN_MIN_DROP_FRACTION = 0.20  # fractional drop required after relay trigger
+RELAY_SLOWDOWN_ALARM_FLASH_HZ = 20  # target full-screen flash rate
+RELAY_SLOWDOWN_ALARM_COLOR_A = "black"
+RELAY_SLOWDOWN_ALARM_COLOR_B = "white"
 
 
 # =============================================================================
@@ -47,8 +53,14 @@ IOL_PORT = 2  # Flow meter on X1 (port 0)
 DATA_LENGTH = 15              # Expected data length from flow meter
 
 # Flow meter monitoring thresholds
-FLOW_STOPPED_THRESHOLD = 0.001    # L/s - flow is considered stopped below this
+FLOW_STOPPED_THRESHOLD = 0.001       # L/s - flow is considered stopped below this
+NEW_FILL_CYCLE_THRESHOLD = 0.630902  # L/s - 10 GPM; clear thumbs/pending fill above this
+NEW_FILL_CYCLE_HOLD_SECONDS = 3.0    # seconds - require sustained new-fill flow
+NEW_FILL_CYCLE_FRESH_GRACE_SECONDS = 0.25  # seconds - latest high-flow sample must be fresh/recent
 FLOW_METER_TIMEOUT = 5            # seconds - flow meter considered disconnected after this
+FLOW_METER_RECONNECT_FRESH_READS = 3  # healthy status checks required before clearing flow-meter fault latch
+FLOW_METER_RECONNECT_STABLE_SECONDS = 10.0  # continuous healthy time before clearing flow-meter fault latch
+IOL_STARTUP_WARNING_GRACE_SECONDS = 15.0  # hide startup-only IO-Link warnings while the port settles
 IOL_RECONNECT_INTERVAL = 15       # seconds - minimum time between IOL port power-cycle attempts
 
 
@@ -62,29 +74,38 @@ LITERS_PER_SEC_TO_GPM = 15.850323 # L/s to GPM conversion (60 * 0.264172)
 
 # Flow-based shutoff coast calibration
 # Use a short rolling average of flow rather than a single instant sample.
-FLOW_AVERAGING_SAMPLES = 3  # 3 x 200 ms updates = ~0.6 s average
+FLOW_AVERAGING_SAMPLES = 3  # 3 fresh Picomag samples; independent of control-loop poll rate
 
-# Piecewise coast model derived from usable March 2026 auto-shutoff samples.
-# Low band samples:
-#   - 42.3 GPM -> 1.02 gal coast
-#   - 48.1 GPM -> 1.18 gal coast
-#   - 59.9 GPM -> 1.45 gal coast
-#   - 65.7 GPM -> 1.62 gal coast
-# High band samples:
-#   - 80.6 GPM -> 1.98 gal coast
-#   - 84.4 GPM -> 2.09 gal coast
-#   - 85.0 GPM -> 2.12 gal coast
-# Refit from the last 11 usable auto loads in fill_calibration.log:
-#   Low band (<= 70 GPM): 29.8, 36.8, 49.0, 59.0, 64.4, 65.0, 68.9
-#   High band (> 70 GPM): 73.2, 75.4, 78.8, 83.1
+# Safety-critical auto-shutoff loop. Keep IO-Link reads and relay decisions out
+# of the Tk render loop so GUI timing cannot move the pump stop point.
+FLOW_CONTROL_THREAD_ENABLED = True
+FLOW_CONTROL_INTERVAL = 0.020  # seconds; test 50 Hz polling against ~12.7 Hz fresh Picomag data
+FLOW_CONTROL_PREDICTION_SECONDS = 0.0  # keep curve behavior unchanged by default
+FLOW_CONTROL_AUDIT_INTERVAL = 5.0  # seconds between flow-meter freshness summaries
+
+# Piecewise coast model refit from 25 thumbs-up-confirmed Auto fills logged
+# after 2026-05-28 17:03 during the curve test:
+#   Low band (<= 70 GPM): 38.4, 39.5, 39.1, 47.9, 48.8, 47.1,
+#                         47.8, 58.9, 58.8, 58.8
+#   High band (> 70 GPM): 73.1, 72.6, 72.8, 72.6, 72.7, 72.2, 73.0,
+#                         86.7, 87.3, 86.6, 85.9, 85.5, 100.7, 100.6, 100.4
 # Desired threshold per run is estimated as:
 #   corrected_threshold = logged_threshold + (actual - requested)
 # so underfills reduce the threshold and overfills increase it.
 FLOW_CURVE_SPLIT_GPM = 70.0
-FLOW_CURVE_LOW_SLOPE = 0.02543409299521162
-FLOW_CURVE_LOW_INTERCEPT = -0.12819618255920154
-FLOW_CURVE_HIGH_SLOPE = 0.030867814806530995
-FLOW_CURVE_HIGH_INTERCEPT = -0.38336412435696915
+FLOW_CURVE_LOW_SLOPE = 0.028133462493840494
+FLOW_CURVE_LOW_INTERCEPT = 0.006145734423797622
+FLOW_CURVE_HIGH_SLOPE = 0.02735502035885965
+FLOW_CURVE_HIGH_INTERCEPT = 0.13052774666967393
+
+# Runtime curve learning. Factory values above remain the fallback; learned
+# values are saved outside the repo so they can be reset in the field.
+FLOW_CURVE_OVERRIDE_FILE = "/home/pi/flow_curve_override.json"
+FLOW_CURVE_SAMPLES_FILE = "/home/pi/flow_curve_samples.json"
+FLOW_CURVE_PROPOSAL_FILE = "/home/pi/flow_curve_proposal.json"
+FLOW_CURVE_LEARN_SAMPLE_COUNT = 3
+FLOW_CURVE_MAX_LEARNED_OFFSET_GAL = 0.75
+FLOW_CURVE_MAX_SAMPLE_ERROR_GAL = 5.0
 
 
 # =============================================================================
@@ -112,6 +133,8 @@ UPDATE_INTERVAL = 150         # Milliseconds between GUI updates (lower = more r
 MAIN_LOG_FILE = "/home/pi/iol_dashboard.log"
 SERIAL_DEBUG_LOG = "/home/pi/serial_debug.log"
 RELAY_TEST_LOG = "/home/pi/relay_test.log"
+BUTTON_DEBUG_LOG = "/home/pi/button_debug.log"
+FLOW_CONTROL_LOG_FILE = "/home/pi/flow_control.log"
 
 
 # =============================================================================

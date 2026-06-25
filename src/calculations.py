@@ -7,6 +7,8 @@ These functions have no side effects and are fully testable.
 
 import config
 
+from .flow_curve import calculate_trigger_threshold as calculate_flow_curve_threshold
+
 
 def calculate_trigger_threshold(flow_rate_l_per_s: float) -> float:
     """
@@ -20,9 +22,7 @@ def calculate_trigger_threshold(flow_rate_l_per_s: float) -> float:
     Returns:
         Gallons before target to trigger shutoff (minimum 0.1)
     """
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-    predicted_coast = config.FLOW_CURVE_SLOPE * flow_rate_gpm + config.FLOW_CURVE_INTERCEPT
-    return max(predicted_coast, 0.1)
+    return calculate_flow_curve_threshold(flow_rate_l_per_s)
 
 
 def liters_to_gallons(liters: float) -> float:

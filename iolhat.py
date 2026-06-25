@@ -32,6 +32,12 @@ CMD_SUCCESS = 1
 CMD_FAIL = 0
 
 verbose = True #True
+SOCKET_TIMEOUT_SECONDS = 2.0
+
+def _open_socket():
+	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s.settimeout(SOCKET_TIMEOUT_SECONDS)
+	return s
 
 def power (port, status):
 
@@ -49,7 +55,7 @@ def power (port, status):
 
 	#CMD PWR = 1
 	message = struct.pack("!BBB",1, port, status);
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 	try:
 		s.connect((TCP_IP, tcp_port))
 
@@ -110,7 +116,7 @@ def pd (port, len_out, len_in, pd_out):
 		print("PD: Send buffer", out_buffer)
 
 	try:
-		s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		s = _open_socket()
 		s.connect((TCP_IP, tcp_port))
 		#print (port, "out=", out_buffer)
 		s.send(out_buffer)
@@ -154,7 +160,7 @@ def led (port, status):
 
 	#CMD LED = 2
 	message = struct.pack("!BBB",2, port, status);
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 
 	try:
 		s.connect((TCP_IP, tcp_port))
@@ -215,7 +221,7 @@ def read (port, index, subindex, length):
 
 	#CMD READ = 4
 	message = struct.pack("!BBHBB",4, port, index, subindex, length);
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 
 	try:
 		s.connect((TCP_IP, tcp_port))
@@ -291,7 +297,7 @@ def write (port, index, subindex, length, writeData):
 		print (snd_message)
 
 	#Open a socket, connect and send the message
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 
 	try:
 		s.connect((TCP_IP, tcp_port))
@@ -427,7 +433,7 @@ def readStatus(port):
 
 	#CMD STATUS = 6
 	message = struct.pack("!BB",6, port);
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 
 	try:
 		s.connect((TCP_IP, tcp_port))
@@ -486,7 +492,7 @@ def readStatus2(port):
 
 	#CMD STATUS2 = 8
 	message = struct.pack("!BB",8, port);
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s = _open_socket()
 
 	try:
 		s.connect((TCP_IP, tcp_port))
@@ -545,5 +551,3 @@ def getErrorMessage(error_code):
 	}
 
 	return error_messages.get(error_code, "Unknown error code")
-
-

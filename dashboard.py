@@ -10,13 +10,82 @@ import threading
 import subprocess
 import os
 import json
+import csv
 import shlex
+import shutil
+import fcntl
+import atexit
+import builtins
+import math
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
+from src.batchmix_payload import (
+    parse_field_color,
+    scaled_batchmix_payload_for_water,
+)
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
+REPO_DIR = Path(__file__).resolve().parent
+SIM_MODE = os.environ.get("BBB_SIM_MODE") == "1"
+SIM_STATE_DIR = Path(os.environ.get("BBB_SIM_STATE_DIR", REPO_DIR / ".sim-data"))
+if SIM_MODE:
+    os.environ.setdefault("BBB_SIM_STATE_DIR", str(SIM_STATE_DIR))
+SIM_GEOMETRY = os.environ.get("BBB_SIM_GEOMETRY", "1920x1080")
+SIM_PUMP_GLIDE_SECONDS = 3.0
+SIM_RENDER_SCALE = 1.0
+FILL_HISTORY_SOCKET_LIMIT = 20
+
+
+def _base36_encode(value):
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    value = int(value)
+    if value == 0:
+        return "0"
+    sign = ""
+    if value < 0:
+        sign = "-"
+        value = -value
+    result = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        result = chars[remainder] + result
+    return sign + result
+
+
+def _geometry_size(geometry):
+    try:
+        size = geometry.split("+", 1)[0]
+        width, height = size.lower().split("x", 1)
+        return int(width), int(height)
+    except Exception:
+        return 1920, 1080
+
+
+SIM_WINDOW_WIDTH, SIM_WINDOW_HEIGHT = _geometry_size(SIM_GEOMETRY)
+
+
+def _pi_path(path):
+    """Map Pi absolute paths into a local state directory during simulator runs."""
+    if SIM_MODE and isinstance(path, (str, os.PathLike)):
+        path_str = os.fspath(path)
+        pi_prefix = "/home/pi/"
+        if path_str.startswith(pi_prefix):
+            mapped = SIM_STATE_DIR / path_str[len(pi_prefix):]
+            mapped.parent.mkdir(parents=True, exist_ok=True)
+            return str(mapped)
+    return path
+
+
+if SIM_MODE:
+    SIM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _real_open = builtins.open
+
+    def _sim_open(file, *args, **kwargs):
+        return _real_open(_pi_path(file), *args, **kwargs)
+
+    builtins.open = _sim_open
 
 
 def _read_local_version():
@@ -42,9 +111,24 @@ def _read_git_ref_version(git_ref):
 
 
 VERSION = _read_local_version()
+PROGRAM_STARTED_AT = time.time()
 
 # Import configuration
 import config
+
+if SIM_MODE:
+    config.MAIN_LOG_FILE = _pi_path(config.MAIN_LOG_FILE)
+    config.SERIAL_DEBUG_LOG = _pi_path(config.SERIAL_DEBUG_LOG)
+    config.RELAY_TEST_LOG = _pi_path(config.RELAY_TEST_LOG)
+    config.BUTTON_DEBUG_LOG = _pi_path(config.BUTTON_DEBUG_LOG)
+    config.FLOW_CONTROL_LOG_FILE = _pi_path(config.FLOW_CONTROL_LOG_FILE)
+
+from src import flow_curve
+FLOW_CURVE_OVERRIDE_PATH = _pi_path(config.FLOW_CURVE_OVERRIDE_FILE)
+FLOW_CURVE_SAMPLES_PATH = _pi_path(config.FLOW_CURVE_SAMPLES_FILE)
+FLOW_CURVE_PROPOSAL_PATH = _pi_path(config.FLOW_CURVE_PROPOSAL_FILE)
+active_flow_curve = flow_curve.FlowCurve.factory()
+flow_curve_metadata = {"source": "factory", "reason": "startup"}
 
 # Set up rotating loggers
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
@@ -75,9 +159,130 @@ except ImportError:
 
 import iolhat
 
+
+class _SimStatus2:
+    def __init__(self, connected=True, powered=True):
+        self.pd_in_valid = 1 if connected and powered else 0
+        self.transmission_rate = 0x02 if connected and powered else 0
+        self.master_cycle_time = 0x20
+        self.error = 0x00 if connected and powered else 0x80
+        self.power = 1 if powered else 0
+
+
+class _SimIOLHat:
+    LED_GREEN = getattr(iolhat, "LED_GREEN", 2)
+    LED_RED = getattr(iolhat, "LED_RED", 1)
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.connected = True
+        self.powered = True
+        self.totalizer_liters = 0.0
+        self.flow_rate_l_per_s = 0.0
+        self.temperature_c = 20.0
+        self._last_tick = time.time()
+        self._flow_start_l_per_s = 0.0
+        self._flow_target_l_per_s = 0.0
+        self._transition_start = self._last_tick
+        self._transition_duration = 0.0
+        self._packet_counter = 0
+        self._led = self.LED_GREEN
+
+    def _flow_at(self, when):
+        if self._transition_duration <= 0:
+            return self._flow_target_l_per_s
+        progress = (when - self._transition_start) / self._transition_duration
+        if progress >= 1:
+            return self._flow_target_l_per_s
+        if progress <= 0:
+            return self._flow_start_l_per_s
+        return self._flow_start_l_per_s + (
+            self._flow_target_l_per_s - self._flow_start_l_per_s
+        ) * progress
+
+    def _tick(self):
+        now = time.time()
+        elapsed = max(0.0, now - self._last_tick)
+        if self.connected and self.powered and elapsed > 0:
+            start_flow = self._flow_at(self._last_tick)
+            end_flow = self._flow_at(now)
+            self.totalizer_liters += ((start_flow + end_flow) / 2.0) * elapsed
+            self.flow_rate_l_per_s = end_flow
+        else:
+            self.flow_rate_l_per_s = self._flow_at(now)
+        self._last_tick = now
+        if self._transition_duration > 0 and now >= self._transition_start + self._transition_duration:
+            self._transition_duration = 0.0
+            self._flow_start_l_per_s = self._flow_target_l_per_s
+            self.flow_rate_l_per_s = self._flow_target_l_per_s
+
+    def set_flow_gpm(self, gpm):
+        with self._lock:
+            self._tick()
+            flow_l_per_s = max(0.0, float(gpm)) / config.LITERS_PER_SEC_TO_GPM
+            self.flow_rate_l_per_s = flow_l_per_s
+            self._flow_start_l_per_s = flow_l_per_s
+            self._flow_target_l_per_s = flow_l_per_s
+            self._transition_start = time.time()
+            self._transition_duration = 0.0
+
+    def stop_pump(self, glide_seconds=3.0):
+        with self._lock:
+            self._tick()
+            now = time.time()
+            self._flow_start_l_per_s = self.flow_rate_l_per_s
+            self._flow_target_l_per_s = 0.0
+            self._transition_start = now
+            self._transition_duration = max(0.0, float(glide_seconds))
+
+    def get_flow_gpm(self):
+        with self._lock:
+            self._tick()
+            return self.flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+
+    def reset_totalizer(self):
+        with self._lock:
+            self.totalizer_liters = 0.0
+            self._last_tick = time.time()
+
+    def pd(self, port, index, data_length, callback):
+        with self._lock:
+            self._tick()
+            self._packet_counter = (self._packet_counter + 1) % 256
+            if not self.connected or not self.powered:
+                return b"\x00" * data_length
+
+            packet = (
+                b"\x00\x00\x00\x00"
+                + struct.pack(">f", abs(self.totalizer_liters))
+                + struct.pack(">f", self.flow_rate_l_per_s)
+                + struct.pack(">h", int(round(self.temperature_c * 10)))
+                + bytes([0])
+            )
+            return packet[:data_length].ljust(data_length, b"\x00")
+
+    def power(self, port, status):
+        with self._lock:
+            self.powered = bool(status)
+        return 1
+
+    def led(self, port, color):
+        with self._lock:
+            self._led = color
+        return 1
+
+    def readStatus2(self, port):
+        with self._lock:
+            return _SimStatus2(self.connected, self.powered)
+
+
+if SIM_MODE:
+    iolhat = _SimIOLHat()
+
 # Global variables
 last_totalizer_liters = 0.0
 last_flow_rate = 0.0
+last_flow_meter_temp_f = None
 previous_totalizer_liters = 0.0
 connection_error = False
 error_message = ""
@@ -87,7 +292,13 @@ override_mode = False
 last_alert_triggered = False
 auto_shutoff_latched = False  # True once the pump-stop relay has fired for the current fill cycle
 last_successful_read_time = time.time()
+last_flow_read_was_fresh = False  # True only when latest IO-Link data changed
+last_fresh_flow_read_time = 0.0  # Monotonic-ish wall time of latest changed IO-Link data
 was_flowing = False  # Track if flow was active in previous update (for detecting flow stop)
+new_fill_flow_started_at = None  # Time flow first exceeded the new-fill threshold
+current_fill_flow_started_at = 0.0  # Epoch when flow started for the in-progress fill segment (0 = none)
+new_fill_last_fresh_at = None  # Last fresh high-flow sample during new-fill clearing
+new_fill_cycle_cleared = False  # True after prior fill state is cleared for this cycle
 colors_are_green = False  # Track if colors have been changed to green
 last_reminder_date = None  # Track the last date reminders were shown (YYYY-MM-DD format)
 reminders_mode = False  # Track if we're showing reminders
@@ -100,6 +311,12 @@ menu_arrows = []  # List of arrow label widgets
 menu_daily_label = None  # Reference to daily total label in menu
 menu_season_label = None  # Reference to season total label in menu
 menu_position_label = None  # Reference to position indicator label
+menu_highlight_refresh_pending = False  # Coalesce menu redraws so knob pulses do not stack UI work
+menu_displayed_index = None  # Last menu item whose highlight state was painted
+menu_ov_guard_until = 0.0  # Suppress OV contact/repeat bounce after screen changes
+MENU_OV_GUARD_SECONDS = 2.5
+last_serial_ov_toggle_time = 0.0
+SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS = 0.5
 log_viewer_mode = False  # Track if we're in log viewer
 log_viewer_window = None  # Reference to log viewer window
 log_viewer_text = None  # Reference to log text widget
@@ -119,15 +336,29 @@ exit_cancel_handler = None  # Function to call on cancel
 reset_season_confirm_window = None  # Reference to reset season confirmation window
 reset_season_confirm_handler = None  # Function to call on confirmation
 reset_season_cancel_handler = None  # Function to call on cancel
+reset_flow_curve_confirm_window = None  # Reference to flow curve reset confirmation
+reset_flow_curve_confirm_handler = None  # Function to call on confirmation
+reset_flow_curve_cancel_handler = None  # Function to call on cancel
+accept_flow_curve_confirm_window = None  # Reference to learned curve accept confirmation
+accept_flow_curve_confirm_handler = None  # Function to call on confirmation
+accept_flow_curve_cancel_handler = None  # Function to call on cancel
 daily_total = 0.0  # Total gallons pumped today
 season_total = 0.0  # Total gallons pumped this season (until manually reset)
 last_reset_date = None  # Track last daily reset date
 last_loads_gallons = []  # Most recent recorded load sizes (newest first)
 pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up confirmation
+current_pilot_name = ""  # Name of the most recent pilot (role='pilot') reported by BLE server
+current_pilot_connected = False  # True while that pilot is actively connected
+last_pilot_disconnect_at = 0.0  # Wall time the pilot last disconnected
+PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS = 99 * 60  # Stop attributing loads after this gap
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
 pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the completed fill
+pending_fill_temp_f = None  # Flow-meter temperature snapshot associated with the completed fill
+pending_fill_stop_to_thumb_start_at = 0.0  # Relay activation time for the completed fill
+pending_fill_flow_started_at = 0.0  # Epoch when flow first started for the completed fill (0 = unknown)
+pending_fill_flow_ended_at = 0.0  # Epoch when flow stopped for the completed fill (0 = unknown)
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
 last_trigger_threshold = 0.0  # Threshold when auto shutoff triggered
@@ -137,12 +368,42 @@ last_heartbeat_time = time.time()  # Last time we received OK heartbeat from swi
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
 last_raw_data = None  # Previous raw bytes for stale detection
-STALE_RAW_THRESHOLD = 25  # Identical raw reads before flagging (25 * 200ms = 5 seconds)
 last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
 iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
 override_enabled_time = 0  # Timestamp when override mode was last enabled
-last_ui_serial_command = None  # Last UI/menu command received from switch box
-last_ui_serial_command_time = 0.0
+iol_io_lock = threading.RLock()  # Single gate for direct IO-Link process-data calls
+flow_control_stop_event = threading.Event()
+flow_control_thread = None
+flow_control_was_flowing = False
+flow_control_last_tick = None
+flow_control_last_loop_time = time.time()
+flow_control_last_error_log_time = 0.0
+flow_control_audit_started_at = time.time()
+flow_control_audit_polls = 0
+flow_control_audit_fresh = 0
+flow_control_audit_duplicates = 0
+flow_control_audit_flowing_polls = 0
+flow_control_audit_flowing_fresh = 0
+flow_control_audit_errors = 0
+flow_control_audit_loop_ms_total = 0.0
+flow_control_audit_loop_ms_max = 0.0
+relay_slowdown_watch_active = False
+relay_slowdown_alarm_active = False
+relay_slowdown_alarm_visible = False
+relay_slowdown_trigger_time = 0.0
+relay_slowdown_trigger_flow_gpm = 0.0
+pump_stop_relay_lock = threading.Lock()
+pump_stop_pulse_count = 0
+last_pump_stop_relay_activated_at = 0.0
+pump_stop_fault_hold_active = False
+pump_stop_fault_hold_reason = ""
+flow_meter_reconnect_fresh_reads = 0
+flow_meter_reconnect_started_at = 0.0
+flow_meter_reconnect_last_status_check = 0.0
+flow_meter_reconnect_status_ok = False
+flow_meter_reconnect_fault_reason = ""
+last_trigger_predicted_actual = 0.0
+last_trigger_loop_dt_ms = 0.0
 # Mix/Fill mode variables
 current_mode = "fill"  # Current mode: "fill" or "mix"
 fill_requested_gallons = config.REQUESTED_GALLONS  # Preset for fill mode
@@ -153,6 +414,7 @@ last_daily_total_text = None  # Cache daily total footer text
 last_daily_total_mode = None  # Track mode used for daily total rendering
 last_flow_rate_text = None  # Cache flow rate footer text
 last_flow_rate_mode = None  # Track mode used for flow footer rendering
+last_visible_cursor_check = 0.0
 
 # Shared menu order.
 MENU_ITEMS = [
@@ -161,6 +423,8 @@ MENU_ITEMS = [
     "TANK CALIBRATION",
     "FULL TEST",
     "RESET SEASON",
+    "ACCEPT CURVE",
+    "FACTORY CURVE",
     "SELF TEST",
     "CAPTURE BUG",
     "SYSTEM UPDATE",
@@ -198,6 +462,97 @@ calibration_state = None
 batch_mix_data = None  # Cached JSON data from iPad
 batch_mix_overlay = None  # Reference to batch mix overlay frame
 
+
+def load_flow_curve_state():
+    """Load the learned curve override, or fall back to factory values."""
+    global active_flow_curve, flow_curve_metadata
+    active_flow_curve, flow_curve_metadata = flow_curve.load_curve_override(
+        FLOW_CURVE_OVERRIDE_PATH
+    )
+    status = flow_curve_status_text()
+    reason = flow_curve_metadata.get("reason", "")
+    msg = f"Loaded flow curve: {status}"
+    if reason:
+        msg = f"{msg} ({reason})"
+    print(msg)
+    log_serial_debug(msg)
+
+
+def flow_curve_status_text():
+    """Short field-readable label for the active shutoff curve."""
+    if flow_curve_metadata.get("source") == "learned":
+        learning = flow_curve_metadata.get("learning", {})
+        offset = learning.get("applied_offset_gallons")
+        if isinstance(offset, (int, float)):
+            return f"Learned {offset:+.2f} gal"
+        return "Learned"
+    return "Factory"
+
+
+def flow_curve_proposal_status_text():
+    """Short label describing whether a learned curve proposal is waiting."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        return "No pending curve"
+    learning = proposal.get("learning", {})
+    offset = learning.get("applied_offset_gallons")
+    if isinstance(offset, (int, float)):
+        return f"Pending {offset:+.2f} gal"
+    return "Pending curve"
+
+
+def _flow_curve_accept_payload(curve_payload):
+    """Build a compact JSON-safe response for an accepted learned curve."""
+    learning = curve_payload.get("learning", {}) if isinstance(curve_payload, dict) else {}
+    return {
+        "current_curve": flow_curve_status_text(),
+        "pending_curve": flow_curve_proposal_status_text(),
+        "sample_count": curve_payload.get("sample_count", 0) if isinstance(curve_payload, dict) else 0,
+        "applied_offset_gallons": learning.get("applied_offset_gallons"),
+        "raw_offset_gallons": learning.get("raw_offset_gallons"),
+        "accepted_at": curve_payload.get("accepted_at") if isinstance(curve_payload, dict) else None,
+    }
+
+
+def accept_pending_flow_curve(source="Socket"):
+    """Activate a pending learned flow curve without opening a UI dialog."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        return False, {
+            "code": "NO_PENDING_CURVE",
+            "message": "No learned curve proposal is ready.",
+            "current_curve": flow_curve_status_text(),
+            "pending_curve": "No pending curve",
+        }
+
+    try:
+        accepted = flow_curve.accept_curve_proposal(
+            FLOW_CURVE_PROPOSAL_PATH,
+            FLOW_CURVE_OVERRIDE_PATH,
+        )
+        load_flow_curve_state()
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted proposal"
+                f" | Source: {source}"
+                f" | Offset: {accepted.get('learning', {}).get('applied_offset_gallons', 'unknown')}\n"
+            )
+        return True, _flow_curve_accept_payload(accepted)
+    except Exception as exc:
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accept failed"
+                f" | Source: {source}"
+                f" | Error: {exc}\n"
+            )
+        return False, {
+            "code": "ACCEPT_FAILED",
+            "message": str(exc),
+            "current_curve": flow_curve_status_text(),
+            "pending_curve": flow_curve_proposal_status_text(),
+        }
+
+
 def calculate_trigger_threshold(flow_rate_l_per_s):
     """
     Calculate how many gallons before target to trigger shutoff based on flow rate.
@@ -209,24 +564,7 @@ def calculate_trigger_threshold(flow_rate_l_per_s):
     Returns:
         Gallons before target to trigger shutoff (predicted coast distance)
     """
-    # Convert L/s to GPM
-    flow_rate_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
-
-    if flow_rate_gpm <= config.FLOW_CURVE_SPLIT_GPM:
-        predicted_coast = (
-            config.FLOW_CURVE_LOW_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_LOW_INTERCEPT
-        )
-    else:
-        predicted_coast = (
-            config.FLOW_CURVE_HIGH_SLOPE * flow_rate_gpm
-            + config.FLOW_CURVE_HIGH_INTERCEPT
-        )
-
-    # Ensure we don't have negative threshold (minimum 0.1 gallon before target)
-    threshold = max(predicted_coast, 0.1)
-
-    return threshold
+    return flow_curve.calculate_trigger_threshold(flow_rate_l_per_s, active_flow_curve)
 
 
 def get_smoothed_flow_rate():
@@ -234,6 +572,255 @@ def get_smoothed_flow_rate():
     if not recent_flow_rates_l_per_s:
         return last_flow_rate
     return sum(recent_flow_rates_l_per_s) / len(recent_flow_rates_l_per_s)
+
+
+def flow_control_enabled():
+    """True when the dedicated flow-control loop owns IO-Link shutoff timing."""
+    return bool(getattr(config, "FLOW_CONTROL_THREAD_ENABLED", False))
+
+
+def flow_control_active():
+    """True when the configured flow-control thread is currently alive."""
+    return bool(
+        flow_control_enabled()
+        and flow_control_thread is not None
+        and flow_control_thread.is_alive()
+    )
+
+
+def flow_read_interval_seconds():
+    """Return the expected interval between IO-Link process-data reads."""
+    if flow_control_enabled():
+        return max(0.01, float(getattr(config, "FLOW_CONTROL_INTERVAL", 0.05)))
+    return max(0.01, config.UPDATE_INTERVAL / 1000.0)
+
+
+def stale_raw_threshold_reads():
+    """Convert the stale-data timeout into a read count for the active poll rate."""
+    return max(1, int(config.FLOW_METER_TIMEOUT / flow_read_interval_seconds()))
+
+
+def get_cached_actual_gallons():
+    """Return the latest cached totalizer reading without touching IO-Link."""
+    return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+
+def _decode_flow_meter_temp_f(raw_data):
+    """Decode Picomag process-data temperature from tenths C to F."""
+    if len(raw_data) < 14:
+        return None
+    temp_c = struct.unpack('>h', raw_data[12:14])[0] / 10.0
+    return (temp_c * 9.0 / 5.0) + 32.0
+
+
+def _format_flow_meter_temp_field(temp_f):
+    if temp_f is None:
+        return ""
+    return f" | Temp: {temp_f:.1f} F"
+
+
+def _format_stop_to_thumb_field(seconds):
+    if seconds is None:
+        return ""
+    return f" | StopToThumb: {seconds:.1f} s"
+
+
+def _format_flow_window_fields(start_epoch, end_epoch):
+    """FlowStart/FlowEnd fields for a fill-history line.
+
+    Each is emitted as a 'YYYY-MM-DD HH:MM:SS' local timestamp (matching the
+    leading record timestamp) only when known (epoch > 0). A field is omitted
+    when its time is unknown, so the iPad app can detect missing flow times and
+    flag the record loudly instead of silently inventing one.
+    """
+    fields = ""
+    if start_epoch:
+        fields += " | FlowStart: " + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_epoch))
+    if end_epoch:
+        fields += " | FlowEnd: " + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_epoch))
+    return fields
+
+
+def _history_named_field(parts, name):
+    prefix = f"{name}:"
+    for part in parts:
+        text = part.strip()
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return ""
+
+
+def log_flow_control(message):
+    """Append a timestamped flow-control event for shutoff timing audits."""
+    try:
+        with open(config.FLOW_CONTROL_LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
+
+
+def log_relay_event(message):
+    """Append a timestamped pump-stop relay event."""
+    try:
+        with open(config.RELAY_TEST_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+    except Exception:
+        pass
+
+
+def _set_pump_stop_output(active, reason):
+    """Drive the pump-stop relay output without changing hold/pulse state."""
+    if SIM_MODE:
+        if active:
+            iolhat.stop_pump(SIM_PUMP_GLIDE_SECONDS)
+        return True
+
+    if not GPIO_AVAILABLE:
+        log_relay_event(f"ERROR: Cannot {'activate' if active else 'release'} relay ({reason}); GPIO unavailable")
+        return False
+
+    GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH if active else GPIO.LOW)
+    log_relay_event(f"Relay {'HIGH' if active else 'LOW'} ({reason})")
+    return True
+
+
+def set_pump_stop_fault_hold(active, reason="flow meter fault"):
+    """Latch flow-meter fault status and pulse pump stop when the fault starts."""
+    global pump_stop_fault_hold_active, pump_stop_fault_hold_reason
+
+    reason = reason or "flow meter fault"
+    pulse_fault_stop = False
+    with pump_stop_relay_lock:
+        if active:
+            if pump_stop_fault_hold_active:
+                if pump_stop_fault_hold_reason != reason:
+                    pump_stop_fault_hold_reason = reason
+                    log_flow_control(f"pump_stop_fault_hold_reason | reason={reason}")
+                return
+            pump_stop_fault_hold_active = True
+            pump_stop_fault_hold_reason = reason
+            pulse_fault_stop = True
+            log_flow_control(f"pump_stop_fault_latch_active | reason={reason}")
+        else:
+            if not pump_stop_fault_hold_active:
+                return
+            previous_reason = pump_stop_fault_hold_reason
+            pump_stop_fault_hold_active = False
+            pump_stop_fault_hold_reason = ""
+            log_flow_control(f"pump_stop_fault_latch_cleared | reason={previous_reason}")
+
+    if pulse_fault_stop:
+        log_flow_control(
+            f"pump_stop_fault_momentary_stop | reason={reason}"
+            f" | duration={config.PUMP_STOP_DURATION}s"
+        )
+        start_pump_stop_thread(config.PUMP_STOP_DURATION)
+
+
+def update_flow_meter_fault_hold(flow_meter_disconnected=None):
+    """Pulse pump stop and latch warning while the flow meter is disconnected or stale."""
+    global flow_meter_reconnect_fresh_reads
+    global flow_meter_reconnect_started_at, flow_meter_reconnect_last_status_check
+    global flow_meter_reconnect_status_ok, flow_meter_reconnect_fault_reason
+
+    if flow_meter_disconnected is None:
+        flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+
+    if connection_error:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
+        set_pump_stop_fault_hold(True, error_message or "flow meter connection error")
+    elif flow_meter_disconnected:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
+        set_pump_stop_fault_hold(True, "flow meter read timeout")
+    elif pump_stop_fault_hold_active:
+        now = time.time()
+        required_reads = max(1, int(getattr(config, "FLOW_METER_RECONNECT_FRESH_READS", 3)))
+        stable_seconds = max(0.0, float(getattr(config, "FLOW_METER_RECONNECT_STABLE_SECONDS", 10.0)))
+        if iol_power_cycle_in_progress:
+            flow_meter_reconnect_started_at = 0.0
+            flow_meter_reconnect_fresh_reads = 0
+            flow_meter_reconnect_status_ok = False
+            flow_meter_reconnect_fault_reason = ""
+        elif now - flow_meter_reconnect_last_status_check >= 1.0:
+            flow_meter_reconnect_last_status_check = now
+            try:
+                flow_meter_reconnect_status_ok, st = _read_iol_status_ok()
+                if flow_meter_reconnect_status_ok:
+                    if flow_meter_reconnect_started_at <= 0:
+                        flow_meter_reconnect_started_at = now
+                    flow_meter_reconnect_fresh_reads += 1
+                    flow_meter_reconnect_fault_reason = ""
+                else:
+                    flow_meter_reconnect_started_at = 0.0
+                    flow_meter_reconnect_fresh_reads = 0
+                    flow_meter_reconnect_fault_reason = _describe_iol_status_fault(st)
+                log_flow_control(
+                    "flow_meter_reconnect_status"
+                    f" | ok={flow_meter_reconnect_status_ok}"
+                    f" | pdInValid={st.pd_in_valid}"
+                    f" | txRate=0x{st.transmission_rate:02X}"
+                    f" | error=0x{st.error:02X}"
+                    f" | reason={flow_meter_reconnect_fault_reason or 'healthy'}"
+                )
+            except Exception as exc:
+                flow_meter_reconnect_status_ok = False
+                flow_meter_reconnect_started_at = 0.0
+                flow_meter_reconnect_fresh_reads = 0
+                flow_meter_reconnect_fault_reason = "flow meter status read failed"
+                log_flow_control(f"flow_meter_reconnect_status | ok=False | error={exc}")
+
+        stable_elapsed = (
+            now - flow_meter_reconnect_started_at
+            if flow_meter_reconnect_started_at > 0 else 0.0
+        )
+        if flow_meter_reconnect_fresh_reads >= required_reads:
+            if flow_meter_reconnect_status_ok and stable_elapsed >= stable_seconds:
+                flow_meter_reconnect_fresh_reads = 0
+                flow_meter_reconnect_started_at = 0.0
+                flow_meter_reconnect_status_ok = False
+                set_pump_stop_fault_hold(False)
+            else:
+                set_pump_stop_fault_hold(
+                    True,
+                    f"waiting for stable flow meter recovery ({stable_elapsed:.1f}/{stable_seconds:.1f}s)",
+                )
+        else:
+            set_pump_stop_fault_hold(
+                True,
+                flow_meter_reconnect_fault_reason or "waiting for healthy flow meter status",
+            )
+    else:
+        flow_meter_reconnect_fresh_reads = 0
+        flow_meter_reconnect_started_at = 0.0
+        flow_meter_reconnect_status_ok = False
+        flow_meter_reconnect_fault_reason = ""
+        set_pump_stop_fault_hold(False)
+
+
+def _suppress_startup_iol_warning(flow_meter_disconnected=False):
+    """Keep startup IO-Link settling quiet on-screen without changing relay safety."""
+    grace_seconds = max(0.0, float(getattr(config, "IOL_STARTUP_WARNING_GRACE_SECONDS", 0.0)))
+    if grace_seconds <= 0.0 or time.time() - PROGRAM_STARTED_AT > grace_seconds:
+        return False
+    if last_flow_rate >= config.FLOW_STOPPED_THRESHOLD:
+        return False
+    return bool(pump_stop_fault_hold_active or connection_error or flow_meter_disconnected)
+
+
+def start_pump_stop_thread(duration=config.AUTO_ALERT_DURATION):
+    """Fire pump-stop relay without blocking the caller."""
+    relay_thread = threading.Thread(
+        target=pump_stop_relay,
+        args=(duration,),
+        daemon=True,
+    )
+    relay_thread.start()
 
 def load_totals():
     """Load daily and season totals from files"""
@@ -350,6 +937,9 @@ def switch_mode(new_mode):
     if current_mode == 'mix' and new_mode == 'fill' and current_actual_gallons > 0 and current_flow_gpm < 10:
         root.after(0, lambda: force_flow_reset("mix_to_fill_low_flow"))
 
+    if current_mode == 'fill' and new_mode == 'mix' and current_actual_gallons > 0 and current_flow_gpm < 10:
+        root.after(0, lambda: force_flow_reset("fill_to_mix_low_flow"))
+
     # Switch to new mode and load its preset
     current_mode = new_mode
     if current_mode == 'fill':
@@ -360,6 +950,8 @@ def switch_mode(new_mode):
     # Reset color state for new fill
     colors_are_green = False
     serial_command_received = False
+
+    update_mix_mode_indicator()
 
     if current_mode == 'mix':
         if thumbs_up_animation_id:
@@ -372,7 +964,7 @@ def switch_mode(new_mode):
     # Update mode indicator
     if mode_indicator_label:
         if current_mode == 'mix':
-            mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+            place_mix_mode_indicator()
         else:
             mode_indicator_label.place_forget()
 
@@ -384,6 +976,7 @@ def switch_mode(new_mode):
     update_mopeka_display()
     update_bms_display()
     update_last_load_display()
+    update_bms_display()
 
     print(f"Switched to {current_mode.upper()} mode - requested gallons: {requested_gallons}")
 
@@ -398,6 +991,10 @@ _last_requested_text = None
 _last_requested_color = None
 _last_actual_text = None
 _last_actual_color = None
+_last_batch_requested_text = None
+_last_batch_requested_color = None
+_last_batch_actual_text = None
+_last_batch_actual_color = None
 
 def update_batch_mix_overlay():
     """Update the batch mix screen layout based on mode and data"""
@@ -405,6 +1002,7 @@ def update_batch_mix_overlay():
 
     # Only show batch mix layout in mix mode with data
     if current_mode == "mix" and batch_mix_data is not None:
+        place_mix_mode_indicator()
         if thumbs_up_animation_id:
             root.after_cancel(thumbs_up_animation_id)
             thumbs_up_animation_id = None
@@ -416,9 +1014,15 @@ def update_batch_mix_overlay():
         else:
             refresh_batch_mix_products()
             refresh_batch_mix_totals()
+            refresh_batch_mix_tank_levels()
     else:
+        update_mix_mode_indicator()
         if batch_mix_layout_active:
             deactivate_batch_mix_layout()
+        if current_mode == "mix":
+            place_mix_mode_indicator()
+        elif mode_indicator_label:
+            mode_indicator_label.place_forget()
 
 
 def clear_batch_mix_screen(reason="clear"):
@@ -436,12 +1040,13 @@ def clear_batch_mix_screen(reason="clear"):
     print(msg)
     log_serial_debug(msg)
 
+
 def show_batchmix_error(error_msg):
     """Display a BatchMix error message on screen"""
     canvas.delete("batchmix_error")
 
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Red background box
     canvas.create_rectangle(width * 0.1, height * 0.3, width * 0.9, height * 0.5,
@@ -462,20 +1067,22 @@ def activate_batch_mix_layout():
     """Switch to batch mix screen layout"""
     global batch_mix_layout_active
     global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
     # Clear existing labels and redraw in new positions
     canvas.delete("labels")
     canvas.delete("batchmix")
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Left 1/3 section - center point
     left_center_x = width // 6
 
     # Draw "Requested:" label on left side
-    canvas.create_text(left_center_x, int(height * 0.08), text="Requested:",
+    canvas.create_text(left_center_x, int(height * 0.13), text="Requested:",
                       font=("Helvetica", 28, "bold"), fill="white", tags="labels")
 
     # Draw "Actual:" label on left side
@@ -484,16 +1091,17 @@ def activate_batch_mix_layout():
 
     # Separator line above totals (bottom 1/4)
     canvas.create_line(0, int(height * 0.75), width, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
+                      fill="cyan", width=8, tags="batchmix")
 
     # Vertical separator between left and right sections
     canvas.create_line(width // 3, 0, width // 3, int(height * 0.75),
-                      fill="cyan", width=2, tags="batchmix")
+                      fill="cyan", width=8, tags="batchmix")
 
     # Products section title (right 2/3, top area)
-    products_x = width * 2 // 3
+    products_x = int(width * 0.54)
     canvas.create_text(products_x, int(height * 0.05), text="PRODUCTS",
                       font=("Helvetica", 32, "bold"), fill="lime", tags="batchmix")
+    refresh_batch_mix_tank_levels()
 
     # Draw products and totals
     refresh_batch_mix_products()
@@ -505,6 +1113,10 @@ def activate_batch_mix_layout():
     _last_requested_color = None
     _last_actual_text = None
     _last_actual_color = None
+    _last_batch_requested_text = None
+    _last_batch_requested_color = None
+    _last_batch_actual_text = None
+    _last_batch_actual_color = None
 
     # Redraw the numbers in new positions
     redraw_numbers_for_batch_mix()
@@ -518,16 +1130,19 @@ def refresh_batch_mix_totals():
     if batch_mix_data is None:
         return
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     # Bottom 1/4 section - totals info
     bottom_y = int(height * 0.85)
-    label_y = bottom_y + 35
+    label_y = min(height - 28, bottom_y + 62)
+    value_font = ("Helvetica", 77, "bold")
+    label_font = ("Helvetica", 42, "bold")
 
+    acres_format = ".2f" if _batch_mix_has_product_rates() else ".1f"
     totals_data = [
-        (width * 0.12, f"{batch_mix_data.get('total_acres', 0):.1f}", "ACRES"),
+        (width * 0.12, f"{batch_mix_data.get('total_acres', 0):{acres_format}}", "ACRES"),
         (width * 0.37, f"{batch_mix_data.get('gallons_per_acre', 0):.1f}", "GAL/AC"),
         (width * 0.62, f"{batch_mix_data.get('total_liquid', 0):.1f}", "TOTAL GAL"),
         (width * 0.87, f"{batch_mix_data.get('water_needed', 0):.1f}", "WATER"),
@@ -535,11 +1150,412 @@ def refresh_batch_mix_totals():
 
     for x, value, label in totals_data:
         # Value - large cyan text
-        canvas.create_text(x, bottom_y, text=value, font=("Helvetica", 44, "bold"),
+        canvas.create_text(x, bottom_y, text=value, font=value_font,
                           fill="cyan", tags="totals")
         # Label below - smaller gray text
-        canvas.create_text(x, label_y, text=label, font=("Helvetica", 24, "bold"),
+        canvas.create_text(x, label_y, text=label, font=label_font,
                           fill="#d0d0d0", tags="totals")
+
+def _mopeka_quality_color(q):
+    """Return display color for a Mopeka quality value."""
+    if q >= 3:
+        return "#00ff00"
+    if q >= 2:
+        return "#ffff00"
+    if q >= 1:
+        return "#ff8800"
+    return "#ff0000"
+
+def refresh_batch_mix_tank_levels():
+    """Draw small tank levels in the BatchMix product header."""
+    canvas.delete("batchmix_tanks")
+
+    if current_mode != "mix" or batch_mix_data is None or not mopeka_enabled:
+        return
+
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
+    x = width - 20
+    y = int(height * 0.05)
+    font = ("Helvetica", 28, "bold")
+
+    if not mopeka_connected:
+        canvas.create_text(x, y, text="Tanks: No Signal", font=font,
+                          fill="#ff0000", anchor="ne", tags="batchmix_tanks")
+        return
+
+    front_text = f"Front: {mopeka1_gallons:.0f} gal"
+    back_text = f"Back: {mopeka2_gallons:.0f} gal"
+    canvas.create_text(x - 220, y, text=front_text, font=font,
+                      fill=_mopeka_quality_color(mopeka1_quality),
+                      anchor="ne", tags="batchmix_tanks")
+    canvas.create_text(x, y, text=back_text, font=font,
+                      fill=_mopeka_quality_color(mopeka2_quality),
+                      anchor="ne", tags="batchmix_tanks")
+
+def _batch_mix_payload_active():
+    """Return True when the visible BatchMix screen should own knob adjustments."""
+    return current_mode == "mix" and batch_mix_data is not None
+
+def _format_batch_mix_target(value):
+    """Format the water target for the requested-gallons display."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 0.0
+
+    if value == int(value):
+        return f"{int(value)}"
+    return f"{value:.1f}"
+
+def adjust_batch_mix_gallons(delta, source):
+    """Adjust BatchMix gallons and scale all formula amounts from that change."""
+    global batch_mix_data, requested_gallons, mix_requested_gallons, colors_are_green
+
+    if not _batch_mix_payload_active():
+        return False
+
+    try:
+        old_water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        water_needed = max(1.0, old_water_needed + float(delta))
+        batch_mix_data = scaled_batchmix_payload_for_water(batch_mix_data, water_needed)
+        water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        new_acres = float(batch_mix_data.get("total_acres", 0))
+    except Exception as exc:
+        msg = f"{source}: BatchMix gallon adjust failed: {exc}"
+        print(msg)
+        try:
+            with open(debug_log, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        except Exception:
+            pass
+        return True
+
+    requested_gallons = water_needed
+    mix_requested_gallons = water_needed
+    colors_are_green = False
+    save_mode_presets()
+
+    msg = (
+        f"{source}: Adjusted BatchMix gallons by {delta:+.0f}, "
+        f"water target {water_needed:.1f} gal, acres now {new_acres:.1f}"
+    )
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, update_batch_mix_overlay)
+    root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
+    return True
+
+
+def set_batch_mix_gallons(value, source):
+    """Set BatchMix water target and scale all formula amounts to match."""
+    global batch_mix_data, requested_gallons, mix_requested_gallons, colors_are_green
+
+    if not _batch_mix_payload_active():
+        return None
+
+    try:
+        water_target = max(1.0, float(value))
+        batch_mix_data = scaled_batchmix_payload_for_water(batch_mix_data, water_target)
+        water_needed = float(batch_mix_data.get("water_needed", requested_gallons))
+        new_acres = float(batch_mix_data.get("total_acres", 0))
+    except Exception as exc:
+        msg = f"{source}: BatchMix gallon set failed: {exc}"
+        print(msg)
+        try:
+            with open(debug_log, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        except Exception:
+            pass
+        return False
+
+    requested_gallons = water_needed
+    mix_requested_gallons = water_needed
+    colors_are_green = False
+    save_mode_presets()
+
+    msg = (
+        f"{source}: Set BatchMix gallons to {water_needed:.1f}, "
+        f"acres now {new_acres:.1f}"
+    )
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, update_batch_mix_overlay)
+    root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
+    return True
+
+
+def set_requested_gallons(value, source):
+    """Set the active requested-gallons preset from a trusted control path."""
+    global requested_gallons, fill_requested_gallons, mix_requested_gallons, colors_are_green
+
+    try:
+        target = float(value)
+    except (TypeError, ValueError):
+        return False, "invalid number"
+
+    if not math.isfinite(target):
+        return False, "invalid number"
+
+    if current_mode == "mix":
+        batch_mix_result = set_batch_mix_gallons(target, source)
+        if batch_mix_result is not None:
+            if batch_mix_result:
+                return True, requested_gallons
+            return False, "batchmix set failed"
+
+    requested_gallons = max(0.0, target)
+    colors_are_green = False
+
+    if current_mode == "fill":
+        fill_requested_gallons = requested_gallons
+    else:
+        mix_requested_gallons = requested_gallons
+    save_mode_presets()
+
+    msg = f"{source}: Set requested gallons to {requested_gallons:.3f}"
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+
+    root.after(0, lambda value=requested_gallons: draw_requested_number(_format_batch_mix_target(value), "red"))
+    root.after(0, update_batch_mix_overlay)
+    return True, requested_gallons
+
+def _format_batch_mix_product_amount(ounces):
+    """Format product volume as gallons and ounces for display.
+
+    The ounces are shown to 2 decimal places for a fractional amount (the iPad
+    sends amounts at full precision; we no longer round to whole ounces) and as
+    a clean integer when whole.
+    """
+    try:
+        total_ounces = max(0.0, float(ounces))
+    except (TypeError, ValueError):
+        total_ounces = 0.0
+
+    whole_gallons = int(total_ounces // 128)
+    remainder_ounces = total_ounces % 128
+    if remainder_ounces == int(remainder_ounces):
+        oz_text = str(int(remainder_ounces))
+    else:
+        oz_text = f"{remainder_ounces:.2f}"
+
+    if whole_gallons and remainder_ounces:
+        return f"{whole_gallons} gal {oz_text} oz"
+    if whole_gallons:
+        return f"{whole_gallons} gal"
+    return f"{oz_text} oz"
+
+def _format_batch_mix_product_display_amount(prod):
+    """Format the product amount from the BatchMix payload."""
+    if "amount_oz" in prod:
+        return _format_batch_mix_product_amount(prod.get("amount_oz", 0))
+
+    try:
+        pounds = max(0.0, float(prod.get("amount_lb", 0)))
+    except (TypeError, ValueError):
+        pounds = 0.0
+
+    if pounds == int(pounds):
+        return f"{int(pounds)} lb"
+    return f"{pounds:.2f} lb"
+
+def _format_batch_mix_product_rate(prod):
+    """Format the optional product rate from the BatchMix payload."""
+    if "rate_per_acre" not in prod or "rate_unit" not in prod:
+        return ""
+
+    try:
+        rate = max(0.0, float(prod.get("rate_per_acre")))
+    except (TypeError, ValueError):
+        return ""
+
+    rate_unit = prod.get("rate_unit")
+    if not isinstance(rate_unit, str):
+        return ""
+
+    rate_unit = rate_unit.strip()
+    if rate_unit not in ("oz/ac", "lb/ac"):
+        return ""
+
+    if rate == int(rate):
+        rate_text = f"{int(rate)}"
+    else:
+        rate_text = f"{rate:.1f}"
+    return f"{rate_text}{rate_unit}"
+
+def _format_batch_mix_product_name(prod):
+    """Format product name with optional compact rate."""
+    name = prod.get("name", "Unknown")
+    return name
+
+def _batch_mix_has_product_rates():
+    products = batch_mix_data.get("products", []) if batch_mix_data else []
+    if not isinstance(products, list):
+        return False
+    return any(
+        isinstance(product, dict)
+        and "rate_per_acre" in product
+        and "rate_unit" in product
+        for product in products
+    )
+
+def _text_width(text, font, anchor="w"):
+    test_id = canvas.create_text(0, 0, text=text, font=font,
+                                anchor=anchor, tags="temp_measure")
+    bbox = canvas.bbox(test_id)
+    width = bbox[2] - bbox[0] if bbox else 0
+    canvas.delete(test_id)
+    return width
+
+def _hex_to_rgb(color):
+    """Convert #RRGGBB to an RGB tuple."""
+    return tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+
+def _contrast_text_color(background):
+    """Choose black or white text for readable contrast on a hex background."""
+    red, green, blue = _hex_to_rgb(background)
+    luminance = (0.299 * red) + (0.587 * green) + (0.114 * blue)
+    return "black" if luminance >= 150 else "white"
+
+def _batch_mix_badge_color():
+    """Return optional color for the Mix mode badge."""
+    colors = batch_mix_data.get("field_colors", []) if batch_mix_data else []
+    if not isinstance(colors, list) or not colors:
+        return None
+
+    entry = colors[0]
+    if not isinstance(entry, dict):
+        return None
+
+    color = entry.get("color")
+    return parse_field_color(color)
+
+def _striped_mix_badge_image(width, height, first_color, second_color):
+    """Return a two-color striped badge image."""
+    stripe_width = 18
+    first_rgb = _hex_to_rgb(first_color)
+    second_rgb = _hex_to_rgb(second_color)
+    image = Image.new("RGB", (width, height), first_rgb)
+    pixels = image.load()
+    for x in range(width):
+        stripe_color = second_rgb if (x // stripe_width) % 2 else first_rgb
+        for y in range(height):
+            pixels[x, y] = stripe_color
+    return ImageTk.PhotoImage(image)
+
+def _no_color_mix_badge_image(width, height):
+    """Return a white/gray striped badge image for no-color BatchMix payloads."""
+    return _striped_mix_badge_image(width, height, "#FFFFFF", "#BEBEBE")
+
+def _contrast_text_color_for_pair(first_color, second_color):
+    """Choose black or white text for readable contrast on a striped background."""
+    first_rgb = _hex_to_rgb(first_color)
+    second_rgb = _hex_to_rgb(second_color)
+    blended = "#%02X%02X%02X" % tuple(
+        int((first_rgb[index] + second_rgb[index]) / 2) for index in range(3)
+    )
+    return _contrast_text_color(blended)
+
+def update_mix_mode_indicator():
+    """Update the upper-left mix badge from the active BatchMix color."""
+    label = globals().get("mode_indicator_label")
+    if not label:
+        return
+
+    if current_mode != "mix" or batch_mix_data is None:
+        label._stripe_image = None
+        label.configure(
+            text="MIX",
+            foreground="cyan",
+            background="black",
+            image="",
+            compound="none",
+        )
+        return
+
+    _sync_canvas_geometry()
+    badge_width = max(180, _canvas_width() // 3)
+    badge_height = max(54, int(_canvas_height() * 0.085))
+    color_spec = _batch_mix_badge_color()
+    if not color_spec:
+        label._stripe_image = _no_color_mix_badge_image(badge_width, badge_height)
+        label.configure(
+            text="NO COLOR MIX",
+            foreground="black",
+            background="white",
+            image=label._stripe_image,
+            compound="center",
+        )
+        return
+
+    if color_spec[0] == "stripe":
+        first_color, second_color = color_spec[1], color_spec[2]
+        label._stripe_image = _striped_mix_badge_image(
+            badge_width, badge_height, first_color, second_color
+        )
+        label.configure(
+            text="MIX",
+            foreground=_contrast_text_color_for_pair(first_color, second_color),
+            background=first_color,
+            image=label._stripe_image,
+            compound="center",
+        )
+        return
+
+    color = color_spec[1]
+    label._stripe_image = None
+    label.configure(
+        text="MIX",
+        foreground=_contrast_text_color(color),
+        background=color,
+        image="",
+        compound="none",
+    )
+
+def place_mix_mode_indicator():
+    """Place the Mix badge for the active mix screen."""
+    if not mode_indicator_label:
+        return
+
+    if current_mode != "mix":
+        mode_indicator_label.place_forget()
+        return
+
+    _sync_canvas_geometry()
+    update_mix_mode_indicator()
+    if batch_mix_data is None:
+        mode_indicator_label.place(
+            x=10,
+            y=10,
+            width=150,
+            height=58,
+            anchor="nw",
+        )
+        return
+
+    mode_indicator_label.place(
+        x=0,
+        y=0,
+        width=max(180, _canvas_width() // 3),
+        height=max(54, int(_canvas_height() * 0.085)),
+        anchor="nw",
+    )
 
 def refresh_batch_mix_products():
     """Draw/update products list on canvas"""
@@ -550,33 +1566,35 @@ def refresh_batch_mix_products():
     if batch_mix_data is None:
         return
 
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     products = batch_mix_data.get("products", [])
     products_x_start = width // 3 + 20
     products_x_end = width - 20
 
     start_y = int(height * 0.14)
-    row_height = int(height * 0.09)  # Height per product row
+    row_height = int(height * 0.105)  # Height per product row
 
     for i, prod in enumerate(products[:6]):  # Max 6 products
         y = start_y + (i * row_height)
 
         # Product name (left side of products area) - auto-scale to fit
-        name = prod.get("name", "Unknown")
+        name = _format_batch_mix_product_name(prod)
+        rate_text = _format_batch_mix_product_rate(prod)
+        rate_suffix = f" ({rate_text})" if rate_text else ""
         max_name_width = (products_x_end - products_x_start) // 2 - 20  # Half the products area
 
         # Start with larger font, scale down if needed
-        font_size = 40
-        while font_size >= 20:
-            test_id = canvas.create_text(0, 0, text=name,
-                                        font=("Helvetica", font_size, "bold"),
-                                        anchor="w", tags="temp_measure")
-            bbox = canvas.bbox(test_id)
-            text_width = bbox[2] - bbox[0] if bbox else 0
-            canvas.delete(test_id)
+        font_size = 48
+        while font_size >= 22:
+            rate_font_size = max(16, int(font_size * 0.62))
+            text_width = _text_width(name, ("Helvetica", font_size, "bold"))
+            if rate_suffix:
+                text_width += _text_width(
+                    rate_suffix, ("Helvetica", rate_font_size, "bold")
+                )
 
             if text_width <= max_name_width:
                 break
@@ -586,70 +1604,33 @@ def refresh_batch_mix_products():
                           font=("Helvetica", font_size, "bold"), fill="white",
                           anchor="w", tags="products")
 
+        if rate_suffix:
+            rate_font_size = max(16, int(font_size * 0.62))
+            name_width = _text_width(name, ("Helvetica", font_size, "bold"))
+            canvas.create_text(products_x_start + 10 + name_width, y,
+                              text=rate_suffix,
+                              font=("Helvetica", rate_font_size, "bold"),
+                              fill="cyan", anchor="w", tags="products")
+
         # Amount (right side)
-        gallons = prod.get("gallons", 0)
-        jugs = prod.get("jugs", 0)
-        jug_size = prod.get("jug_size", "")
+        amount_text = _format_batch_mix_product_display_amount(prod)
+        max_amount_width = (products_x_end - products_x_start) // 2 - 20
+        amount_font_size = 44
+        while amount_font_size >= 30:
+            test_id = canvas.create_text(0, 0, text=amount_text,
+                                        font=("Helvetica", amount_font_size, "bold"),
+                                        anchor="e", tags="temp_measure")
+            bbox = canvas.bbox(test_id)
+            text_width = bbox[2] - bbox[0] if bbox else 0
+            canvas.delete(test_id)
 
-        if jugs > 0 and jug_size:
-            # Parse jug size to get gallons (e.g., "2.5 gal jug" -> 2.5)
-            try:
-                jug_gallons = float(jug_size.split()[0])
-            except Exception:
-                jug_gallons = 2.5  # default
-            oz_per_jug = jug_gallons * 128
+            if text_width <= max_amount_width:
+                break
+            amount_font_size -= 2
 
-            # Short jug size for display (e.g., "(2.5g Jug)")
-            short_size = f"({jug_gallons:.1f}g Jug)"
-
-            whole_jugs = int(jugs)
-            fraction = jugs - whole_jugs
-
-            # Check if close to half (within 0.02)
-            if abs(fraction - 0.5) < 0.02:
-                if whole_jugs == 0:
-                    amount_text = "1/2 jug"
-                else:
-                    amount_text = f"{whole_jugs} 1/2 jugs"
-            elif fraction < 0.02:
-                # Close to whole number
-                if whole_jugs == 1:
-                    amount_text = "1 jug"
-                else:
-                    amount_text = f"{whole_jugs} jugs"
-            else:
-                # Has extra oz
-                extra_oz = fraction * oz_per_jug
-                if whole_jugs == 0:
-                    amount_text = f"{extra_oz:.0f} oz"
-                    short_size = ""  # No jug size for oz-only
-                elif whole_jugs == 1:
-                    amount_text = f"1 jug + {extra_oz:.0f} oz"
-                else:
-                    amount_text = f"{whole_jugs} jugs + {extra_oz:.0f} oz"
-
-            # Draw amount in yellow, jug size in cyan (two separate texts)
-            if short_size:
-                # Draw jug size first at far right
-                jug_text_id = canvas.create_text(products_x_end - 10, y, text=short_size,
-                                  font=("Helvetica", 30, "bold"), fill="cyan",
-                                  anchor="e", tags="products")
-                # Get width of jug size text
-                bbox = canvas.bbox(jug_text_id)
-                jug_width = bbox[2] - bbox[0] if bbox else 150
-                # Draw amount to the left with some padding
-                canvas.create_text(products_x_end - 20 - jug_width, y, text=amount_text,
-                                  font=("Helvetica", 34, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-            else:
-                canvas.create_text(products_x_end - 10, y, text=amount_text,
-                                  font=("Helvetica", 34, "bold"), fill="yellow",
-                                  anchor="e", tags="products")
-        else:
-            amount_text = f"{gallons:.1f} gal"
-            canvas.create_text(products_x_end - 10, y, text=amount_text,
-                              font=("Helvetica", 28, "bold"), fill="yellow",
-                              anchor="e", tags="products")
+        canvas.create_text(products_x_end - 10, y, text=amount_text,
+                          font=("Helvetica", amount_font_size, "bold"), fill="yellow",
+                          anchor="e", tags="products")
 
         # Draw subtle separator line under each product (except last)
         if i < min(len(products), 6) - 1:
@@ -664,26 +1645,24 @@ def refresh_batch_mix_products():
         canvas.create_text(width * 2 // 3, easy_y, text="EASY MIX",
                           font=("Helvetica", 22, "bold"), fill="lime", tags="products")
 
-    # Warning to double check jug sizes
-    warning_y = start_y + (min(len(products), 6) * row_height) + 40
-    canvas.create_text(width * 2 // 3, warning_y, text="Double check jug size!",
-                      font=("Helvetica", 16, "italic"), fill="red", tags="products")
-
 def deactivate_batch_mix_layout():
     """Switch back to normal screen layout"""
     global batch_mix_layout_active
     global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
     # Clear batch mix elements
     canvas.delete("batchmix")
+    canvas.delete("batchmix_tanks")
     canvas.delete("products")
     canvas.delete("totals")
 
     # Restore normal labels
     canvas.delete("labels")
-    canvas.update()
-    center_x = canvas.winfo_width() // 2
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    center_x = _canvas_width() // 2
+    height = _canvas_height()
 
     canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:",
                       font=("Helvetica", 36, "bold"), fill="white", tags="labels")
@@ -695,6 +1674,10 @@ def deactivate_batch_mix_layout():
     _last_requested_color = None
     _last_actual_text = None
     _last_actual_color = None
+    _last_batch_requested_text = None
+    _last_batch_requested_color = None
+    _last_batch_actual_text = None
+    _last_batch_actual_color = None
 
     # Leave batch-mix layout before redrawing so normal positioning is used.
     batch_mix_layout_active = False
@@ -707,59 +1690,70 @@ _last_requested_text = None
 _last_requested_color = None
 _last_actual_text = None
 _last_actual_color = None
+_last_batch_requested_text = None
+_last_batch_requested_color = None
+_last_batch_actual_text = None
+_last_batch_actual_color = None
+
+def target_display_color(actual_gallons=None):
+    """Return the color used for requested/actual gallons on the main display."""
+    if actual_gallons is None:
+        actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    if actual_gallons > requested_gallons + config.WARNING_THRESHOLD:
+        return "red"
+    return "green" if colors_are_green else "red"
 
 def redraw_numbers_for_batch_mix():
     """Redraw requested/actual numbers in batch mix positions (left 1/3)"""
     global requested_gallons, last_totalizer_liters
-    global _last_requested_text, _last_requested_color, _last_actual_text, _last_actual_color
+    global _last_batch_requested_text, _last_batch_requested_color
+    global _last_batch_actual_text, _last_batch_actual_color
 
-    # Get current color based on state
-    color = "green" if colors_are_green else "red"
-
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     left_center_x = width // 6
+    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    color = target_display_color(actual_gallons)
 
-    # Requested number - smaller font for left panel
-    req_y = int(height * 0.22)
-    req_font = ("Helvetica", 90, "bold")
+    # Requested number - left panel
+    req_y = int(height * 0.27)
+    req_font = ("Helvetica", 151, "bold")
     req_text = f"{requested_gallons:.0f}"
 
-    if req_text != _last_requested_text or color != _last_requested_color:
-        _last_requested_text = req_text
-        _last_requested_color = color
+    if req_text != _last_batch_requested_text or color != _last_batch_requested_color:
         canvas.delete("requested")
         for dx, dy in [(-3,-3), (-3,0), (-3,3), (0,-3), (0,3), (3,-3), (3,0), (3,3)]:
             canvas.create_text(left_center_x+dx, req_y+dy, text=req_text,
                               font=req_font, fill="white", tags="requested")
         canvas.create_text(left_center_x, req_y, text=req_text,
                           font=req_font, fill=color, tags="requested")
+        _last_batch_requested_text = req_text
+        _last_batch_requested_color = color
 
-    # Actual number - smaller font for left panel
-    actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    # Actual number - left panel
     act_y = int(height * 0.55)
-    act_font = ("Helvetica", 110, "bold")
+    act_font = ("Helvetica", 185, "bold")
     act_text = f"{actual_gallons:.1f}"
 
-    if act_text != _last_actual_text or color != _last_actual_color:
-        _last_actual_text = act_text
-        _last_actual_color = color
+    if act_text != _last_batch_actual_text or color != _last_batch_actual_color:
         canvas.delete("actual")
         for dx, dy in [(-4,-4), (-4,0), (-4,4), (0,-4), (0,4), (4,-4), (4,0), (4,4)]:
             canvas.create_text(left_center_x+dx, act_y+dy, text=act_text,
                               font=act_font, fill="white", tags="actual")
         canvas.create_text(left_center_x, act_y, text=act_text,
                           font=act_font, fill=color, tags="actual")
+        _last_batch_actual_text = act_text
+        _last_batch_actual_color = color
 
 def redraw_numbers_normal():
     """Redraw requested/actual numbers in normal centered positions"""
     global requested_gallons, last_totalizer_liters
 
-    color = "green" if colors_are_green else "red"
-    draw_requested_number(f"{requested_gallons:.0f}", color)
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    color = target_display_color(actual_gallons)
+    draw_requested_number(f"{requested_gallons:.0f}", color)
     draw_actual_number(f"{actual_gallons:.1f}", color)
 
 def add_to_totals(gallons):
@@ -768,6 +1762,61 @@ def add_to_totals(gallons):
     daily_total += gallons
     season_total += gallons
     save_totals()
+
+
+def record_flow_curve_learning_sample():
+    """Learn a conservative curve offset from confirmed Auto thumbs-up fills."""
+    calibration_log = "/home/pi/fill_calibration.log"
+    try:
+        sample, reason = flow_curve.make_confirmed_auto_sample(
+            requested_gallons=pending_fill_requested,
+            actual_gallons=pending_fill_gallons,
+            flow_gpm=pending_fill_flow_gpm,
+            threshold_gallons=pending_fill_trigger_threshold,
+            shutoff_type=pending_fill_shutoff_type,
+        )
+    except Exception as exc:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: error"
+                f" | Stage: sample | Error: {exc}\n"
+            )
+        return
+
+    if sample is None:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: skipped"
+                f" | Reason: {reason}\n"
+            )
+        return
+
+    try:
+        result = flow_curve.record_learning_sample(
+            FLOW_CURVE_SAMPLES_PATH,
+            FLOW_CURVE_PROPOSAL_PATH,
+            sample,
+        )
+    except Exception as exc:
+        with open(calibration_log, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: error"
+                f" | Stage: save | Error: {exc}\n"
+            )
+        return
+    with open(calibration_log, "a") as f:
+        f.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: accepted"
+            f" | Samples: {result['sample_count']}/{result['required_sample_count']}"
+        )
+        if result.get("proposal_saved"):
+            learning = result["learning"]
+            f.write(
+                f" | ProposalReady: yes"
+                f" | Offset: {learning['applied_offset_gallons']:+.3f} gal"
+                f" | RawOffset: {learning['raw_offset_gallons']:+.3f} gal"
+            )
+        f.write("\n")
 
 def reset_daily_total():
     """Reset daily total and log the previous day's total"""
@@ -839,13 +1888,13 @@ def update_bms_display():
     if current_mode == "mix":
         return
 
-    title_font = ("Helvetica", 72, "bold")
-    value_font = ("Helvetica", 84, "bold")
-
     if bms_soc is None:
         value_text = "--"
     else:
         value_text = f"{int(round(bms_soc))}%"
+
+    title_font = ("Helvetica", 72, "bold")
+    value_font = ("Helvetica", 84, "bold")
 
     canvas.create_text(
         20,
@@ -886,8 +1935,8 @@ def update_flow_rate_display(flow_rate_gpm):
     if current_mode == "mix":
         return
     canvas.create_text(
-        canvas.winfo_width() - 10,
-        canvas.winfo_height() - 10,
+        _canvas_width() - 10,
+        _canvas_height() - 10,
         text=flow_text,
         font=("Helvetica", 72, "bold"),
         fill="cyan",
@@ -897,28 +1946,81 @@ def update_flow_rate_display(flow_rate_gpm):
     last_flow_rate_text = flow_text
     last_flow_rate_mode = current_mode
 
+def update_pilot_status(connected, name):
+    """Update the tracked pilot identity reported by the BLE server."""
+    global current_pilot_name, current_pilot_connected, last_pilot_disconnect_at
+    name = (name or "").strip()
+    if connected:
+        if name:
+            current_pilot_name = name
+        current_pilot_connected = True
+    else:
+        if name:
+            current_pilot_name = name
+        current_pilot_connected = False
+        last_pilot_disconnect_at = time.time()
+
+
+def current_pilot_label():
+    """Pilot name to stamp on a load (see record_pending_fill)."""
+    if current_pilot_connected and current_pilot_name:
+        return current_pilot_name
+    if current_pilot_name and last_pilot_disconnect_at > 0:
+        elapsed = time.time() - last_pilot_disconnect_at
+        if 0 <= elapsed <= PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS:
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            return f"{current_pilot_name}/disconnected-({minutes}m{seconds}sec)"
+    return "Unknown"
+
+
 def record_pending_fill():
     """Record the pending fill to history log and totals when thumbs up is pressed"""
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, thumbs_up_label, last_loads_gallons
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global pending_fill_stop_to_thumb_start_at
+    global pending_fill_flow_started_at, pending_fill_flow_ended_at
+    global thumbs_up_label, last_loads_gallons
 
     # Only record if there's pending fill data
     if pending_fill_gallons > 0:
         fill_log = "/home/pi/fill_history.log"
         calibration_log = "/home/pi/fill_calibration.log"
+        recorded_at = time.time()
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recorded_at))
+        stop_to_thumb_seconds = (
+            max(0.0, recorded_at - pending_fill_stop_to_thumb_start_at)
+            if pending_fill_stop_to_thumb_start_at > 0 else None
+        )
 
         # Write to fill history log
+        pilot_label = current_pilot_label()
         with open(fill_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal | Actual: {pending_fill_gallons:.3f} gal | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal | {pending_fill_shutoff_type}\n")
+            f.write(
+                f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
+                f" | Actual: {pending_fill_gallons:.3f} gal"
+                f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
+                f" | {pending_fill_shutoff_type}"
+                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
+                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
+                f"{_format_flow_window_fields(pending_fill_flow_started_at, pending_fill_flow_ended_at)}"
+                f" | Pilot: {pilot_label}\n"
+            )
 
         # Write detailed calibration record with flow snapshot and threshold in one line
         with open(calibration_log, 'a') as f:
             f.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Requested: {pending_fill_requested:.3f} gal"
+                f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
                 f" | Actual: {pending_fill_gallons:.3f} gal"
                 f" | Diff: {pending_fill_gallons - pending_fill_requested:+.3f} gal"
+                f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
+                f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
+                f"{_format_flow_window_fields(pending_fill_flow_started_at, pending_fill_flow_ended_at)}"
                 f" | FlowAtStop: {pending_fill_flow_gpm:.1f} GPM"
                 f" | Threshold: {pending_fill_trigger_threshold:.3f} gal"
+                f" | TriggerActual: {last_trigger_actual:.3f} gal"
+                f" | TriggerPredicted: {last_trigger_predicted_actual:.3f} gal"
+                f" | TriggerLoopMs: {last_trigger_loop_dt_ms:.1f}"
                 f" | Type: {pending_fill_shutoff_type}\n"
             )
 
@@ -926,6 +2028,7 @@ def record_pending_fill():
         add_to_totals(pending_fill_gallons)
         last_loads_gallons = [pending_fill_gallons] + last_loads_gallons[:2]
         update_last_load_display()
+        record_flow_curve_learning_sample()
         print(f"Fill recorded - Actual: {pending_fill_gallons:.3f} gal")
         print(f"Updated totals - Daily: {daily_total:.2f}, Season: {season_total:.2f}")
 
@@ -935,6 +2038,10 @@ def record_pending_fill():
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
+        pending_fill_temp_f = None
+        pending_fill_stop_to_thumb_start_at = 0.0
+        pending_fill_flow_started_at = 0.0
+        pending_fill_flow_ended_at = 0.0
 
     else:
         print("No pending fill to record")
@@ -966,58 +2073,57 @@ def handle_thumbs_up_press(source):
 
 def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
     """Activate pump stop relay for specified duration"""
-    relay_log = config.RELAY_TEST_LOG
-
-    # Log function entry
-    with open(relay_log, 'a') as f:
-        f.write(f"\n{'='*60}\n")
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - pump_stop_relay() CALLED\n")
-        f.write(f"Duration: {duration} seconds\n")
-        f.write(f"GPIO_AVAILABLE: {GPIO_AVAILABLE}\n")
-        f.write(f"PUMP_STOP_RELAY_PIN: {config.PUMP_STOP_RELAY_PIN}\n")
-
-    if not GPIO_AVAILABLE:
-        msg = "GPIO not available, cannot control relay"
-        print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - ERROR: {msg}\n")
-        return
+    global pump_stop_pulse_count, last_pump_stop_relay_activated_at
 
     try:
-        # GPIO already initialized during startup - just control the output
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - About to set GPIO {config.PUMP_STOP_RELAY_PIN} HIGH\n")
+        log_relay_event("")
+        log_relay_event("=" * 60)
+        log_relay_event(
+            f"pump_stop_relay() CALLED | duration={duration} | "
+            f"GPIO_AVAILABLE={GPIO_AVAILABLE} | pin={config.PUMP_STOP_RELAY_PIN}"
+        )
 
-        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.HIGH)
+        with pump_stop_relay_lock:
+            pump_stop_pulse_count += 1
+            if _set_pump_stop_output(True, f"pulse start {duration}s"):
+                last_pump_stop_relay_activated_at = time.time()
 
         msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) activated for {duration} seconds"
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to HIGH\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleeping for {duration} seconds...\n")
-
+        log_relay_event(msg)
         time.sleep(duration)
 
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Sleep complete, about to set GPIO {config.PUMP_STOP_RELAY_PIN} LOW\n")
+        relay_released = False
+        with pump_stop_relay_lock:
+            pump_stop_pulse_count = max(0, pump_stop_pulse_count - 1)
+            if pump_stop_pulse_count == 0:
+                _set_pump_stop_output(False, "pulse complete")
+                relay_released = True
+            else:
+                log_relay_event(
+                    "Pulse complete; relay remains HIGH "
+                    f"(active_pulses={pump_stop_pulse_count})"
+                )
 
-        GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
-
-        msg = f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
+        msg = (
+            f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
+            if relay_released
+            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH by active pulse"
+        )
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: GPIO set to LOW\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-            f.write(f"{'='*60}\n")
+        log_relay_event(msg)
+        log_relay_event("=" * 60)
     except Exception as e:
         msg = f"Error controlling relay: {e}"
         print(msg)
-        with open(relay_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - EXCEPTION: {msg}\n")
-            import traceback
-            f.write(traceback.format_exc())
-            f.write(f"{'='*60}\n")
+        log_relay_event(f"EXCEPTION: {msg}")
+        import traceback
+        try:
+            with open(config.RELAY_TEST_LOG, 'a') as f:
+                f.write(traceback.format_exc())
+                f.write(f"{'='*60}\n")
+        except Exception:
+            pass
 
 
 def get_ip_address():
@@ -1028,6 +2134,21 @@ def get_ip_address():
         return ip
     except Exception:
         return "No IP"
+
+def get_assigned_trailer_label():
+    """Return the trailer assignment shown in the system menu."""
+    try:
+        with open(_mopeka_config_path()) as f:
+            cfg = json.load(f)
+        trailer = cfg.get("assigned_trailer", cfg.get("trailer"))
+        if trailer not in (None, ""):
+            return f"TR{trailer}"
+        display_name = str(cfg.get("display_name") or "").strip()
+        if display_name:
+            return display_name
+    except Exception:
+        pass
+    return "Unconfigured"
 
 def get_username():
     """Get the current username"""
@@ -1076,13 +2197,13 @@ def change_colors_to_green(from_button=False):
             colors_are_green = True
 
             # Change the number colors to green by redrawing
-            draw_requested_number(f"{requested_gallons:.0f}", "green")
             current_actual = last_totalizer_liters * config.LITERS_TO_GALLONS
-            draw_actual_number(f"{current_actual:.1f}", "green")
+            display_color = target_display_color(current_actual)
+            draw_requested_number(f"{requested_gallons:.0f}", display_color)
+            draw_actual_number(f"{current_actual:.1f}", display_color)
             # Show big thumbs up on the right side and start animation, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                _set_thumbs_up_visible(True)
+                show_thumbs_up(current_actual)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -1104,8 +2225,7 @@ def change_colors_to_green(from_button=False):
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
             # Show thumbs up but DO NOT change colors to green, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
-                thumbs_up_label.place(relx=0.85, rely=0.35, anchor="n")
-                _set_thumbs_up_visible(True)
+                show_thumbs_up(actual_gallons)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
@@ -1261,6 +2381,7 @@ def close_log_viewer():
         log_viewer_window.destroy()
         log_viewer_window = None
         log_viewer_text = None
+    arm_menu_ov_guard()
     show_menu()
 
 def show_fill_history():
@@ -1348,6 +2469,7 @@ def close_fill_history():
         fill_history_window.destroy()
         fill_history_window = None
         fill_history_text = None
+    arm_menu_ov_guard()
     show_menu()
 
 
@@ -1365,6 +2487,8 @@ def _default_calibration_state():
         "last_step_actual": 0.0,
         "reading": None,
         "return_phase": None,
+        "profile_path": "",
+        "profile_error": "",
     }
 
 
@@ -1395,6 +2519,40 @@ def _calibration_runs_path():
     return "/home/pi/tank_calibration_runs.json"
 
 
+def _mopeka_config_path():
+    return "/opt/mopeka/mopeka_config.json"
+
+
+def _mopeka_calibration_dir():
+    return "/opt/mopeka/calibrations"
+
+
+def _safe_calibration_profile_key(value):
+    key = str(value or "").strip().lower().replace("_", "-")
+    return "".join(ch for ch in key if ch.isalnum() or ch == "-")
+
+
+def _current_tank_calibration_profile_key(tank):
+    try:
+        with open(_mopeka_config_path(), "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+    mode = str(cfg.get("box_mode") or "fleet").strip().lower()
+    trailer = cfg.get("assigned_trailer", cfg.get("trailer"))
+    tank = "back" if tank == "back" else "front"
+
+    if mode != "customer" and trailer not in (None, ""):
+        return _safe_calibration_profile_key(f"trailer-{trailer}-{tank}")
+    return f"customer-{tank}"
+
+
+def _current_tank_calibration_profile_path(tank):
+    profile_key = _current_tank_calibration_profile_key(tank)
+    return os.path.join(_mopeka_calibration_dir(), f"{profile_key}.csv")
+
+
 def _build_dashboard_state_snapshot():
     """Build a compact state snapshot for BLE/iPad clients."""
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -1414,12 +2572,22 @@ def _build_dashboard_state_snapshot():
         "thumbs_visible": bool(thumbs_up_visible),
         "fill_pending": bool(fill_pending),
         "can_confirm_fill": bool(can_confirm_fill),
+        "pending_fill": {
+            "requested_gal": round(pending_fill_requested, 3),
+            "actual_gal": round(pending_fill_gallons, 3),
+            "flow_gpm": round(pending_fill_flow_gpm, 1),
+            "shutoff_type": pending_fill_shutoff_type,
+            "flow_meter_temp_f": None if pending_fill_temp_f is None else round(pending_fill_temp_f, 1),
+            "thumbs_status": "pending",
+        } if fill_pending else None,
         "colors_green": bool(colors_are_green),
         "pump_stop_latched": bool(auto_shutoff_latched),
+        "relay_slowdown_alarm": bool(relay_slowdown_alarm_active),
         "flow_meter_connected": bool(flow_meter_connected),
         "switch_box_connected": bool(switch_box_connected),
         "bms_soc": None if bms_soc is None else int(round(bms_soc)),
         "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
+        "daily_total_gal": round(daily_total, 3),
         "front_tank_gal": round(mopeka1_gallons, 1),
         "back_tank_gal": round(mopeka2_gallons, 1),
         "front_tank_quality": int(mopeka1_quality),
@@ -1427,6 +2595,8 @@ def _build_dashboard_state_snapshot():
         "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
+        "current_curve": flow_curve_status_text(),
+        "pending_curve": flow_curve_proposal_status_text(),
     }
 
 
@@ -1476,6 +2646,53 @@ def _save_calibration_run():
             )
 
 
+def _append_calibration_point(actual_gallons, step_target_gallons=None):
+    reading = calibration_state.get("reading") or _selected_tank_reading()
+    calibration_state["points"].append({
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "step_target_gallons": (
+            actual_gallons if step_target_gallons is None else step_target_gallons
+        ),
+        "actual_total_gallons": actual_gallons,
+        "level_mm": reading["level_mm"],
+        "level_in": reading["level_in"],
+        "display_gallons": reading["gallons"],
+        "quality": reading["quality"],
+    })
+
+
+def _apply_tank_calibration_profile():
+    if not calibration_state or len(calibration_state.get("points", [])) < 2:
+        raise ValueError("Need at least empty plus one fill point")
+
+    tank = calibration_state["tank"]
+    profile_path = _current_tank_calibration_profile_path(tank)
+    os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+
+    if os.path.exists(profile_path):
+        backup_path = f"{profile_path}.backup-{time.strftime('%Y%m%d_%H%M%S')}"
+        with open(profile_path, "r") as src, open(backup_path, "w") as dst:
+            dst.write(src.read())
+
+    rows = []
+    for point in calibration_state["points"]:
+        rows.append({
+            "tank_level_in": float(point["level_in"]),
+            "gallons": float(point["actual_total_gallons"]),
+            "tank_size": float(calibration_state["total_capacity"]),
+        })
+    rows.sort(key=lambda row: row["tank_level_in"], reverse=True)
+
+    tmp_path = f"{profile_path}.tmp"
+    with open(tmp_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Tank Level (in)", "Gallons", "Tank Size (gal)"])
+        for row in rows:
+            writer.writerow([row["tank_level_in"], row["gallons"], row["tank_size"]])
+    os.replace(tmp_path, profile_path)
+    return profile_path
+
+
 def _refresh_calibration_window():
     if not calibration_window or not calibration_state:
         return
@@ -1519,8 +2736,10 @@ def _refresh_calibration_window():
     elif phase == "settling":
         remaining = max(0, int(calibration_state["settle_deadline"] - time.time()))
         body = (
-            f"{tank_label} Tank\n\n{calibration_state['current_step']} gal reached.\n\n"
-            f"Waiting for Mopeka to settle...\n{remaining} sec remaining"
+            f"{tank_label} Tank\n"
+            f"{calibration_state['current_step']} gal reached.\n"
+            "Waiting for Mopeka to settle\n"
+            f"{remaining} sec remaining"
         )
         footer = "PS = ABORT"
         hint = "Do not disturb the tank during the settle period."
@@ -1535,10 +2754,26 @@ def _refresh_calibration_window():
         footer = "OV = SAVE/NEXT   +1 = REREAD   -1 = WAIT 2 MORE MIN   PS = ABORT"
         hint = "Confirm the Mopeka reading before continuing."
     elif phase == "complete":
+        profile_path = _current_tank_calibration_profile_path(calibration_state["tank"])
         body = (
             f"{tank_label} Tank Calibration Complete\n\n"
             f"Saved {len(calibration_state['points'])} calibration points\n"
-            f"through {calibration_state['target_capacity']} gallons."
+            f"through {calibration_state['target_capacity']} gallons.\n\n"
+            "Apply this as the live tank curve?"
+        )
+        footer = "OV = APPLY PROFILE   PS = RETURN"
+        hint = profile_path
+    elif phase == "applied":
+        body = (
+            f"{tank_label} Tank Calibration Applied\n\n"
+            "RotorSync will reload the curve automatically."
+        )
+        footer = "OV = RETURN TO MENU"
+        hint = calibration_state.get("profile_path") or _current_tank_calibration_profile_path(calibration_state["tank"])
+    elif phase == "apply_error":
+        body = (
+            f"{tank_label} Tank Calibration Apply Failed\n\n"
+            f"{calibration_state.get('profile_error', 'Unknown error')}"
         )
         footer = "OV = RETURN TO MENU"
         hint = _calibration_points_path()
@@ -1550,8 +2785,14 @@ def _refresh_calibration_window():
         footer = "OV = YES, ABORT   PS = NO, GO BACK"
         hint = "Use OV to exit the calibration workflow."
 
+    body_font_size = 54
+    if phase in ("wait_for_fill", "settling", "review", "complete", "applied", "apply_error", "abort_confirm"):
+        body_font_size = 46
+    elif phase in ("set_total", "set_target"):
+        body_font_size = 58
+
     calibration_title_label.config(text=title)
-    calibration_body_label.config(text=body)
+    calibration_body_label.config(text=body, font=("Helvetica", body_font_size, "bold"))
     calibration_footer_label.config(text=footer)
     calibration_hint_label.config(text=hint)
 
@@ -1606,33 +2847,40 @@ def show_tank_calibration():
     calibration_window.configure(bg='black')
 
     calibration_title_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 72, "bold"), fg="cyan", bg="black"
+        calibration_window, text="", font=("Helvetica", 40, "bold"), fg="cyan", bg="black"
     )
-    calibration_title_label.pack(pady=24)
+    calibration_title_label.pack(pady=(10, 2))
 
     calibration_body_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 120, "bold"),
+        font=("Helvetica", 54, "bold"),
         fg="white",
         bg="black",
         justify=tk.CENTER,
+        wraplength=760,
     )
-    calibration_body_label.pack(expand=True, padx=40, pady=30)
+    calibration_body_label.pack(expand=True, fill=tk.BOTH, padx=20, pady=6)
 
     calibration_hint_label = tk.Label(
-        calibration_window, text="", font=("Helvetica", 44, "bold"), fg="#ffff99", bg="black"
+        calibration_window,
+        text="",
+        font=("Helvetica", 24, "bold"),
+        fg="#ffff99",
+        bg="black",
+        wraplength=760,
     )
-    calibration_hint_label.pack(pady=14)
+    calibration_hint_label.pack(pady=(2, 4))
 
     calibration_footer_label = tk.Label(
         calibration_window,
         text="",
-        font=("Helvetica", 44, "bold"),
+        font=("Helvetica", 26, "bold"),
         fg="#00ffff",
         bg="#0a0a0a",
+        wraplength=760,
     )
-    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=14, ipady=12)
+    calibration_footer_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8), ipady=6)
 
     _refresh_calibration_window()
 
@@ -1670,20 +2918,18 @@ def calibration_confirm():
     elif phase == "set_target":
         calibration_state["phase"] = "confirm_empty"
     elif phase == "confirm_empty":
+        calibration_state["points"] = []
+        calibration_state["reading"] = _selected_tank_reading()
+        _append_calibration_point(0.0, 0)
+        calibration_state["reading"] = None
         calibration_state["current_step"] = calibration_state["step_size"]
         switch_mode("fill")
         _calibration_prepare_next_step()
     elif phase == "review":
-        reading = calibration_state.get("reading") or _selected_tank_reading()
-        calibration_state["points"].append({
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "step_target_gallons": calibration_state["current_step"],
-            "actual_total_gallons": calibration_state["last_step_actual"],
-            "level_mm": reading["level_mm"],
-            "level_in": reading["level_in"],
-            "display_gallons": reading["gallons"],
-            "quality": reading["quality"],
-        })
+        _append_calibration_point(
+            calibration_state["last_step_actual"],
+            calibration_state["current_step"],
+        )
         next_step = calibration_state["current_step"] + calibration_state["step_size"]
         if next_step <= calibration_state["target_capacity"]:
             calibration_state["current_step"] = next_step
@@ -1691,10 +2937,18 @@ def calibration_confirm():
             return
         _save_calibration_run()
         calibration_state["phase"] = "complete"
+    elif phase == "complete":
+        try:
+            calibration_state["profile_path"] = _apply_tank_calibration_profile()
+            calibration_state["profile_error"] = ""
+            calibration_state["phase"] = "applied"
+        except Exception as exc:
+            calibration_state["profile_error"] = str(exc)
+            calibration_state["phase"] = "apply_error"
     elif phase == "abort_confirm":
         _close_calibration_window(return_to_menu=True)
         return
-    elif phase == "complete":
+    elif phase in ("applied", "apply_error"):
         _close_calibration_window(return_to_menu=True)
         return
 
@@ -1709,6 +2963,9 @@ def calibration_cancel():
     if phase == "choose_tank":
         calibration_state["return_phase"] = "choose_tank"
         calibration_state["phase"] = "abort_confirm"
+        return
+    if phase in ("complete", "applied", "apply_error"):
+        _close_calibration_window(return_to_menu=True)
         return
     if phase == "set_total":
         calibration_state["phase"] = "choose_tank"
@@ -1741,22 +2998,22 @@ def run_self_test():
     self_test_window.configure(bg='black')
 
     # Title
-    title = tk.Label(self_test_window, text="SYSTEM SELF-TEST", font=("Helvetica", 40, "bold"),
+    title = tk.Label(self_test_window, text="SYSTEM SELF-TEST", font=("Helvetica", 44, "bold"),
                      fg="cyan", bg="black")
-    title.pack(pady=20)
+    title.pack(pady=(12, 6))
 
     # Controls instruction
     controls = tk.Label(self_test_window, text="OV=EXIT TO MENU",
-                       font=("Helvetica", 22, "bold"), fg="#ffff00", bg="#0a0a0a")
+                       font=("Helvetica", 28, "bold"), fg="#ffff00", bg="#0a0a0a")
     controls.pack(pady=2)
 
     # Results frame
     results_frame = tk.Frame(self_test_window, bg='black')
-    results_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
+    results_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(8, 14))
 
-    results_text = tk.Text(results_frame, font=("Courier", 24), bg="black", fg="white",
-                           height=15, width=50)
-    results_text.pack()
+    results_text = tk.Text(results_frame, font=("Courier", 32, "bold"), bg="black", fg="white",
+                           wrap=tk.WORD, borderwidth=0, highlightthickness=0)
+    results_text.pack(fill=tk.BOTH, expand=True)
 
     def run_tests():
         results_text.insert(tk.END, "Starting self-test...\n\n")
@@ -1794,7 +3051,8 @@ def run_self_test():
         results_text.insert(tk.END, "3. IOL-HAT Communication: ")
         results_text.update()
         try:
-            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+            with iol_io_lock:
+                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
             if len(raw_data) >= 15 and raw_data != b'\x00' * len(raw_data):
                 results_text.insert(tk.END, "PASS (Data received)\n", "pass")
             else:
@@ -1807,7 +3065,7 @@ def run_self_test():
         results_text.insert(tk.END, "4. Flow Meter Reading: ")
         results_text.update()
         try:
-            gallons = read_flow_meter()
+            gallons = get_cached_actual_gallons() if flow_control_active() else read_flow_meter()
             if not connection_error:
                 results_text.insert(tk.END, f"PASS (Reading: {gallons:.2f} gal)\n", "pass")
             else:
@@ -1822,7 +3080,7 @@ def run_self_test():
         results_text.insert(tk.END, "\n=== Test Complete ===\n")
 
         # Color tags
-        results_text.tag_config("pass", foreground="red")
+        results_text.tag_config("pass", foreground="green")
         results_text.tag_config("fail", foreground="red")
         results_text.tag_config("skip", foreground="yellow")
 
@@ -1837,6 +3095,7 @@ def close_self_test():
     if self_test_window:
         self_test_window.destroy()
         self_test_window = None
+    arm_menu_ov_guard()
 
 def run_full_test():
     """Run comprehensive interactive full system test"""
@@ -1980,7 +3239,8 @@ def run_full_test():
 
         def test_iolhat():
             try:
-                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+                with iol_io_lock:
+                    raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
                 if len(raw_data) >= 15 and raw_data != b'\x00' * len(raw_data):
                     iolhat_success[0] = True
                     root.after(0, lambda: mark_tested('iolhat'))
@@ -2005,7 +3265,8 @@ def run_full_test():
 
         # Test 5: Flow Meter
         try:
-            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+            with iol_io_lock:
+                raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
             if raw_data and len(raw_data) == config.DATA_LENGTH and raw_data != b'\x00' * len(raw_data):
                 root.after(0, lambda: mark_tested('flow_meter'))
             else:
@@ -2034,6 +3295,7 @@ def close_full_test():
     if full_test_window:
         full_test_window.destroy()
         full_test_window = None
+    arm_menu_ov_guard()
 
 def check_wifi_status():
     """Check if WiFi is connected and return status string"""
@@ -2176,6 +3438,16 @@ def run_system_update():
                 "if [ \"$base_name\" = \"mopeka_config.json\" ] && [ -f /opt/mopeka/mopeka_config.json ]; then continue; fi; "
                 "cp \"$mopeka_file\" /opt/mopeka/; "
                 "done; "
+                "if [ ! -s /etc/rotorsync/maintenance.secret ] && [ ! -s /home/pi/.rotorsync-maintenance-secret ]; then "
+                "if [ -n \"${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}\" ]; then "
+                "umask 077; printf '%s' \"${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}\" > /home/pi/.rotorsync-maintenance-secret; chown pi:pi /home/pi/.rotorsync-maintenance-secret; chmod 600 /home/pi/.rotorsync-maintenance-secret; "
+                "elif [ -s /home/pi/Big-Beautiful-Box/deploy/maintenance.secret.local ]; then "
+                "install -m 600 -o pi -g pi /home/pi/Big-Beautiful-Box/deploy/maintenance.secret.local /home/pi/.rotorsync-maintenance-secret; "
+                "fi; "
+                "fi; "
+                "if [ -x /home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh ]; then "
+                "/home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh --restart-dashboard; "
+                "fi; "
                 "chmod 755 /opt/rotorsync_bumble.py /opt/rotorsync_watchdog.py; "
                 "python3 - <<'PY'\n"
                 "from pathlib import Path\n"
@@ -2358,6 +3630,7 @@ def close_update():
     if update_window:
         update_window.destroy()
         update_window = None
+    arm_menu_ov_guard()
 
 def confirm_reset_season():
     """Confirm and reset season total with OV/PS commands"""
@@ -2428,6 +3701,220 @@ def confirm_reset_season():
     # Start countdown
     confirm_window.after(1000, update_countdown)
 
+
+def confirm_reset_flow_curve():
+    """Confirm and reset learned flow curve override with OV/PS commands."""
+    confirm_window = tk.Toplevel()
+    confirm_window.title("Flow Curve Reset Confirmation")
+    confirm_window.attributes('-fullscreen', True)
+    confirm_window.configure(bg='black')
+
+    message = tk.Label(confirm_window, text="USE FACTORY FLOW CURVE?",
+                      font=("Helvetica", 46, "bold"), fg="orange", bg="black")
+    message.pack(expand=True, pady=40)
+
+    current_curve = tk.Label(
+        confirm_window,
+        text=f"Current Curve: {flow_curve_status_text()}",
+        font=("Helvetica", 30, "bold"),
+        fg="lime",
+        bg="black",
+    )
+    current_curve.pack(pady=16)
+
+    detail = tk.Label(
+        confirm_window,
+        text="This archives learned curve samples and reloads factory defaults.",
+        font=("Helvetica", 24, "bold"),
+        fg="white",
+        bg="black",
+        wraplength=1100,
+        justify=tk.CENTER,
+    )
+    detail.pack(pady=12)
+
+    instructions = tk.Label(confirm_window, text="Press OV to CONFIRM or PS to CANCEL",
+                          font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+    instructions.pack(pady=24)
+
+    countdown_label = tk.Label(confirm_window, text="Auto-cancel in 10 seconds",
+                             font=("Helvetica", 22), fg="white", bg="black")
+    countdown_label.pack(pady=16)
+
+    countdown = [10]
+
+    def cancel_reset():
+        global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+        global reset_flow_curve_cancel_handler
+        confirm_window.destroy()
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+
+    def confirm_reset():
+        global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+        global reset_flow_curve_cancel_handler
+        archived = flow_curve.reset_learning(
+            FLOW_CURVE_SAMPLES_PATH,
+            FLOW_CURVE_PROPOSAL_PATH,
+            FLOW_CURVE_OVERRIDE_PATH,
+        )
+        load_flow_curve_state()
+        with open("/home/pi/fill_calibration.log", "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | CurveLearning: factory reset"
+                f" | Archived: {', '.join(archived) if archived else 'none'}\n"
+            )
+        confirm_window.destroy()
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+        if menu_window:
+            close_menu()
+            show_menu()
+
+    def update_countdown():
+        countdown[0] -= 1
+        if countdown[0] <= 0:
+            cancel_reset()
+        else:
+            countdown_label.config(text=f"Auto-cancel in {countdown[0]} seconds")
+            confirm_window.after(1000, update_countdown)
+
+    confirm_window.bind('<Escape>', lambda e: cancel_reset())
+
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    reset_flow_curve_confirm_window = confirm_window
+    reset_flow_curve_confirm_handler = confirm_reset
+    reset_flow_curve_cancel_handler = cancel_reset
+
+    confirm_window.after(1000, update_countdown)
+
+
+def confirm_accept_flow_curve():
+    """Confirm and activate a pending learned flow curve proposal."""
+    proposal = flow_curve.load_curve_proposal(FLOW_CURVE_PROPOSAL_PATH)
+    if not proposal:
+        confirm_window = tk.Toplevel()
+        confirm_window.title("No Curve Proposal")
+        confirm_window.attributes('-fullscreen', True)
+        confirm_window.configure(bg='black')
+
+        message = tk.Label(confirm_window, text="NO LEARNED CURVE READY",
+                          font=("Helvetica", 46, "bold"), fg="orange", bg="black")
+        message.pack(expand=True, pady=50)
+        detail = tk.Label(confirm_window, text="Need 3 thumbs-up confirmed Auto fills first.",
+                         font=("Helvetica", 28, "bold"), fg="white", bg="black")
+        detail.pack(pady=20)
+        instructions = tk.Label(confirm_window, text="Press OV or PS to return",
+                              font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+        instructions.pack(pady=30)
+
+        def close_notice():
+            global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+            global accept_flow_curve_cancel_handler
+            confirm_window.destroy()
+            accept_flow_curve_confirm_window = None
+            accept_flow_curve_confirm_handler = None
+            accept_flow_curve_cancel_handler = None
+
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        accept_flow_curve_confirm_window = confirm_window
+        accept_flow_curve_confirm_handler = close_notice
+        accept_flow_curve_cancel_handler = close_notice
+        confirm_window.after(8000, close_notice)
+        return
+
+    learning = proposal.get("learning", {})
+    offset = learning.get("applied_offset_gallons")
+    raw_offset = learning.get("raw_offset_gallons")
+    sample_count = proposal.get("sample_count", 0)
+
+    confirm_window = tk.Toplevel()
+    confirm_window.title("Accept Flow Curve Confirmation")
+    confirm_window.attributes('-fullscreen', True)
+    confirm_window.configure(bg='black')
+
+    message = tk.Label(confirm_window, text="ACCEPT LEARNED FLOW CURVE?",
+                      font=("Helvetica", 44, "bold"), fg="orange", bg="black")
+    message.pack(expand=True, pady=36)
+
+    detail_text = (
+        f"Samples: {sample_count} Auto fills\n"
+        f"Proposed offset: {offset:+.3f} gal\n"
+        f"Raw offset: {raw_offset:+.3f} gal"
+        if isinstance(offset, (int, float)) and isinstance(raw_offset, (int, float))
+        else f"Samples: {sample_count} Auto fills"
+    )
+    detail = tk.Label(
+        confirm_window,
+        text=detail_text,
+        font=("Helvetica", 28, "bold"),
+        fg="lime",
+        bg="black",
+        justify=tk.CENTER,
+    )
+    detail.pack(pady=16)
+
+    warning = tk.Label(
+        confirm_window,
+        text="This makes the learned curve active. Factory curve remains available.",
+        font=("Helvetica", 23, "bold"),
+        fg="white",
+        bg="black",
+        wraplength=1100,
+        justify=tk.CENTER,
+    )
+    warning.pack(pady=12)
+
+    instructions = tk.Label(confirm_window, text="Press OV to ACCEPT or PS to CANCEL",
+                          font=("Helvetica", 22, "bold"), fg="cyan", bg="black")
+    instructions.pack(pady=24)
+
+    countdown_label = tk.Label(confirm_window, text="Auto-cancel in 10 seconds",
+                             font=("Helvetica", 22), fg="white", bg="black")
+    countdown_label.pack(pady=16)
+
+    countdown = [10]
+
+    def cancel_accept():
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        confirm_window.destroy()
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
+
+    def confirm_accept():
+        global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+        global accept_flow_curve_cancel_handler
+        accept_pending_flow_curve("TrailerScreen")
+        confirm_window.destroy()
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
+        if menu_window:
+            close_menu()
+            show_menu()
+
+    def update_countdown():
+        countdown[0] -= 1
+        if countdown[0] <= 0:
+            cancel_accept()
+        else:
+            countdown_label.config(text=f"Auto-cancel in {countdown[0]} seconds")
+            confirm_window.after(1000, update_countdown)
+
+    confirm_window.bind('<Escape>', lambda e: cancel_accept())
+
+    accept_flow_curve_confirm_window = confirm_window
+    accept_flow_curve_confirm_handler = confirm_accept
+    accept_flow_curve_cancel_handler = cancel_accept
+
+    confirm_window.after(1000, update_countdown)
+
 def shutdown_system():
     """Shutdown the system"""
     import subprocess
@@ -2470,18 +3957,13 @@ def reboot_system():
     reboot_thread = threading.Thread(target=do_reboot, daemon=True)
     reboot_thread.start()
 
-def update_menu_highlight():
-    """Update visual highlighting of selected menu item"""
-    global menu_buttons, menu_arrows, menu_selected_index, menu_position_label
-
-    if not menu_buttons or not menu_arrows:
+def style_menu_item(index, selected):
+    """Apply selected or unselected styling to a single menu item."""
+    if index < 0 or index >= len(menu_buttons) or index >= len(menu_arrows):
         return
 
-    # Update position indicator with current selection
-    if menu_position_label:
-        menu_position_label.config(
-            text=f"Option {menu_selected_index + 1} of {len(MENU_ITEMS)}: {MENU_ITEMS[menu_selected_index]}"
-        )
+    btn = menu_buttons[index]
+    arrow = menu_arrows[index]
 
     # High-contrast unselected palette for sunlight readability.
     colors = [
@@ -2499,31 +3981,88 @@ def update_menu_highlight():
         ("#e3e3e3", "#111111"),  # Exit Menu
     ]
 
-    for i, (btn, arrow) in enumerate(zip(menu_buttons, menu_arrows)):
-        if i == menu_selected_index:
-            # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
-            btn.config(bg="#111111", fg="#ffff00",
-                      activebackground="#111111", activeforeground="#ffff00",
-                      font=("Helvetica", 28, "bold"),
-                      relief=tk.RAISED, borderwidth=6,
-                      highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
-                      width=16, height=2,
-                      wraplength=360, justify=tk.CENTER)
-            arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
-                        font=("Helvetica", 20, "bold"))
-        else:
-            # Unselected - Keep it bright enough to read in direct sun.
-            bg, fg = colors[i % len(colors)]
-            btn.config(bg=bg, fg=fg,
-                      activebackground=bg, activeforeground=fg,
-                      font=("Helvetica", 28, "bold"),
-                      relief=tk.FLAT, borderwidth=2,
-                      highlightthickness=0,
-                      highlightbackground=bg,
-                      highlightcolor=bg,
-                      width=16, height=2,
-                      wraplength=360, justify=tk.CENTER)
-            arrow.config(text="", fg="black")
+    if selected:
+        # SELECTED - Use a dark tile with bright text so it stands off the lighter menu items.
+        btn.config(bg="#111111", fg="#ffff00",
+                  activebackground="#111111", activeforeground="#ffff00",
+                  font=("Helvetica", 28, "bold"),
+                  relief=tk.RAISED, borderwidth=6,
+                  highlightbackground="#ffffff", highlightthickness=4, highlightcolor="#ffffff",
+                  width=16, height=2,
+                  wraplength=360, justify=tk.CENTER)
+        arrow.config(text=">>> SELECTED >>>", fg="#00ffff",
+                    font=("Helvetica", 20, "bold"))
+    else:
+        bg, fg = colors[index % len(colors)]
+        btn.config(bg=bg, fg=fg,
+                  activebackground=bg, activeforeground=fg,
+                  font=("Helvetica", 28, "bold"),
+                  relief=tk.FLAT, borderwidth=2,
+                  highlightthickness=0,
+                  highlightbackground=bg,
+                  highlightcolor=bg,
+                  width=16, height=2,
+                  wraplength=360, justify=tk.CENTER)
+        arrow.config(text="", fg="black")
+
+def update_menu_highlight(full_refresh=False):
+    """Update visual highlighting of selected menu item."""
+    global menu_buttons, menu_arrows, menu_selected_index, menu_position_label, menu_displayed_index
+
+    if not menu_buttons or not menu_arrows:
+        return
+
+    # Update position indicator with current selection
+    if menu_position_label:
+        menu_position_label.config(
+            text=f"Option {menu_selected_index + 1} of {len(MENU_ITEMS)}: {MENU_ITEMS[menu_selected_index]}"
+        )
+
+    if full_refresh or menu_displayed_index is None:
+        for i in range(len(menu_buttons)):
+            style_menu_item(i, i == menu_selected_index)
+    else:
+        if menu_displayed_index != menu_selected_index:
+            style_menu_item(menu_displayed_index, False)
+        style_menu_item(menu_selected_index, True)
+
+    menu_displayed_index = menu_selected_index
+
+def _apply_menu_highlight_update():
+    """Run one coalesced menu highlight redraw on the Tk thread."""
+    global menu_highlight_refresh_pending
+    menu_highlight_refresh_pending = False
+    update_menu_highlight()
+
+def schedule_menu_highlight_update():
+    """Schedule at most one menu redraw while serial knob pulses are arriving."""
+    global menu_highlight_refresh_pending
+    if menu_highlight_refresh_pending:
+        return
+    menu_highlight_refresh_pending = True
+    root.after(0, _apply_menu_highlight_update)
+
+
+def arm_menu_ov_guard():
+    """Ignore repeated OV messages from the same press after a screen change."""
+    global menu_ov_guard_until
+    menu_ov_guard_until = time.time() + MENU_OV_GUARD_SECONDS
+
+
+def should_ignore_menu_ov_bounce(line, source):
+    global menu_ov_guard_until
+    if line != "OV":
+        menu_ov_guard_until = 0.0
+        return False
+    if time.time() >= menu_ov_guard_until:
+        return False
+    msg = f"{source}: Ignored OV bounce after menu select"
+    print(msg)
+    log_serial_debug(msg)
+    with open(debug_log, 'a') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    return True
+
 
 def menu_navigate_up():
     """Move selection up in menu"""
@@ -2532,7 +4071,7 @@ def menu_navigate_up():
     menu_selected_index = (menu_selected_index - 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_up: {old_index} -> {menu_selected_index}\n")
-    update_menu_highlight()
+    schedule_menu_highlight_update()
 
 def menu_navigate_down():
     """Move selection down in menu"""
@@ -2541,7 +4080,7 @@ def menu_navigate_down():
     menu_selected_index = (menu_selected_index + 1) % len(MENU_ITEMS)
     with open('/home/pi/menu_debug.log', 'a') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_down: {old_index} -> {menu_selected_index}\n")
-    update_menu_highlight()
+    schedule_menu_highlight_update()
 
 def menu_select():
     """Activate the currently selected menu item"""
@@ -2562,18 +4101,22 @@ def menu_select():
     elif menu_selected_index == 4:
         confirm_reset_season()
     elif menu_selected_index == 5:
-        run_self_test()
+        confirm_accept_flow_curve()
     elif menu_selected_index == 6:
-        run_bug_capture()
+        confirm_reset_flow_curve()
     elif menu_selected_index == 7:
-        run_system_update()
+        run_self_test()
     elif menu_selected_index == 8:
-        shutdown_system()
+        run_bug_capture()
     elif menu_selected_index == 9:
-        reboot_system()
+        run_system_update()
     elif menu_selected_index == 10:
-        exit_to_desktop()
+        shutdown_system()
     elif menu_selected_index == 11:
+        reboot_system()
+    elif menu_selected_index == 12:
+        exit_to_desktop()
+    elif menu_selected_index == 13:
         close_menu()
 
 def exit_to_desktop():
@@ -2637,16 +4180,29 @@ def exit_to_desktop():
 
 def close_menu():
     """Close the menu and return to main dashboard"""
-    global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index
+    global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_displayed_index
+    global menu_highlight_refresh_pending
     global exit_confirm_window, exit_confirm_handler, exit_cancel_handler
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+    global accept_flow_curve_cancel_handler
     menu_mode = False
     menu_selected_index = 0
+    menu_displayed_index = None
+    menu_highlight_refresh_pending = False
     menu_buttons = []
     menu_arrows = []
     # Reset exit confirmation globals
     exit_confirm_window = None
     exit_confirm_handler = None
     exit_cancel_handler = None
+    reset_flow_curve_confirm_window = None
+    reset_flow_curve_confirm_handler = None
+    reset_flow_curve_cancel_handler = None
+    accept_flow_curve_confirm_window = None
+    accept_flow_curve_confirm_handler = None
+    accept_flow_curve_cancel_handler = None
     if menu_window:
         menu_window.destroy()
         menu_window = None
@@ -2718,11 +4274,18 @@ def show_daily_reminders():
 def show_menu():
     """Display the main menu"""
     global menu_mode, menu_window, menu_buttons, menu_arrows, menu_selected_index, menu_position_label
+    global menu_displayed_index, menu_highlight_refresh_pending
+
+    load_flow_curve_state()
 
     # Defensive cleanup in case any stale submenu window/mode was left behind.
     global log_viewer_mode, log_viewer_window, log_viewer_text
     global fill_history_mode, fill_history_window, fill_history_text
     global calibration_mode, calibration_window, calibration_state
+    global reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler
+    global reset_flow_curve_cancel_handler
+    global accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler
+    global accept_flow_curve_cancel_handler
 
     log_viewer_mode = False
     if log_viewer_window:
@@ -2751,6 +4314,24 @@ def show_menu():
         calibration_window = None
         calibration_state = None
 
+    if reset_flow_curve_confirm_window:
+        try:
+            reset_flow_curve_confirm_window.destroy()
+        except Exception:
+            pass
+        reset_flow_curve_confirm_window = None
+        reset_flow_curve_confirm_handler = None
+        reset_flow_curve_cancel_handler = None
+
+    if accept_flow_curve_confirm_window:
+        try:
+            accept_flow_curve_confirm_window.destroy()
+        except Exception:
+            pass
+        accept_flow_curve_confirm_window = None
+        accept_flow_curve_confirm_handler = None
+        accept_flow_curve_cancel_handler = None
+
     if menu_window:
         try:
             menu_window.destroy()
@@ -2760,6 +4341,8 @@ def show_menu():
 
     menu_mode = True
     menu_selected_index = 0  # Start at first item
+    menu_displayed_index = None
+    menu_highlight_refresh_pending = False
     menu_buttons = []
     menu_arrows = []
 
@@ -2798,6 +4381,12 @@ def show_menu():
                        font=("Helvetica", 22), fg="#00d4ff", bg="#1a1a1a")
     ip_label.pack(anchor='w', pady=2)
 
+    # Assigned trailer
+    assigned_trailer = get_assigned_trailer_label()
+    trailer_label = tk.Label(left_info_frame, text=f"Trailer: {assigned_trailer}",
+                             font=("Helvetica", 22), fg="#00d4ff", bg="#1a1a1a")
+    trailer_label.pack(anchor='w', pady=2)
+
     # Username
     username = get_username()
     user_label = tk.Label(left_info_frame, text=f"User: {username}",
@@ -2815,6 +4404,14 @@ def show_menu():
     version_label = tk.Label(center_frame, text=f"Version {VERSION}", font=("Helvetica", 20),
                             fg="#888888", bg="#1a1a1a")
     version_label.pack()
+
+    curve_label = tk.Label(center_frame, text=f"Curve: {flow_curve_status_text()}",
+                           font=("Helvetica", 18), fg="#ffaa00", bg="#1a1a1a")
+    curve_label.pack()
+
+    proposal_label = tk.Label(center_frame, text=flow_curve_proposal_status_text(),
+                              font=("Helvetica", 16), fg="#ffd080", bg="#1a1a1a")
+    proposal_label.pack()
 
     # Right side - Totals Panel
     global menu_daily_label, menu_season_label
@@ -2859,6 +4456,8 @@ def show_menu():
         ("TANK CALIBRATION", show_tank_calibration),
         ("FULL TEST", run_full_test),
         ("RESET SEASON", lambda: confirm_reset_season()),
+        ("ACCEPT CURVE", lambda: confirm_accept_flow_curve()),
+        ("FACTORY CURVE", lambda: confirm_reset_flow_curve()),
         ("SELF TEST", run_self_test),
         ("CAPTURE BUG", run_bug_capture),
         ("SYSTEM UPDATE", run_system_update),
@@ -2914,22 +4513,7 @@ def show_menu():
     instructions.pack(pady=8)
 
     # Apply initial highlight
-    update_menu_highlight()
-
-def should_debounce_ui_serial_command(line):
-    """Ignore repeated switch-box UI pulses that would double-navigate/select."""
-    global last_ui_serial_command, last_ui_serial_command_time
-
-    if line not in {'OV', '+1', '-1', 'PS'}:
-        return False
-
-    now = time.time()
-    if line == last_ui_serial_command and (now - last_ui_serial_command_time) < 0.25:
-        return True
-
-    last_ui_serial_command = line
-    last_ui_serial_command_time = now
-    return False
+    update_menu_highlight(full_refresh=True)
 
 def iol_power_cycle():
     """Power-cycle the IOL port in a background thread to trigger re-negotiation.
@@ -2942,53 +4526,54 @@ def iol_power_cycle():
     global iol_power_cycle_in_progress, last_power_cycle_time
 
     try:
-        # Check port status before power cycle
-        try:
-            pre_status = iolhat.readStatus2(config.IOL_PORT)
-            print(f"IOL power-cycle: Pre-cycle status - pdInValid={pre_status.pd_in_valid}, "
-                  f"txRate=0x{pre_status.transmission_rate:02X}, "
-                  f"error=0x{pre_status.error:02X}, power={pre_status.power}", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Pre-cycle status check failed: {e}", flush=True)
-
-        print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle", flush=True)
-
-        # Step 1: Power off
-        try:
-            iolhat.power(config.IOL_PORT, 0)
-            print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Failed to power off: {e}", flush=True)
-            return
-
-        time.sleep(1.0)
-
-        # Step 2: Power on
-        try:
-            iolhat.power(config.IOL_PORT, 1)
-            print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
-        except Exception as e:
-            print(f"IOL power-cycle: Failed to power on: {e}", flush=True)
-            return
-
-        # Step 3: Wait for IO-Link handshake (up to 5 seconds, polling status)
-        for attempt in range(5):
-            time.sleep(1.0)
+        with iol_io_lock:
+            # Check port status before power cycle
             try:
-                post_status = iolhat.readStatus2(config.IOL_PORT)
-                print(f"IOL power-cycle: Post-cycle check {attempt+1}/5 - "
-                      f"pdInValid={post_status.pd_in_valid}, "
-                      f"txRate=0x{post_status.transmission_rate:02X}, "
-                      f"error=0x{post_status.error:02X}", flush=True)
-                if post_status.pd_in_valid == 1 and post_status.transmission_rate != 0:
-                    print(f"IOL power-cycle: Device reconnected successfully", flush=True)
-                    try:
-                        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
-                    except:
-                        pass
-                    return
+                pre_status = iolhat.readStatus2(config.IOL_PORT)
+                print(f"IOL power-cycle: Pre-cycle status - pdInValid={pre_status.pd_in_valid}, "
+                      f"txRate=0x{pre_status.transmission_rate:02X}, "
+                      f"error=0x{pre_status.error:02X}, power={pre_status.power}", flush=True)
             except Exception as e:
-                print(f"IOL power-cycle: Post-cycle status check failed: {e}", flush=True)
+                print(f"IOL power-cycle: Pre-cycle status check failed: {e}", flush=True)
+
+            print(f"IOL power-cycle: Starting port {config.IOL_PORT} power-cycle", flush=True)
+
+            # Step 1: Power off
+            try:
+                iolhat.power(config.IOL_PORT, 0)
+                print(f"IOL power-cycle: Port {config.IOL_PORT} powered OFF", flush=True)
+            except Exception as e:
+                print(f"IOL power-cycle: Failed to power off: {e}", flush=True)
+                return
+
+            time.sleep(1.0)
+
+            # Step 2: Power on
+            try:
+                iolhat.power(config.IOL_PORT, 1)
+                print(f"IOL power-cycle: Port {config.IOL_PORT} powered ON", flush=True)
+            except Exception as e:
+                print(f"IOL power-cycle: Failed to power on: {e}", flush=True)
+                return
+
+            # Step 3: Wait for IO-Link handshake (up to 5 seconds, polling status)
+            for attempt in range(5):
+                time.sleep(1.0)
+                try:
+                    post_status = iolhat.readStatus2(config.IOL_PORT)
+                    print(f"IOL power-cycle: Post-cycle check {attempt+1}/5 - "
+                          f"pdInValid={post_status.pd_in_valid}, "
+                          f"txRate=0x{post_status.transmission_rate:02X}, "
+                          f"error=0x{post_status.error:02X}", flush=True)
+                    if post_status.pd_in_valid == 1 and post_status.transmission_rate != 0:
+                        print(f"IOL power-cycle: Device reconnected successfully", flush=True)
+                        try:
+                            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+                        except:
+                            pass
+                        return
+                except Exception as e:
+                    print(f"IOL power-cycle: Post-cycle status check failed: {e}", flush=True)
 
         print(f"IOL power-cycle: Device did not reconnect after power cycle", flush=True)
 
@@ -3016,7 +4601,7 @@ def _try_iol_power_cycle():
 def _log_iol_disconnect_status(reason):
     """Read STATUS2 and log the hardware error byte when a disconnect is first detected."""
     try:
-        st = iolhat.readStatus2(config.IOL_PORT)
+        _, st = _read_iol_status_ok()
         print(f"IOL DISCONNECT [{reason}]: pdInValid={st.pd_in_valid}, "
               f"txRate=0x{st.transmission_rate:02X}, "
               f"cycleTime=0x{st.master_cycle_time:02X}, "
@@ -3024,14 +4609,45 @@ def _log_iol_disconnect_status(reason):
     except Exception as e:
         print(f"IOL DISCONNECT [{reason}]: STATUS2 read failed: {e}", flush=True)
 
+def _read_iol_status_ok():
+    """Return whether IO-Link status indicates valid process data."""
+    with iol_io_lock:
+        st = iolhat.readStatus2(config.IOL_PORT)
+    ok = st.pd_in_valid == 1 and st.transmission_rate != 0 and st.error == 0
+    return ok, st
+
+
+def _describe_iol_status_fault(st):
+    """Return a field-friendly reason for an unhealthy IO-Link status."""
+    status_error = getattr(st, "error", 0)
+    if status_error & 0x02:
+        return "LOW VOLTAGE: check 24V"
+    if status_error & 0x04:
+        return "IO-Link current limit"
+    if status_error & 0x01:
+        return "IO-Link CQ fault"
+    if getattr(st, "power", 0) != 1:
+        return "IO-Link port power off"
+    if getattr(st, "pd_in_valid", 0) != 1:
+        return "flow meter data invalid"
+    if getattr(st, "transmission_rate", 0) == 0:
+        return "flow meter no COM"
+    return "waiting for healthy flow meter status"
+
+
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
     global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
+    global last_flow_meter_temp_f
+    global last_flow_read_was_fresh, last_fresh_flow_read_time
     global consecutive_identical_raw, last_raw_data
 
     try:
-        # Read process data from IO-Link device
-        raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
+        last_flow_read_was_fresh = False
+        # Read process data from IO-Link device. The flow-control thread is the
+        # normal owner; this lock protects occasional diagnostics from racing it.
+        with iol_io_lock:
+            raw_data = iolhat.pd(config.IOL_PORT, 0, config.DATA_LENGTH, None)
 
         if len(raw_data) >= 15:
             if raw_data == b'\x00' * len(raw_data):
@@ -3052,36 +4668,71 @@ def read_flow_meter():
             if connection_error and raw_data != last_raw_data:
                 print(f"Flow meter reconnected - valid data received", flush=True)
 
-            # Check for stale data (byte-for-byte identical reads = meter disconnected)
-            # A connected meter always has micro-fluctuations in the raw bytes
-            if raw_data == last_raw_data:
+            raw_data_changed = raw_data != last_raw_data
+            raw_flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
+
+            # Identical idle process data can be valid at zero flow. Only treat
+            # repeated identical bytes as stale if IO-Link status is unhealthy
+            # or the frozen data claims flow is still active.
+            if not raw_data_changed:
                 consecutive_identical_raw += 1
-                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
-                    connection_error = True
-                    stale_secs = consecutive_identical_raw * (config.UPDATE_INTERVAL / 1000.0)
-                    error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
-                    if consecutive_identical_raw == STALE_RAW_THRESHOLD:
-                        print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
-                        _log_iol_disconnect_status("stale data")
-                        try:
-                            iolhat.led(config.IOL_PORT, iolhat.LED_RED)
-                        except:
-                            pass
-                    _try_iol_power_cycle()
-                    return last_totalizer_liters * config.LITERS_TO_GALLONS
+                stale_threshold = stale_raw_threshold_reads()
+                if consecutive_identical_raw >= stale_threshold:
+                    try:
+                        status_ok, st = _read_iol_status_ok()
+                    except Exception:
+                        status_ok = False
+                        st = None
+
+                    if status_ok and abs(raw_flow_rate_l_per_s) < config.FLOW_STOPPED_THRESHOLD:
+                        if consecutive_identical_raw == stale_threshold:
+                            print("Flow meter identical idle data accepted with healthy IO-Link status", flush=True)
+                            log_flow_control(
+                                "flow_meter_identical_data_ok"
+                                f" | count={consecutive_identical_raw}"
+                                f" | flow_lps={raw_flow_rate_l_per_s:.6f}"
+                                f" | pdInValid={st.pd_in_valid}"
+                                f" | txRate=0x{st.transmission_rate:02X}"
+                                f" | error=0x{st.error:02X}"
+                            )
+                        consecutive_identical_raw = 0
+                    else:
+                        if st is not None and consecutive_identical_raw == stale_threshold:
+                            log_flow_control(
+                                "flow_meter_identical_data_bad_status"
+                                f" | count={consecutive_identical_raw}"
+                                f" | flow_lps={raw_flow_rate_l_per_s:.6f}"
+                                f" | pdInValid={st.pd_in_valid}"
+                                f" | txRate=0x{st.transmission_rate:02X}"
+                                f" | error=0x{st.error:02X}"
+                            )
+                        connection_error = True
+                        stale_secs = consecutive_identical_raw * flow_read_interval_seconds()
+                        error_message = f"Stale data - meter may be disconnected ({stale_secs:.0f}s)"
+                        if consecutive_identical_raw == stale_threshold:
+                            print(f"Flow meter stale data detected after {stale_secs:.0f}s", flush=True)
+                            _log_iol_disconnect_status("stale data")
+                            try:
+                                iolhat.led(config.IOL_PORT, iolhat.LED_RED)
+                            except:
+                                pass
+                        _try_iol_power_cycle()
+                        return last_totalizer_liters * config.LITERS_TO_GALLONS
             else:
-                if consecutive_identical_raw >= STALE_RAW_THRESHOLD:
+                if consecutive_identical_raw >= stale_raw_threshold_reads():
                     print(f"Flow meter data flowing again", flush=True)
                 consecutive_identical_raw = 0
             last_raw_data = raw_data
 
             # Decode the data according to Picomag format
             totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
-            flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
+            flow_rate_l_per_s = raw_flow_rate_l_per_s
+            flow_meter_temp_f = _decode_flow_meter_temp_f(raw_data)
             detect_totalizer_reset(totalizer_liters)
 
             last_totalizer_liters = totalizer_liters
             last_flow_rate = flow_rate_l_per_s
+            last_flow_meter_temp_f = flow_meter_temp_f
             # Clear error state - set LED green on reconnect
             if connection_error:
                 try:
@@ -3091,6 +4742,9 @@ def read_flow_meter():
             connection_error = False
             error_message = ""
             last_successful_read_time = time.time()
+            last_flow_read_was_fresh = raw_data_changed
+            if raw_data_changed:
+                last_fresh_flow_read_time = last_successful_read_time
 
             return totalizer_liters * config.LITERS_TO_GALLONS
         else:
@@ -3103,6 +4757,296 @@ def read_flow_meter():
         error_message = str(e)
         _try_iol_power_cycle()
         return last_totalizer_liters * config.LITERS_TO_GALLONS
+
+
+def _flow_control_process_sample(actual, now, loop_dt_ms):
+    """Run safety-critical auto-shutoff decisions from the control loop."""
+    global flow_control_was_flowing, flow_cycle_counter, last_alert_triggered
+    global auto_shutoff_latched, last_flowing_rate_l_per_s
+    global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
+
+    is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+    flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+    current_flow_gpm = max(0.0, last_flow_rate * config.LITERS_PER_SEC_TO_GPM)
+
+    if is_flowing and not flow_control_was_flowing:
+        flow_cycle_counter += 1
+        last_alert_triggered = False
+        auto_shutoff_latched = False
+        last_trigger_flow_gpm = 0.0
+        last_trigger_threshold = 0.0
+        last_trigger_actual = 0.0
+        last_trigger_predicted_actual = 0.0
+        last_trigger_loop_dt_ms = 0.0
+        last_pump_stop_relay_activated_at = 0.0
+        recent_flow_rates_l_per_s.clear()
+        log_flow_control(
+            f"cycle_start | actual={actual:.3f} | flow_lps={last_flow_rate:.4f}"
+        )
+
+    if is_flowing:
+        if last_flow_read_was_fresh:
+            recent_flow_rates_l_per_s.append(last_flow_rate)
+            last_flowing_rate_l_per_s = last_flow_rate
+    elif flow_control_was_flowing:
+        log_flow_control(
+            f"cycle_stop | actual={actual:.3f} | auto={auto_shutoff_latched}"
+        )
+
+    flow_control_was_flowing = is_flowing
+    _update_relay_slowdown_watch(is_flowing, current_flow_gpm, now)
+
+    if not is_flowing or override_mode or flow_meter_disconnected or last_alert_triggered:
+        return
+
+    smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
+    flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
+    prediction_seconds = max(0.0, float(getattr(config, "FLOW_CONTROL_PREDICTION_SECONDS", 0.0)))
+    predicted_actual = actual + (smoothed_flow_rate_l_per_s * prediction_seconds * config.LITERS_TO_GALLONS)
+
+    if predicted_actual >= requested_gallons - trigger_threshold:
+        last_alert_triggered = True
+        auto_shutoff_latched = True
+        last_trigger_flow_gpm = flow_rate_gpm
+        last_trigger_threshold = trigger_threshold
+        last_trigger_actual = actual
+        last_trigger_predicted_actual = predicted_actual
+        last_trigger_loop_dt_ms = loop_dt_ms
+        log_flow_control(
+            "auto_stop"
+            f" | requested={requested_gallons:.3f}"
+            f" | actual={actual:.3f}"
+            f" | predicted={predicted_actual:.3f}"
+            f" | threshold={trigger_threshold:.3f}"
+            f" | flow_gpm={flow_rate_gpm:.1f}"
+            f" | loop_dt_ms={loop_dt_ms:.1f}"
+        )
+        print(
+            f"Auto-alert(control): Flow={flow_rate_gpm:.1f} GPM, "
+            f"threshold={trigger_threshold:.2f}gal, triggering relay for "
+            f"{config.AUTO_ALERT_DURATION}s"
+        )
+        _arm_relay_slowdown_watch(flow_rate_gpm, now)
+        start_pump_stop_thread(config.AUTO_ALERT_DURATION)
+
+
+def _arm_relay_slowdown_watch(flow_gpm, now):
+    """Watch for measurable flow slowdown after an auto-stop relay trigger."""
+    global relay_slowdown_watch_active, relay_slowdown_alarm_active
+    global relay_slowdown_trigger_time, relay_slowdown_trigger_flow_gpm
+
+    relay_slowdown_watch_active = True
+    relay_slowdown_alarm_active = False
+    relay_slowdown_trigger_time = now
+    relay_slowdown_trigger_flow_gpm = max(0.0, flow_gpm)
+    log_flow_control(
+        "slowdown_watch_start"
+        f" | flow_gpm={relay_slowdown_trigger_flow_gpm:.1f}"
+        f" | check_after={config.RELAY_SLOWDOWN_CHECK_SECONDS:.1f}s"
+    )
+
+
+def _clear_relay_slowdown_watch(reason):
+    """Clear post-relay slowdown watch/alarm state."""
+    global relay_slowdown_watch_active, relay_slowdown_alarm_active
+    global relay_slowdown_trigger_time, relay_slowdown_trigger_flow_gpm
+
+    if relay_slowdown_watch_active or relay_slowdown_alarm_active:
+        log_flow_control(f"slowdown_watch_clear | reason={reason}")
+    relay_slowdown_watch_active = False
+    relay_slowdown_alarm_active = False
+    relay_slowdown_trigger_time = 0.0
+    relay_slowdown_trigger_flow_gpm = 0.0
+
+
+def _update_relay_slowdown_watch(is_flowing, flow_gpm, now):
+    """Latch an alarm if flow does not drop measurably after auto-stop."""
+    global relay_slowdown_alarm_active
+
+    if not relay_slowdown_watch_active:
+        return
+
+    if not is_flowing:
+        _clear_relay_slowdown_watch("flow_stopped")
+        return
+
+    elapsed = now - relay_slowdown_trigger_time
+    if elapsed < config.RELAY_SLOWDOWN_CHECK_SECONDS:
+        return
+
+    required_drop = max(
+        config.RELAY_SLOWDOWN_MIN_DROP_GPM,
+        relay_slowdown_trigger_flow_gpm * config.RELAY_SLOWDOWN_MIN_DROP_FRACTION,
+    )
+    actual_drop = relay_slowdown_trigger_flow_gpm - max(0.0, flow_gpm)
+    if actual_drop >= required_drop:
+        _clear_relay_slowdown_watch("flow_slowed")
+        return
+
+    if not relay_slowdown_alarm_active:
+        relay_slowdown_alarm_active = True
+        log_flow_control(
+            "slowdown_alarm"
+            f" | elapsed={elapsed:.1f}s"
+            f" | trigger_flow_gpm={relay_slowdown_trigger_flow_gpm:.1f}"
+            f" | current_flow_gpm={flow_gpm:.1f}"
+            f" | drop_gpm={actual_drop:.1f}"
+            f" | required_drop_gpm={required_drop:.1f}"
+        )
+
+
+def _record_flow_control_audit(loop_dt_ms, read_ok=True):
+    """Track flow-meter sample freshness without adding another IO-Link reader."""
+    global flow_control_audit_started_at, flow_control_audit_polls
+    global flow_control_audit_fresh, flow_control_audit_duplicates
+    global flow_control_audit_flowing_polls, flow_control_audit_flowing_fresh
+    global flow_control_audit_errors, flow_control_audit_loop_ms_total
+    global flow_control_audit_loop_ms_max
+
+    now = time.time()
+    flow_control_audit_polls += 1
+    flow_control_audit_loop_ms_total += loop_dt_ms
+    flow_control_audit_loop_ms_max = max(flow_control_audit_loop_ms_max, loop_dt_ms)
+
+    if read_ok:
+        is_fresh = bool(last_flow_read_was_fresh)
+        is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+        if is_fresh:
+            flow_control_audit_fresh += 1
+        else:
+            flow_control_audit_duplicates += 1
+        if is_flowing:
+            flow_control_audit_flowing_polls += 1
+            if is_fresh:
+                flow_control_audit_flowing_fresh += 1
+    else:
+        flow_control_audit_errors += 1
+
+    elapsed = now - flow_control_audit_started_at
+    audit_interval = max(1.0, float(getattr(config, "FLOW_CONTROL_AUDIT_INTERVAL", 5.0)))
+    if elapsed < audit_interval or flow_control_audit_polls <= 0:
+        return
+
+    polls = flow_control_audit_polls
+    fresh = flow_control_audit_fresh
+    duplicates = flow_control_audit_duplicates
+    flowing_polls = flow_control_audit_flowing_polls
+    flowing_fresh = flow_control_audit_flowing_fresh
+    flowing_duplicates = max(0, flowing_polls - flowing_fresh)
+    errors = flow_control_audit_errors
+    avg_loop_ms = flow_control_audit_loop_ms_total / polls
+    poll_hz = polls / elapsed
+    fresh_hz = fresh / elapsed
+    flowing_fresh_hz = flowing_fresh / elapsed
+
+    log_flow_control(
+        "audit"
+        f" | window={elapsed:.1f}s"
+        f" | polls={polls}"
+        f" | fresh={fresh}"
+        f" | dup={duplicates}"
+        f" | errors={errors}"
+        f" | poll_hz={poll_hz:.1f}"
+        f" | fresh_hz={fresh_hz:.1f}"
+        f" | flowing_polls={flowing_polls}"
+        f" | flowing_fresh={flowing_fresh}"
+        f" | flowing_dup={flowing_duplicates}"
+        f" | flowing_fresh_hz={flowing_fresh_hz:.1f}"
+        f" | loop_avg_ms={avg_loop_ms:.1f}"
+        f" | loop_max_ms={flow_control_audit_loop_ms_max:.1f}"
+    )
+
+    flow_control_audit_started_at = now
+    flow_control_audit_polls = 0
+    flow_control_audit_fresh = 0
+    flow_control_audit_duplicates = 0
+    flow_control_audit_flowing_polls = 0
+    flow_control_audit_flowing_fresh = 0
+    flow_control_audit_errors = 0
+    flow_control_audit_loop_ms_total = 0.0
+    flow_control_audit_loop_ms_max = 0.0
+
+
+def _reset_flow_control_audit(started_at=None):
+    """Start a fresh flow-meter freshness audit window."""
+    global flow_control_audit_started_at, flow_control_audit_polls
+    global flow_control_audit_fresh, flow_control_audit_duplicates
+    global flow_control_audit_flowing_polls, flow_control_audit_flowing_fresh
+    global flow_control_audit_errors, flow_control_audit_loop_ms_total
+    global flow_control_audit_loop_ms_max
+
+    flow_control_audit_started_at = started_at if started_at is not None else time.time()
+    flow_control_audit_polls = 0
+    flow_control_audit_fresh = 0
+    flow_control_audit_duplicates = 0
+    flow_control_audit_flowing_polls = 0
+    flow_control_audit_flowing_fresh = 0
+    flow_control_audit_errors = 0
+    flow_control_audit_loop_ms_total = 0.0
+    flow_control_audit_loop_ms_max = 0.0
+
+
+def flow_control_loop():
+    """Own IO-Link flow reads and auto-shutoff timing outside the Tk loop."""
+    global flow_control_last_tick, flow_control_last_loop_time, flow_control_last_error_log_time
+
+    interval = max(0.01, float(getattr(config, "FLOW_CONTROL_INTERVAL", 0.05)))
+    next_tick = time.monotonic()
+    flow_control_last_tick = next_tick
+    flow_control_last_loop_time = time.time()
+    _reset_flow_control_audit(flow_control_last_loop_time)
+    log_flow_control(f"thread_start | interval={interval:.3f}s")
+
+    while not flow_control_stop_event.is_set():
+        now_mono = time.monotonic()
+        loop_dt_ms = (now_mono - flow_control_last_tick) * 1000.0
+        flow_control_last_tick = now_mono
+
+        try:
+            actual = read_flow_meter()
+            update_flow_meter_fault_hold()
+            flow_control_last_loop_time = time.time()
+            _record_flow_control_audit(loop_dt_ms, read_ok=True)
+            _flow_control_process_sample(actual, time.time(), loop_dt_ms)
+        except Exception as exc:
+            set_pump_stop_fault_hold(True, f"flow control read exception: {exc}")
+            flow_control_last_loop_time = time.time()
+            _record_flow_control_audit(loop_dt_ms, read_ok=False)
+            now = time.time()
+            if now - flow_control_last_error_log_time > 5:
+                flow_control_last_error_log_time = now
+                log_flow_control(f"thread_error | {exc}")
+
+        next_tick += interval
+        sleep_for = next_tick - time.monotonic()
+        if sleep_for < 0:
+            next_tick = time.monotonic()
+            sleep_for = 0
+        flow_control_stop_event.wait(sleep_for)
+
+    log_flow_control("thread_stop")
+
+
+def start_flow_control_thread():
+    """Start the dedicated flow-control loop when configured."""
+    global flow_control_thread
+
+    if not flow_control_enabled():
+        log_flow_control("thread_disabled")
+        return
+    if flow_control_thread and flow_control_thread.is_alive():
+        return
+
+    flow_control_stop_event.clear()
+    flow_control_thread = threading.Thread(
+        target=flow_control_loop,
+        name="flow-control",
+        daemon=True,
+    )
+    flow_control_thread.start()
 
 
 
@@ -3197,9 +5141,367 @@ def _wifi_connect(ssid, password, hidden=False):
         return {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
 
 
+def _mouse_int(value, minimum, maximum, default=0):
+    try:
+        value = int(value)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _xdotool_env():
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not env.get("XAUTHORITY"):
+        runtime_dir = Path(env["XDG_RUNTIME_DIR"])
+        auth_files = sorted(runtime_dir.glob(".mutter-Xwaylandauth.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if auth_files:
+            env["XAUTHORITY"] = str(auth_files[0])
+        else:
+            env["XAUTHORITY"] = "/home/pi/.Xauthority"
+    return env
+
+
+def _run_xdotool(args):
+    xdotool = shutil.which("xdotool") or "/usr/bin/xdotool"
+    if not os.path.exists(xdotool):
+        return False, "xdotool not installed"
+    try:
+        result = subprocess.run(
+            [xdotool] + args,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            env=_xdotool_env(),
+        )
+        if result.returncode != 0:
+            return False, ((result.stderr or result.stdout or "xdotool failed").strip()[:160])
+        return True, (result.stdout or "ok").strip()
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def _run_ydotool(args):
+    ydotool = shutil.which("ydotool") or "/usr/bin/ydotool"
+    if not os.path.exists(ydotool):
+        return False, "ydotool not installed"
+    try:
+        result = subprocess.run(
+            [ydotool] + args,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if result.returncode != 0:
+            return False, ((result.stderr or result.stdout or "ydotool failed").strip()[:160])
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+class UInputMouse:
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_RELBIT = 0x40045566
+
+    EV_SYN = 0
+    EV_KEY = 1
+    EV_REL = 2
+    SYN_REPORT = 0
+    REL_X = 0
+    REL_Y = 1
+    REL_WHEEL = 8
+    BTN_LEFT = 0x110
+    BTN_RIGHT = 0x111
+    BTN_MIDDLE = 0x112
+    BUS_USB = 0x03
+
+    def __init__(self):
+        self.fd = None
+        self.lock = threading.Lock()
+        self.available = False
+        self.error = ""
+
+    def ensure(self):
+        if self.available:
+            return True, "ok"
+        with self.lock:
+            if self.available:
+                return True, "ok"
+            try:
+                self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+                for evbit in (self.EV_KEY, self.EV_REL):
+                    fcntl.ioctl(self.fd, self.UI_SET_EVBIT, evbit)
+                for keybit in (self.BTN_LEFT, self.BTN_RIGHT, self.BTN_MIDDLE):
+                    fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, keybit)
+                for relbit in (self.REL_X, self.REL_Y, self.REL_WHEEL):
+                    fcntl.ioctl(self.fd, self.UI_SET_RELBIT, relbit)
+
+                name = b"TrailerSync app cursor"
+                user_dev = struct.pack(
+                    "80sHHHHi" + ("i" * 256),
+                    name,
+                    self.BUS_USB,
+                    0x5253,
+                    0x5453,
+                    1,
+                    0,
+                    *([0] * 256),
+                )
+                os.write(self.fd, user_dev)
+                fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+                time.sleep(0.25)
+                self.available = True
+                self.error = ""
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def close(self):
+        if self.fd is None:
+            self.available = False
+            return
+        try:
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+        self.fd = None
+        self.available = False
+
+    def emit(self, event_type, code, value):
+        now = time.time()
+        sec = int(now)
+        usec = int((now - sec) * 1_000_000)
+        os.write(self.fd, struct.pack("llHHi", sec, usec, event_type, code, int(value)))
+
+    def sync(self):
+        self.emit(self.EV_SYN, self.SYN_REPORT, 0)
+
+    def move(self, dx, dy):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        with self.lock:
+            try:
+                if dx:
+                    self.emit(self.EV_REL, self.REL_X, dx)
+                if dy:
+                    self.emit(self.EV_REL, self.REL_Y, dy)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def click(self, button):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        button_code = {
+            1: self.BTN_LEFT,
+            2: self.BTN_MIDDLE,
+            3: self.BTN_RIGHT,
+        }.get(button, self.BTN_LEFT)
+        with self.lock:
+            try:
+                self.emit(self.EV_KEY, button_code, 1)
+                self.sync()
+                self.emit(self.EV_KEY, button_code, 0)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+    def scroll(self, steps):
+        ok, message = self.ensure()
+        if not ok:
+            return False, message
+        with self.lock:
+            try:
+                self.emit(self.EV_REL, self.REL_WHEEL, steps)
+                self.sync()
+                return True, "ok"
+            except Exception as e:
+                self.error = str(e)[:160]
+                self.close()
+                return False, self.error
+
+
+virtual_mouse = UInputMouse()
+atexit.register(virtual_mouse.close)
+
+
+def _screen_geometry():
+    ok, message = _run_xdotool(["getdisplaygeometry"])
+    if not ok:
+        return 1920, 1080
+    parts = str(message).replace("\n", " ").split()
+    try:
+        return max(1, int(parts[0])), max(1, int(parts[1]))
+    except Exception:
+        return 1920, 1080
+
+
+def _pointer_location():
+    ok, message = _run_xdotool(["getmouselocation"])
+    if not ok:
+        return 0, 0
+    x = 0
+    y = 0
+    for part in str(message).split():
+        if part.startswith("x:"):
+            try:
+                x = int(part.split(":", 1)[1])
+            except Exception:
+                pass
+        elif part.startswith("y:"):
+            try:
+                y = int(part.split(":", 1)[1])
+            except Exception:
+                pass
+    return x, y
+
+
+def _move_pointer_relative(dx, dy):
+    ok, message = virtual_mouse.move(dx, dy)
+    if ok:
+        return ok, message
+    ok, message = _run_xdotool(["mousemove_relative", "--", str(dx), str(dy)])
+    if ok:
+        return ok, message
+    x, y = _pointer_location()
+    width, height = _screen_geometry()
+    target_x = max(0, min(width - 1, x + dx))
+    target_y = max(0, min(height - 1, y + dy))
+    return _run_ydotool(["mousemove", "--delay", "0", str(target_x), str(target_y)])
+
+
+def _ensure_visible_cursor():
+    global last_visible_cursor_check
+    now = time.time()
+    if now - last_visible_cursor_check < 30:
+        return
+    last_visible_cursor_check = now
+
+    env = os.environ.copy()
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    try:
+        current_size = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "cursor-size"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=env,
+        )
+        if (current_size.stdout or "").strip() in ("0", ""):
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", "32"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                env=env,
+            )
+        current_theme = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "cursor-theme"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=env,
+        )
+        if (current_theme.stdout or "").strip() in ("''", ""):
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", "Yaru"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                env=env,
+            )
+    except Exception:
+        pass
+
+
+def handle_mouse_command(payload):
+    try:
+        req = json.loads(payload)
+        if not isinstance(req, dict):
+            return False, "payload must be object"
+    except Exception as e:
+        return False, f"invalid json: {e}"
+
+    action = str(req.get("action", "")).strip().lower()
+    _ensure_visible_cursor()
+
+    if action == "move":
+        dx = _mouse_int(req.get("dx"), -250, 250)
+        dy = _mouse_int(req.get("dy"), -250, 250)
+        if not dx and not dy:
+            return True, "noop"
+        return _move_pointer_relative(dx, dy)
+
+    if action == "click":
+        button = _mouse_int(req.get("button"), 1, 3, default=1)
+        ok, message = virtual_mouse.click(button)
+        if ok:
+            return ok, message
+        ok, message = _run_xdotool(["click", str(button)])
+        if ok:
+            return ok, message
+        ydotool_button = 2 if button == 3 else (3 if button == 2 else button)
+        return _run_ydotool(["click", "--delay", "0", str(ydotool_button)])
+
+    if action == "scroll":
+        steps = _mouse_int(req.get("steps"), -8, 8)
+        if not steps:
+            return True, "noop"
+        ok, message = virtual_mouse.scroll(steps)
+        if ok:
+            return ok, message
+        button = "4" if steps > 0 else "5"
+        ok = True
+        message = "ok"
+        for _ in range(abs(steps)):
+            ok, message = _run_xdotool(["click", button])
+            if not ok:
+                ok, message = _run_ydotool(["click", "--delay", "0", button])
+            if not ok:
+                break
+        return ok, message
+
+    if action == "key":
+        key = str(req.get("key", "")).strip().lower()
+        key_map = {
+            "esc": "Escape",
+            "escape": "Escape",
+            "enter": "Return",
+            "return": "Return",
+            "alt_f4": "alt+F4",
+        }
+        mapped = key_map.get(key)
+        if not mapped:
+            return False, f"unsupported key: {key}"
+        ok, message = _run_ydotool(["key", "--delay", "0", mapped])
+        if ok:
+            return ok, message
+        return _run_xdotool(["key", mapped])
+
+    return False, f"unsupported action: {action}"
+
+
 def socket_command_listener():
     """Listen for commands from rotorsync BLE server via localhost socket"""
-    global requested_gallons, override_mode, colors_are_green
+    global requested_gallons, override_mode, override_enabled_time, colors_are_green
     global fill_requested_gallons, mix_requested_gallons, current_mode, batch_mix_data
 
     import socket as sock_module
@@ -3258,14 +5560,65 @@ def socket_command_listener():
                                 )
                                 continue
 
+                            if line == "LIVE_TELEMETRY":
+                                actual = last_totalizer_liters * config.LITERS_TO_GALLONS
+                                flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+                                payload = {
+                                    "req": round(requested_gallons, 3),
+                                    "act": round(actual, 3),
+                                    "flow": round(flow_gpm, 2),
+                                    "rs": bool(relay_slowdown_alarm_active),
+                                }
+                                client.send(
+                                    f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
+                                )
+                                continue
+
+                            elif line == "ACCEPT_PENDING_CURVE":
+                                ok, payload = accept_pending_flow_curve("Socket")
+                                prefix = "CURVE_ACCEPTED" if ok else "CURVE_ACCEPT_ERR"
+                                client.send(
+                                    f"{prefix}:{json.dumps(payload, separators=(',', ':'))}\n".encode()
+                                )
+                                continue
+
                             elif line == "MIX":
                                 root.after(0, lambda: switch_mode("mix"))
 
                             elif line == "RESET":
-                                root.after(0, pulse_flow_reset)
+                                root.after(0, lambda: force_flow_reset("socket_reset"))
+
+                            elif line == "TU":
+                                root.after(0, lambda: handle_thumbs_up_press("socket TU"))
+
+                            elif line.startswith("PILOT_CONNECTED:"):
+                                pilot_name = line[len("PILOT_CONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_pilot_status(True, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
+
+                            elif line.startswith("PILOT_DISCONNECTED:"):
+                                pilot_name = line[len("PILOT_DISCONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_pilot_status(False, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
 
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
+
+                            elif line == "REBOOT":
+                                msg = "Socket: Reboot command received"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                root.after(0, reboot_system)
+
+                            elif line == "SHUTDOWN":
+                                msg = "Socket: Shutdown command received"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                root.after(0, shutdown_system)
 
                             elif line.startswith("WIFI_SET:"):
                                 try:
@@ -3301,6 +5654,15 @@ def socket_command_listener():
                                 client.send(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
                                 continue
 
+                            elif line.startswith("MOUSE:"):
+                                payload = line[6:]
+                                ok, mouse_message = handle_mouse_command(payload)
+                                if ok:
+                                    client.send(b"MOUSE_OK\n")
+                                else:
+                                    client.send(f"MOUSE_ERR:{mouse_message}\n".encode())
+                                continue
+
                             elif line.startswith("BATCHMIX_ERROR:"):
                                 # Handle BatchMix validation error
                                 error_msg = line[15:]
@@ -3320,12 +5682,17 @@ def socket_command_listener():
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
-                                    # Set mix mode requested gallons to water_needed amount (don't change regular requested_gallons)
+                                    # Store the BatchMix target as the mix preset. If we are already in
+                                    # mix mode, also update the live target used by auto-stop.
                                     water_needed = batch_mix_data.get('water_needed', 0)
                                     if water_needed > 0:
+                                        water_needed = float(water_needed)
                                         mix_requested_gallons = water_needed
+                                        save_mode_presets()
                                         # Only update display if in mix mode
                                         if current_mode == "mix":
+                                            requested_gallons = water_needed
+                                            colors_are_green = False
                                             # Show decimal if present, otherwise whole number
                                             if water_needed == int(water_needed):
                                                 req_str = f"{int(water_needed)}"
@@ -3386,46 +5753,211 @@ def socket_command_listener():
                                 try:
                                     with open("/home/pi/fill_history.log", "r") as hf:
                                         all_lines = hf.readlines()
-                                        last_5 = all_lines[-5:] if len(all_lines) >= 5 else all_lines
+                                        latest_entries = all_lines[-FILL_HISTORY_SOCKET_LIMIT:]
                                         history_items = []
-                                        for entry in last_5:
+                                        for entry in reversed(latest_entries):
                                             parts = entry.strip().split("|")
                                             if len(parts) >= 3:
                                                 ts = parts[0].strip()
-                                                req = parts[1].replace("Requested:", "").replace("gal", "").strip()
-                                                act = parts[2].replace("Actual:", "").replace("gal", "").strip()
-                                                history_items.append(f"{ts},{req},{act}")
-                                        history_response = ";".join(history_items)
+                                                req = float(_history_named_field(parts, "Requested").replace("gal", "").strip())
+                                                act = float(_history_named_field(parts, "Actual").replace("gal", "").strip())
+                                                shutoff_type = ""
+                                                for part in parts[3:]:
+                                                    text = part.strip()
+                                                    if text.lower().startswith(("auto", "manual")):
+                                                        shutoff_type = text
+                                                        break
+                                                temp_token = ""
+                                                temp_text = _history_named_field(parts, "Temp").replace("F", "").strip()
+                                                if temp_text:
+                                                    temp_token = _base36_encode(round(float(temp_text) * 10.0))
+                                                stop_to_thumb_token = ""
+                                                stop_to_thumb_text = (
+                                                    _history_named_field(parts, "StopToThumb")
+                                                    .replace("s", "")
+                                                    .strip()
+                                                )
+                                                if stop_to_thumb_text:
+                                                    stop_to_thumb_token = _base36_encode(round(float(stop_to_thumb_text) * 10.0))
+                                                timestamp = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+                                                minute_token = _base36_encode(int(timestamp // 60))
+                                                req_token = _base36_encode(round(req * 1000.0))
+                                                act_token = _base36_encode(round(act * 1000.0))
+                                                shutoff_token = "a" if shutoff_type.lower().startswith("auto") else "m"
+                                                history_items.append(
+                                                    f"{minute_token},{req_token},{act_token},{shutoff_token},{temp_token},{stop_to_thumb_token}"
+                                                )
+                                        history_response = "H2:" + ";".join(history_items)
                                         client.send(f"HIST:{history_response}\n".encode())
                                 except Exception:
                                     client.send(b"HIST:\n")
                                 continue
 
+                            elif line.startswith("SET_REQUESTED_GALLONS:"):
+                                value = line.split(":", 1)[1].strip()
+                                ok, result = set_requested_gallons(value, "Socket")
+                                if ok:
+                                    client.send(f"SET_REQUESTED_GALLONS_OK:{float(result):.3f}\n".encode())
+                                else:
+                                    client.send(f"SET_REQUESTED_GALLONS_ERR:{result}\n".encode())
+                                continue
+
                             elif line in ['+1', '-1', '+10', '-10']:
-                                try:
-                                    adjustment = int(line)
-                                    requested_gallons += adjustment
-                                    if requested_gallons < 0:
-                                        requested_gallons = 0
-                                    colors_are_green = False
-                                    if current_mode == 'fill':
-                                        fill_requested_gallons = requested_gallons
+                                if menu_mode:
+                                    if line == '+1':
+                                        msg = "Socket: Menu navigate down"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        menu_navigate_down()
+                                    elif line == '-1':
+                                        msg = "Socket: Menu navigate up"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        menu_navigate_up()
                                     else:
-                                        mix_requested_gallons = requested_gallons
-                                    save_mode_presets()
-                                    msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
+                                else:
+                                    try:
+                                        adjustment = int(line)
+                                        if adjust_batch_mix_gallons(adjustment, "Socket"):
+                                            continue
+                                        requested_gallons += adjustment
+                                        if requested_gallons < 0:
+                                            requested_gallons = 0
+                                        colors_are_green = False
+                                        if current_mode == 'fill':
+                                            fill_requested_gallons = requested_gallons
+                                        else:
+                                            mix_requested_gallons = requested_gallons
+                                        save_mode_presets()
+                                        msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    except ValueError:
+                                        pass
+
+                            elif line == 'PS':
+                                if exit_confirm_window:
+                                    msg = "Socket: Exit confirmation cancel"
                                     print(msg)
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                except ValueError:
-                                    pass
+                                    if exit_cancel_handler:
+                                        root.after(0, exit_cancel_handler)
+                                elif reset_season_confirm_window:
+                                    msg = "Socket: Reset season confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_season_cancel_handler:
+                                        root.after(0, reset_season_cancel_handler)
+                                elif reset_flow_curve_confirm_window:
+                                    msg = "Socket: Flow curve reset confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_cancel_handler:
+                                        root.after(0, reset_flow_curve_cancel_handler)
+                                elif accept_flow_curve_confirm_window:
+                                    msg = "Socket: Flow curve accept confirmation cancel"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_cancel_handler:
+                                        root.after(0, accept_flow_curve_cancel_handler)
+                                elif calibration_mode:
+                                    msg = "Socket: Calibration cancel/back"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, calibration_cancel)
+                                elif log_viewer_mode:
+                                    msg = "Socket: Log viewer exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_log_viewer)
+                                elif fill_history_mode:
+                                    msg = "Socket: Fill history exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_fill_history)
+                                elif self_test_mode:
+                                    msg = "Socket: Self-test exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_self_test)
+                                elif full_test_mode:
+                                    msg = "Socket: Full-test PS command detected"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if full_test_window and hasattr(full_test_window, 'mark_tested'):
+                                        root.after(0, lambda: full_test_window.mark_tested('PS'))
+                                elif update_mode:
+                                    msg = "Socket: Update exit"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_update)
+                                elif menu_mode:
+                                    msg = "Socket: Menu close"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, close_menu)
+                                else:
+                                    msg = "Socket: Pump Stop command received"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
-                            elif line == 'PS':
-                                msg = "Socket: Pump Stop command received"
+                            elif line in ('OV:1', 'OV:0'):
+                                override_mode = (line == 'OV:1')
+                                if override_mode:
+                                    override_enabled_time = time.time()
+                                msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'} (explicit)"
                                 print(msg)
                                 with open(debug_log, "a") as f:
                                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                root.after(0, pump_stop_relay)
+
+                            elif line == 'OV':
+                                if menu_mode:
+                                    msg = "Socket: Menu select"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    arm_menu_ov_guard()
+                                    root.after(0, menu_select)
+                                elif requested_gallons == 0:
+                                    if current_mode == 'mix' and batch_mix_data is not None:
+                                        msg = "Socket: Batch mix screen exit triggered (gallons=0, OV pressed)"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        root.after(0, lambda: clear_batch_mix_screen("socket OV at zero gallons"))
+                                    else:
+                                        msg = "Socket: Menu access triggered (gallons=0, OV pressed)"
+                                        print(msg)
+                                        with open(debug_log, "a") as f:
+                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        arm_menu_ov_guard()
+                                        root.after(0, show_menu)
+                                else:
+                                    override_mode = not override_mode
+                                    if override_mode:
+                                        override_enabled_time = time.time()
+                                    msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
+                                    print(msg)
+                                    with open(debug_log, "a") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             client.send(b"OK\n")
                 except sock_module.timeout:
@@ -3442,6 +5974,7 @@ def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
     global fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_serial_ov_toggle_time
 
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
@@ -3484,19 +6017,7 @@ def serial_listener():
                                 log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
 
-                            ui_mode_active = any([
-                                exit_confirm_window,
-                                reset_season_confirm_window,
-                                reminders_mode,
-                                log_viewer_mode,
-                                fill_history_mode,
-                                self_test_mode,
-                                full_test_mode,
-                                update_mode,
-                                menu_mode,
-                            ])
-                            if ui_mode_active and should_debounce_ui_serial_command(line):
-                                log_serial_debug(f"Debounced repeated UI command: '{line}'")
+                            if should_ignore_menu_ov_bounce(line, "Serial"):
                                 continue
 
                             # Handle exit confirmation dialog
@@ -3538,6 +6059,46 @@ def serial_listener():
                                 else:
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
+
+                            # Handle flow curve reset confirmation dialog
+                            elif reset_flow_curve_confirm_window:
+                                if line == 'OV':
+                                    msg = "Serial: Flow curve reset confirmation (OV - Confirm)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_confirm_handler:
+                                        root.after(0, reset_flow_curve_confirm_handler)
+                                elif line == 'PS':
+                                    msg = "Serial: Flow curve reset confirmation (PS - Cancel)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if reset_flow_curve_cancel_handler:
+                                        root.after(0, reset_flow_curve_cancel_handler)
+                                else:
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
+
+                            # Handle learned flow curve accept confirmation dialog
+                            elif accept_flow_curve_confirm_window:
+                                if line == 'OV':
+                                    msg = "Serial: Flow curve accept confirmation (OV - Confirm)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_confirm_handler:
+                                        root.after(0, accept_flow_curve_confirm_handler)
+                                elif line == 'PS':
+                                    msg = "Serial: Flow curve accept confirmation (PS - Cancel)"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    if accept_flow_curve_cancel_handler:
+                                        root.after(0, accept_flow_curve_cancel_handler)
+                                else:
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
 
                             # Handle reminders mode - dismiss on OV
                             elif reminders_mode:
@@ -3706,18 +6267,19 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, menu_navigate_down)
+                                    menu_navigate_down()
                                 elif line == '-1':
                                     msg = "Serial: Menu navigate up"
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, menu_navigate_up)
+                                    menu_navigate_up()
                                 elif line == 'OV':
                                     msg = "Serial: Menu select"
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    arm_menu_ov_guard()
                                     root.after(0, menu_select)
                                 else:
                                     with open(debug_log, 'a') as f:
@@ -3729,6 +6291,8 @@ def serial_listener():
                                 if line in ['+1', '-1', '+10', '-10']:
                                     try:
                                         adjustment = int(line)
+                                        if adjust_batch_mix_gallons(adjustment, "Serial"):
+                                            continue
                                         requested_gallons += adjustment
                                         # Don't allow requested gallons to go below zero
                                         if requested_gallons < 0:
@@ -3764,9 +6328,7 @@ def serial_listener():
                                     print(msg)
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    # Run relay in separate thread to not block serial listener
-                                    relay_thread = threading.Thread(target=pump_stop_relay, daemon=True)
-                                    relay_thread.start()
+                                    start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                                 elif line == 'OV':
                                     global override_enabled_time
@@ -3784,8 +6346,18 @@ def serial_listener():
                                             with open(debug_log, 'a') as f:
                                                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             # Show menu in main thread
+                                            arm_menu_ov_guard()
                                             root.after(0, show_menu)
                                     else:
+                                        now = time.monotonic()
+                                        if now - last_serial_ov_toggle_time < SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS:
+                                            msg = "Serial: Ignored OV debounce during override toggle"
+                                            print(msg)
+                                            log_serial_debug(msg)
+                                            with open(debug_log, 'a') as f:
+                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            continue
+                                        last_serial_ov_toggle_time = now
                                         override_mode = not override_mode
                                         if override_mode:
                                             override_enabled_time = time.time()  # Record when enabled
@@ -3801,6 +6373,13 @@ def serial_listener():
                                     with open(debug_log, 'a') as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: handle_thumbs_up_press("serial TU"))
+
+                                elif line in ('RST', 'RESET'):
+                                    msg = "Serial: Flow reset command received"
+                                    print(msg)
+                                    with open(debug_log, 'a') as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    root.after(0, lambda: force_flow_reset("serial reset"))
 
                                 elif line == 'MIX':
                                     msg = "Serial: Mix mode command received"
@@ -3869,12 +6448,17 @@ def clear_auto_shutoff_state(reason=""):
     """Clear per-cycle auto-shutoff state after a reset or new flow cycle."""
     global last_alert_triggered, auto_shutoff_latched
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
 
     last_alert_triggered = False
     auto_shutoff_latched = False
     last_trigger_flow_gpm = 0.0
     last_trigger_threshold = 0.0
     last_trigger_actual = 0.0
+    last_trigger_predicted_actual = 0.0
+    last_trigger_loop_dt_ms = 0.0
+    last_pump_stop_relay_activated_at = 0.0
     recent_flow_rates_l_per_s.clear()
     if reason:
         print(f"Auto-shutoff state cleared: {reason}")
@@ -3900,6 +6484,9 @@ def detect_totalizer_reset(totalizer_liters):
 
 def _pulse_flow_reset_gpio():
     global flow_reset_scheduled, flow_reset_cycle_id
+    if SIM_MODE:
+        _sim_flow_reset("gpio pulse")
+        return
     try:
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write("pulsing gpio0\n")
@@ -3915,8 +6502,29 @@ def _pulse_flow_reset_gpio():
     flow_reset_cycle_id = None
 
 
+def _sim_flow_reset(reason):
+    global flow_reset_scheduled, flow_reset_cycle_id, last_totalizer_liters
+    iolhat.reset_totalizer()
+    detect_totalizer_reset(0.0)
+    last_totalizer_liters = 0.0
+    draw_actual_number("0.0", target_display_color(0.0))
+    with open("/home/pi/reset_debug.log", "a") as dbg:
+        dbg.write(f"sim totalizer reset: {reason}\n")
+    flow_reset_scheduled = False
+    flow_reset_cycle_id = None
+
+
 def force_flow_reset(reason="forced"):
     global flow_reset_scheduled, flow_reset_cycle_id
+    if SIM_MODE:
+        msg = f"Flow reset forced: {reason} ({last_flow_rate:.3f} L/s)"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
+        clear_auto_shutoff_state(reason)
+        _sim_flow_reset(reason)
+        return
     if not GPIO_AVAILABLE:
         flow_reset_scheduled = False
         flow_reset_cycle_id = None
@@ -3934,10 +6542,6 @@ def pulse_flow_reset():
     global flow_reset_scheduled, flow_reset_cycle_id
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write("pulse called\n")
-    if not GPIO_AVAILABLE:
-        flow_reset_scheduled = False
-        flow_reset_cycle_id = None
-        return
     if flow_reset_cycle_id != flow_cycle_counter:
         msg = "Flow reset cancelled: new flow started after reset was requested"
         print(msg)
@@ -3953,6 +6557,13 @@ def pulse_flow_reset():
         log_serial_debug(msg)
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write(msg + "\n")
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return
+    if SIM_MODE:
+        _sim_flow_reset("scheduled pulse")
+        return
+    if not GPIO_AVAILABLE:
         flow_reset_scheduled = False
         flow_reset_cycle_id = None
         return
@@ -3989,10 +6600,11 @@ def schedule_flow_reset():
 def initialize_iol():
     """Initialize IO-Link port"""
     try:
-        # Power on the port
-        iolhat.power(config.IOL_PORT, 1)
-        # Set LED to green
-        iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
+        with iol_io_lock:
+            # Power on the port
+            iolhat.power(config.IOL_PORT, 1)
+            # Set LED to green
+            iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
         time.sleep(0.5)
         print(f"IO-Link Port {config.IOL_PORT+1} initialized successfully")
         return True
@@ -4004,23 +6616,144 @@ def initialize_iol():
 root = tk.Tk()
 root.title("Tank Dashboard")
 root.configure(bg="black")
-root.attributes("-fullscreen", True)
+if SIM_MODE:
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    SIM_RENDER_SCALE = min(
+        max(0.1, (screen_w - 24) / SIM_WINDOW_WIDTH),
+        max(0.1, (screen_h - 96) / SIM_WINDOW_HEIGHT),
+        1.0,
+    )
+    sim_display_width = max(1, int(SIM_WINDOW_WIDTH * SIM_RENDER_SCALE))
+    sim_display_height = max(1, int(SIM_WINDOW_HEIGHT * SIM_RENDER_SCALE))
+    root.geometry(f"{sim_display_width}x{sim_display_height}")
+    root.resizable(True, True)
+else:
+    root.attributes("-fullscreen", True)
 
 # Get screen dimensions
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 
 # Create ONE full-screen canvas for everything
-canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+canvas = tk.Canvas(
+    root,
+    bg="black",
+    highlightthickness=0,
+    width=sim_display_width if SIM_MODE else 0,
+    height=sim_display_height if SIM_MODE else 0,
+)
 canvas.pack(fill='both', expand=True)
+
+
+def _sim_scale_value(value):
+    if SIM_MODE and isinstance(value, (int, float)):
+        return value * SIM_RENDER_SCALE
+    return value
+
+
+def _sim_scale_args(args):
+    return tuple(_sim_scale_value(arg) for arg in args)
+
+
+def _sim_scale_font(font):
+    if not SIM_MODE or not isinstance(font, tuple) or len(font) < 2:
+        return font
+    size = font[1]
+    if not isinstance(size, int):
+        return font
+    scaled_size = max(1, int(round(abs(size) * SIM_RENDER_SCALE)))
+    return (font[0], -scaled_size, *font[2:])
+
+
+if SIM_MODE:
+    _canvas_create_text = canvas.create_text
+    _canvas_create_rectangle = canvas.create_rectangle
+    _canvas_create_line = canvas.create_line
+
+    def _sim_create_text(*args, **kwargs):
+        if "font" in kwargs:
+            kwargs["font"] = _sim_scale_font(kwargs["font"])
+        return _canvas_create_text(*_sim_scale_args(args), **kwargs)
+
+    def _sim_create_rectangle(*args, **kwargs):
+        return _canvas_create_rectangle(*_sim_scale_args(args), **kwargs)
+
+    def _sim_create_line(*args, **kwargs):
+        return _canvas_create_line(*_sim_scale_args(args), **kwargs)
+
+    canvas.create_text = _sim_create_text
+    canvas.create_rectangle = _sim_create_rectangle
+    canvas.create_line = _sim_create_line
+
+def _sync_canvas_geometry():
+    if not SIM_MODE:
+        canvas.update()
+
+
+def _canvas_width():
+    width = canvas.winfo_width()
+    return SIM_WINDOW_WIDTH if SIM_MODE else width
+
+
+def _canvas_height():
+    height = canvas.winfo_height()
+    return SIM_WINDOW_HEIGHT if SIM_MODE else height
+
+
+def update_relay_slowdown_alarm_flash():
+    """Flash the whole display while auto-stop relay has not slowed flow."""
+    global relay_slowdown_alarm_visible
+
+    flash_hz = max(1.0, float(getattr(config, "RELAY_SLOWDOWN_ALARM_FLASH_HZ", 30)))
+    interval_ms = max(1, int(1000 / flash_hz))
+
+    if relay_slowdown_alarm_active:
+        phase = int(time.time() * flash_hz) % 2
+        color = (
+            config.RELAY_SLOWDOWN_ALARM_COLOR_A
+            if phase == 0
+            else config.RELAY_SLOWDOWN_ALARM_COLOR_B
+        )
+        canvas.delete("relay_slowdown_alarm")
+        width = _canvas_width()
+        height = _canvas_height()
+        canvas.create_rectangle(
+            0,
+            0,
+            width,
+            height,
+            fill=color,
+            outline="",
+            tags="relay_slowdown_alarm",
+        )
+        # Keep a steady red caution symbol centered over the flashing background.
+        # The background still flashes black/white to show the pump-stop failure,
+        # but the warning glyph itself does not alternate color.
+        canvas.create_text(
+            width // 2,
+            height // 2,
+            text="⚠",
+            font=("Helvetica", max(160, int(min(width, height) * 0.55)), "bold"),
+            fill="red",
+            tags="relay_slowdown_alarm",
+        )
+        canvas.tag_raise("relay_slowdown_alarm")
+        relay_slowdown_alarm_visible = True
+    elif relay_slowdown_alarm_visible:
+        canvas.delete("relay_slowdown_alarm")
+        relay_slowdown_alarm_visible = False
+
+    root.after(interval_ms, update_relay_slowdown_alarm_flash)
+
 
 # Draw full-screen barber pole stripes
 def draw_fullscreen_stripes():
     """Draw barber pole stripes across entire screen"""
     # Get actual canvas size after it's been packed
-    canvas.update()
-    width = canvas.winfo_width()
-    height = canvas.winfo_height()
+    _sync_canvas_geometry()
+    width = _canvas_width()
+    height = _canvas_height()
 
     stripe_height = 30
     dark_yellow = "#CC9900"
@@ -4031,7 +6764,8 @@ def draw_fullscreen_stripes():
                                fill=stripe_color, outline="", tags="stripes")
 
 # Draw stripes after window is created
-root.update()
+if not SIM_MODE:
+    root.update()
 # draw_fullscreen_stripes()  # Disabled - using solid black background
 
 
@@ -4085,12 +6819,14 @@ def update_mopeka_display():
     canvas.delete("mopeka_display")
 
     if current_mode == "mix":
+        refresh_batch_mix_tank_levels()
         return
 
     if not mopeka_enabled:
+        canvas.delete("batchmix_tanks")
         return
     
-    width = canvas.winfo_width()
+    width = _canvas_width()
     x = width - 20  # 20px from right edge
     font = ("Helvetica", 72, "bold")
     
@@ -4099,21 +6835,14 @@ def update_mopeka_display():
                           fill="#ff0000", anchor="ne", tags="mopeka_display")
         return
     
-    # Quality indicator: 0=no signal, 1=weak, 2=ok, 3=good
-    def quality_color(q):
-        if q >= 3: return "#00ff00"   # green
-        if q >= 2: return "#ffff00"   # yellow
-        if q >= 1: return "#ff8800"   # orange
-        return "#ff0000"              # red (no signal)
-    
     # Front tank - top right
-    color1 = quality_color(mopeka1_quality)
+    color1 = _mopeka_quality_color(mopeka1_quality)
     label1 = f"Front: {mopeka1_gallons:.0f} gal"
     canvas.create_text(x, 40, text=label1, font=font,
                       fill=color1, anchor="ne", tags="mopeka_display")
     
     # Back tank - below front
-    color2 = quality_color(mopeka2_quality)
+    color2 = _mopeka_quality_color(mopeka2_quality)
     label2 = f"Back: {mopeka2_gallons:.0f} gal"
     canvas.create_text(x, 110, text=label2, font=font,
                       fill=color2, anchor="ne", tags="mopeka_display")
@@ -4138,8 +6867,8 @@ def draw_requested_number(text, color="red"):
     canvas.delete("requested")
 
     # Position: centered horizontally, 20% from top
-    x = canvas.winfo_width() // 2
-    y = int(canvas.winfo_height() * 0.28) + 24
+    x = _canvas_width() // 2
+    y = int(_canvas_height() * 0.28) + 24
     font = ("Helvetica", 220, "bold")
 
     # Draw white outline (8 positions around the text)
@@ -4150,9 +6879,9 @@ def draw_requested_number(text, color="red"):
     canvas.create_text(x, y, text=text, font=font, fill=color, tags="requested")
 
 # Draw text labels on canvas (centered)
-canvas.update()
-center_x = canvas.winfo_width() // 2
-height = canvas.winfo_height()
+_sync_canvas_geometry()
+center_x = _canvas_width() // 2
+height = _canvas_height()
 
 canvas.create_text(center_x, int(height * 0.08), text="Requested Gallons:", font=("Helvetica", 36, "bold"),
                   fill="white", tags="labels")
@@ -4182,10 +6911,10 @@ def draw_actual_number(text, color="red"):
     # Delete old actual number
     canvas.delete("actual")
 
-    # Position: centered horizontally, 65% from top
-    x = canvas.winfo_width() // 2
-    y = int(canvas.winfo_height() * 0.65)
-    font = ("Helvetica", 280, "bold")
+    # Position: centered horizontally, 68% from top
+    x = _canvas_width() // 2
+    y = int(_canvas_height() * 0.68)
+    font = ("Helvetica", 310, "bold")
 
     # Draw white outline (8 positions around the text)
     for dx, dy in [(-6,-6), (-6,0), (-6,6), (0,-6), (0,6), (6,-6), (6,0), (6,6)]:
@@ -4232,20 +6961,68 @@ manual_label = ttk.Label(root, text="MANUAL", font=("Helvetica", 90, "bold"),
 # manual_label.pack_forget()
 
 # Mix Mode Indicator Label (shown in top-left corner when in mix mode)
-mode_indicator_label = ttk.Label(root, text="MIX", font=("Helvetica", 48, "bold"),
-                                 foreground="cyan", background="black")
+mode_indicator_label = tk.Label(root, text="MIX", font=("Helvetica", 38, "bold"),
+                                foreground="cyan", background="black",
+                                padx=14, pady=4, bd=0)
 # mode_indicator_label initially hidden, shown via place() when in mix mode
 
 # Thumbs up animated GIF support
 thumbs_up_frames = []
+thumbs_up_frames_by_color = {}
 thumbs_up_frame_index = [0]  # Use list for mutable reference
 thumbs_up_label = None
 thumbs_up_animation_id = None
 thumbs_up_visible = False
+thumbs_up_current_color = "green"
+THUMBS_UP_RELX = 0.88
+THUMBS_UP_RELY = 0.25
+THUMBS_UP_TINTS = {
+    "green": (0, 190, 0),
+    "red": (230, 0, 0),
+}
+
+def tint_thumbs_up_image(image, rgb):
+    """Tint a transparent thumbs-up image while keeping its shading and alpha."""
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    shade = rgba.convert("L")
+    red, green, blue = rgb
+    channels = [
+        shade.point(lambda value, base=base: int(base * (0.45 + 0.55 * (value / 255.0))))
+        for base in (red, green, blue)
+    ]
+    return Image.merge("RGBA", (*channels, alpha))
+
+
+def set_thumbs_up_color(color):
+    """Switch the thumbs-up image/text to match the gallon display color."""
+    global thumbs_up_frames, thumbs_up_current_color
+
+    color = "red" if color == "red" else "green"
+    if color == thumbs_up_current_color and thumbs_up_frames:
+        return
+
+    thumbs_up_current_color = color
+    if thumbs_up_frames_by_color:
+        thumbs_up_frames = thumbs_up_frames_by_color.get(color, thumbs_up_frames)
+        thumbs_up_frame_index[0] = min(thumbs_up_frame_index[0], max(len(thumbs_up_frames) - 1, 0))
+        if thumbs_up_label and thumbs_up_frames:
+            thumbs_up_label.config(image=thumbs_up_frames[thumbs_up_frame_index[0]])
+    elif thumbs_up_label:
+        thumbs_up_label.config(foreground=color)
+
+
+def show_thumbs_up(actual_gallons=None):
+    """Show thumbs-up with the same red/green state as the gallon text."""
+    if not thumbs_up_label or batch_mix_layout_active:
+        return
+    set_thumbs_up_color(target_display_color(actual_gallons))
+    thumbs_up_label.place(relx=THUMBS_UP_RELX, rely=THUMBS_UP_RELY, anchor="n")
+    _set_thumbs_up_visible(True)
 
 def load_thumbs_up_gif():
     """Load thumbs up image (PNG or GIF) for display"""
-    global thumbs_up_frames, thumbs_up_label
+    global thumbs_up_frames, thumbs_up_frames_by_color, thumbs_up_label
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     png_candidates = [
@@ -4258,35 +7035,40 @@ def load_thumbs_up_gif():
     ]
     
     try:
-        from PIL import Image, ImageTk
-
         png_path = next((path for path in png_candidates if os.path.exists(path)), None)
         gif_path = next((path for path in gif_candidates if os.path.exists(path)), None)
+        base_frames = []
 
         # Try PNG first
         if png_path:
             img = Image.open(png_path)
             # Resize to fit nicely on screen
             img = img.resize((533, 533), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-            thumbs_up_frames = [photo]
+            base_frames = [img]
             print(f"Loaded thumbs up from PNG: {png_path}")
         elif gif_path:
             img = Image.open(gif_path)
             # Extract all frames from GIF
-            thumbs_up_frames = []
             try:
                 while True:
                     frame = img.copy()
                     frame = frame.resize((533, 533), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(frame)
-                    thumbs_up_frames.append(photo)
+                    base_frames.append(frame)
                     img.seek(img.tell() + 1)
             except EOFError:
                 pass
-            print(f"Loaded {len(thumbs_up_frames)} frames from thumbs up GIF")
+            print(f"Loaded {len(base_frames)} frames from thumbs up GIF")
         else:
-            thumbs_up_frames = []
+            base_frames = []
+
+        thumbs_up_frames_by_color = (
+            {
+                color: [ImageTk.PhotoImage(tint_thumbs_up_image(frame, rgb)) for frame in base_frames]
+                for color, rgb in THUMBS_UP_TINTS.items()
+            }
+            if base_frames else {}
+        )
+        thumbs_up_frames = thumbs_up_frames_by_color.get(thumbs_up_current_color, [])
         
         # Create label
         if thumbs_up_frames:
@@ -4321,15 +7103,27 @@ load_thumbs_up_gif()
 def update_dashboard():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
+    global new_fill_flow_started_at, new_fill_last_fresh_at, new_fill_cycle_cleared
     global pending_fill_gallons, pending_fill_requested, pending_fill_shutoff_type
-    global pending_fill_flow_gpm, pending_fill_trigger_threshold, last_flowing_rate_l_per_s
+    global pending_fill_flow_gpm, pending_fill_trigger_threshold, pending_fill_temp_f
+    global pending_fill_stop_to_thumb_start_at
+    global pending_fill_flow_started_at, pending_fill_flow_ended_at, current_fill_flow_started_at
+    global last_flowing_rate_l_per_s
     global last_trigger_flow_gpm, last_trigger_threshold, last_trigger_actual
+    global last_trigger_predicted_actual, last_trigger_loop_dt_ms
+    global last_pump_stop_relay_activated_at
     global flow_cycle_counter, calibration_state, last_status_text, last_daily_total_text, last_daily_total_mode
 
-    actual = read_flow_meter()
+    control_active = flow_control_active()
 
-    # Use green if flag is set, otherwise red
-    color = "green" if colors_are_green else "red"
+    if control_active:
+        actual = get_cached_actual_gallons()
+    else:
+        actual = read_flow_meter()
+
+    color = target_display_color(actual)
+    if thumbs_up_visible:
+        set_thumbs_up_color(color)
 
     # Debug log color being used
     button_log = "/home/pi/button_debug.log"
@@ -4344,6 +7138,7 @@ def update_dashboard():
 
     # Check if flow meter has timed out (no successful reads in X seconds)
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
+    update_flow_meter_fault_hold(flow_meter_disconnected)
 
     # Check if heartbeat has timed out (no OK message in 11 seconds)
     heartbeat_timeout = (time.time() - last_heartbeat_time) > 11
@@ -4360,7 +7155,33 @@ def update_dashboard():
 
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
-    if is_flowing:
+    now = time.time()
+    latest_fresh_age = now - last_fresh_flow_read_time if last_fresh_flow_read_time else float("inf")
+    fresh_grace_seconds = config.NEW_FILL_CYCLE_FRESH_GRACE_SECONDS
+    has_recent_fresh_flow = latest_fresh_age <= fresh_grace_seconds
+    is_recent_fresh_new_fill_flowing = (
+        has_recent_fresh_flow
+        and not flow_meter_disconnected
+        and not connection_error
+        and last_flow_rate >= config.NEW_FILL_CYCLE_THRESHOLD
+    )
+    if is_recent_fresh_new_fill_flowing:
+        if new_fill_flow_started_at is None:
+            new_fill_flow_started_at = last_fresh_flow_read_time
+        new_fill_last_fresh_at = last_fresh_flow_read_time
+    elif (
+        flow_meter_disconnected
+        or connection_error
+        or last_flow_rate < config.NEW_FILL_CYCLE_THRESHOLD
+        or (
+            new_fill_last_fresh_at is not None
+            and now - new_fill_last_fresh_at > fresh_grace_seconds
+        )
+    ):
+        new_fill_flow_started_at = None
+        new_fill_last_fresh_at = None
+        new_fill_cycle_cleared = False
+    if is_flowing and not control_active and last_flow_read_was_fresh:
         recent_flow_rates_l_per_s.append(last_flow_rate)
         last_flowing_rate_l_per_s = last_flow_rate
 
@@ -4386,9 +7207,14 @@ def update_dashboard():
             pending_fill_shutoff_type = ""
             pending_fill_flow_gpm = 0.0
             pending_fill_trigger_threshold = 0.0
+            pending_fill_temp_f = None
+            pending_fill_stop_to_thumb_start_at = 0.0
+            pending_fill_flow_started_at = 0.0
+            pending_fill_flow_ended_at = 0.0
             last_trigger_flow_gpm = 0.0
             last_trigger_threshold = 0.0
             last_trigger_actual = 0.0
+            last_pump_stop_relay_activated_at = 0.0
             recent_flow_rates_l_per_s.clear()
             _refresh_calibration_window()
         else:
@@ -4407,6 +7233,14 @@ def update_dashboard():
             pending_fill_gallons = actual
             pending_fill_requested = requested_gallons
             pending_fill_shutoff_type = shutoff_type
+            pending_fill_temp_f = last_flow_meter_temp_f
+            pending_fill_stop_to_thumb_start_at = last_pump_stop_relay_activated_at
+            # Flow window for this fill: start was captured at the flow rising edge
+            # (current_fill_flow_started_at); end is now, the moment flow stopped.
+            # If the start was never observed (e.g. box restarted mid-fill) it stays
+            # 0.0 and is omitted from the log so the app flags the record.
+            pending_fill_flow_started_at = current_fill_flow_started_at
+            pending_fill_flow_ended_at = now
 
             print(
                 f"Fill complete - Requested: {requested_gallons:.3f}, Actual: {actual:.3f}, "
@@ -4420,28 +7254,49 @@ def update_dashboard():
 
     # Reset colors when new fill cycle starts
     if not was_flowing and is_flowing:
-        flow_cycle_counter += 1
         colors_are_green = False
-        last_alert_triggered = False
-        auto_shutoff_latched = False
+        new_fill_cycle_cleared = False
+        # Flow just started for this fill segment — stamp the start time so it can
+        # be recorded alongside the flow-end time when the fill completes.
+        current_fill_flow_started_at = now
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
             _refresh_calibration_window()
-        # Hide thumbs up when new cycle starts
+        if not control_active:
+            flow_cycle_counter += 1
+            last_alert_triggered = False
+            auto_shutoff_latched = False
+            last_trigger_flow_gpm = 0.0
+            last_trigger_threshold = 0.0
+            last_trigger_actual = 0.0
+            last_trigger_predicted_actual = 0.0
+            last_trigger_loop_dt_ms = 0.0
+            last_pump_stop_relay_activated_at = 0.0
+            recent_flow_rates_l_per_s.clear()
+        print("New fill cycle started - colors reset to red, auto-shutoff state cleared")
+
+    # Hide thumbs up and clear pending fill only after sustained high flow.
+    if (
+        new_fill_flow_started_at is not None
+        and new_fill_last_fresh_at is not None
+        and not new_fill_cycle_cleared
+        and now - new_fill_flow_started_at >= config.NEW_FILL_CYCLE_HOLD_SECONDS
+        and now - new_fill_last_fresh_at <= config.NEW_FILL_CYCLE_FRESH_GRACE_SECONDS
+    ):
         if thumbs_up_label:
             thumbs_up_label.place_forget()
             _set_thumbs_up_visible(False)
-        # Clear any pending fill data from previous cycle
         pending_fill_gallons = 0.0
         pending_fill_requested = 0.0
         pending_fill_shutoff_type = ""
         pending_fill_flow_gpm = 0.0
         pending_fill_trigger_threshold = 0.0
-        last_trigger_flow_gpm = 0.0
-        last_trigger_threshold = 0.0
-        last_trigger_actual = 0.0
-        recent_flow_rates_l_per_s.clear()
-        print("New fill cycle started - colors reset to red, thumbs up hidden, pending fill cleared")
+        pending_fill_temp_f = None
+        pending_fill_stop_to_thumb_start_at = 0.0
+        pending_fill_flow_started_at = 0.0
+        pending_fill_flow_ended_at = 0.0
+        new_fill_cycle_cleared = True
+        print("Sustained high-flow fill cycle detected - thumbs up hidden, pending fill cleared")
 
     if calibration_mode and calibration_state and calibration_state.get("phase") == "settling":
         if time.time() >= calibration_state.get("settle_deadline", time.time()):
@@ -4468,22 +7323,35 @@ def update_dashboard():
     # Calculate dynamic trigger threshold based on current flow rate
     smoothed_flow_rate_l_per_s = get_smoothed_flow_rate()
     flow_rate_gpm = smoothed_flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    display_flow_rate_gpm = flow_rate_gpm if is_flowing else 0.0
     trigger_threshold = calculate_trigger_threshold(smoothed_flow_rate_l_per_s)
 
     # Auto-alert: Trigger GPIO 27 based on flow-adjusted threshold (once per cycle)
     # Only if override mode is OFF and flow meter is connected
-    if is_flowing and not override_mode and not flow_meter_disconnected and actual >= requested_gallons - trigger_threshold and not last_alert_triggered:
+    if (
+        not control_active
+        and is_flowing
+        and not override_mode
+        and not flow_meter_disconnected
+        and actual >= requested_gallons - trigger_threshold
+        and not last_alert_triggered
+    ):
         last_alert_triggered = True
         auto_shutoff_latched = True
         last_trigger_flow_gpm = flow_rate_gpm
         last_trigger_threshold = trigger_threshold
         last_trigger_actual = actual
         print(f"Auto-alert: Flow={flow_rate_gpm:.1f} GPM, threshold={trigger_threshold:.2f}gal, triggering relay for {config.AUTO_ALERT_DURATION}s")
-        relay_thread = threading.Thread(target=pump_stop_relay, args=(config.AUTO_ALERT_DURATION,), daemon=True)
-        relay_thread.start()
+        start_pump_stop_thread(config.AUTO_ALERT_DURATION)
+    startup_iol_warning_suppressed = _suppress_startup_iol_warning(flow_meter_disconnected)
+
     # Update status label
     status_parts = []
-    if connection_error:
+    if startup_iol_warning_suppressed:
+        status_parts.append("IOL: Starting")
+    elif pump_stop_fault_hold_active:
+        status_parts.append(f"IOL: {pump_stop_fault_hold_reason[:30]}")
+    elif connection_error:
         status_parts.append(f"IOL: {error_message[:30]}")
     else:
         status_parts.append("IOL: Connected")
@@ -4505,7 +7373,7 @@ def update_dashboard():
     if status_text != last_status_text:
         canvas.delete("status")
         if status_text:
-            canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() - 20, text=status_text,
+            canvas.create_text(_canvas_width() // 2, _canvas_height() - 20, text=status_text,
                               font=("Helvetica", 20), fill="yellow", tags="status")
         last_status_text = status_text
 
@@ -4514,25 +7382,25 @@ def update_dashboard():
     if daily_total_text != last_daily_total_text or current_mode != last_daily_total_mode:
         canvas.delete("daily_total")
         if daily_total_text:
-            canvas.create_text(10, canvas.winfo_height() - 10, text=daily_total_text,
+            canvas.create_text(10, _canvas_height() - 10, text=daily_total_text,
                               font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
         last_daily_total_text = daily_total_text
         last_daily_total_mode = current_mode
-    update_flow_rate_display(flow_rate_gpm)
+    update_flow_rate_display(display_flow_rate_gpm)
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
     canvas.delete("skull_icons")
-    if flow_meter_disconnected:
+    if flow_meter_disconnected and not startup_iol_warning_suppressed:
         import math
         pulse = math.sin(time.time() * 2 * math.pi)  # -1 to 1, completes cycle every 1 second
         skull_size = int(264 + 24 * pulse)  # Varies from 240pt to 288pt
 
         # Left skull
-        canvas.create_text(150, canvas.winfo_height() // 2, text="☠",
+        canvas.create_text(150, _canvas_height() // 2, text="☠",
                          font=("Helvetica", skull_size, "bold"), fill="red", tags="skull_icons")
         # Right skull
-        canvas.create_text(canvas.winfo_width() - 150, canvas.winfo_height() // 2, text="☠",
+        canvas.create_text(_canvas_width() - 150, _canvas_height() // 2, text="☠",
                          font=("Helvetica", skull_size, "bold"), fill="red", tags="skull_icons")
 
     # Draw warnings on canvas - collect all active warnings and cycle through them
@@ -4549,12 +7417,12 @@ def update_dashboard():
         block_height = 380
 
         # Calculate vertical positions for upper and lower blocks
-        upper_y = int(canvas.winfo_height() * 0.35)  # Upper blocks at 35% down screen
-        lower_y = int(canvas.winfo_height() * 0.65)  # Lower blocks at 65% down screen
+        upper_y = int(_canvas_height() * 0.35)  # Upper blocks at 35% down screen
+        lower_y = int(_canvas_height() * 0.65)  # Lower blocks at 65% down screen
 
         # Block positions (left and right sides)
         left_x = 50
-        right_x = canvas.winfo_width() - 50 - block_width
+        right_x = _canvas_width() - 50 - block_width
 
         # Draw LEFT side blocks when phase=0 (both upper and lower left)
         if phase == 0:
@@ -4593,18 +7461,31 @@ def update_dashboard():
                              fill="white", tags="caution_blocks")
 
         # Draw "MANUAL" text at center bottom
-        canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88),
+        canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                          text="MANUAL", font=("Helvetica", 90, "bold"),
                          fill="orange", tags="warning")
+        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
+            canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.15),
+                             text=f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
+                             font=("Helvetica", 72, "bold"),
+                             fill="red", tags="warning")
 
     else:
         # Build list of active warnings (in priority order) - only when NOT in override mode
         active_warnings = []
 
+        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
+            active_warnings.append((
+                f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
+                "Helvetica",
+                72,
+                "red",
+            ))
+
         if heartbeat_disconnected:
             active_warnings.append(("SWITCH BOX\nDISCONNECTED", "Helvetica", 60, "red"))
 
-        if flow_meter_disconnected:
+        if flow_meter_disconnected and not startup_iol_warning_suppressed:
             active_warnings.append(("☠ FLOW METER ☠\nDISCONNECTED", "Helvetica", 60, "red"))
 
         if actual > requested_gallons + config.WARNING_THRESHOLD:
@@ -4621,10 +7502,242 @@ def update_dashboard():
                     warning_index = 0
 
                 text, font_family, font_size, color = active_warnings[warning_index]
-                canvas.create_text(canvas.winfo_width() // 2, int(canvas.winfo_height() * 0.88),
+                canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                                  text=text, font=(font_family, font_size, "bold"), fill=color, tags="warning")
 
+    if relay_slowdown_alarm_active and relay_slowdown_alarm_visible:
+        canvas.tag_raise("relay_slowdown_alarm")
+
     root.after(config.UPDATE_INTERVAL, update_dashboard)
+
+
+def _sim_send_command(line):
+    """Drive the most common switch-box commands from the simulator panel."""
+    global requested_gallons, serial_connected, override_mode, override_enabled_time
+    global colors_are_green, fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_heartbeat_time
+
+    line = str(line).strip()
+    serial_connected = True
+
+    if line == "OK":
+        last_heartbeat_time = time.time()
+        return
+
+    if should_ignore_menu_ov_bounce(line, "Sim"):
+        return
+
+    if _sim_handle_confirmation_command(line):
+        return
+
+    if menu_mode:
+        if line == "+1":
+            menu_navigate_down()
+        elif line == "-1":
+            menu_navigate_up()
+        elif line == "OV":
+            arm_menu_ov_guard()
+            menu_select()
+        elif line == "PS":
+            close_menu()
+        return
+
+    if line in ["+1", "-1", "+10", "-10"]:
+        adjustment = int(line)
+        if adjust_batch_mix_gallons(adjustment, "Sim"):
+            return
+        requested_gallons = max(0, requested_gallons + adjustment)
+        colors_are_green = False
+        if current_mode == "fill":
+            fill_requested_gallons = requested_gallons
+        else:
+            mix_requested_gallons = requested_gallons
+        save_mode_presets()
+        draw_requested_number(f"{requested_gallons:.0f}", "red")
+        update_batch_mix_overlay()
+    elif line == "PS":
+        threading.Thread(target=pump_stop_relay, daemon=True).start()
+    elif line == "OV":
+        if requested_gallons == 0:
+            arm_menu_ov_guard()
+            show_menu()
+        else:
+            override_mode = not override_mode
+            if override_mode:
+                override_enabled_time = time.time()
+    elif line == "TU":
+        handle_thumbs_up_press("sim TU")
+    elif line in ("RST", "RESET"):
+        force_flow_reset("sim reset")
+    elif line == "MIX":
+        switch_mode("mix")
+    elif line == "FILL":
+        switch_mode("fill")
+
+
+def _sim_handle_confirmation_command(line):
+    """Route simulator OV/PS through the same confirmation dialogs as serial."""
+    if line not in {"OV", "PS"}:
+        return False
+
+    confirmation_pairs = [
+        (exit_confirm_window, exit_confirm_handler, exit_cancel_handler),
+        (reset_season_confirm_window, reset_season_confirm_handler, reset_season_cancel_handler),
+        (reset_flow_curve_confirm_window, reset_flow_curve_confirm_handler, reset_flow_curve_cancel_handler),
+        (accept_flow_curve_confirm_window, accept_flow_curve_confirm_handler, accept_flow_curve_cancel_handler),
+    ]
+    for window, confirm_handler, cancel_handler in confirmation_pairs:
+        if window:
+            handler = confirm_handler if line == "OV" else cancel_handler
+            if handler:
+                root.after(0, handler)
+            return True
+
+    if reminders_mode:
+        if line == "OV":
+            root.after(0, dismiss_reminders)
+        return True
+
+    return False
+
+
+def _sim_bind_keyboard_shortcuts(panel):
+    """Map simple keyboard keys to the simulated switch-box controls."""
+    key_commands = {
+        "p": "PS",
+        "o": "OV",
+        "Left": "-1",
+        "Right": "+1",
+    }
+
+    def handle_key(event):
+        key = event.keysym
+        command = key_commands.get(key)
+        if command is None:
+            command = key_commands.get(getattr(event, "char", "").lower())
+        if command:
+            _sim_send_command(command)
+            return "break"
+        return None
+
+    def bind_widget(widget):
+        widget.bind("<KeyPress>", handle_key)
+        for child in widget.winfo_children():
+            bind_widget(child)
+
+    bind_widget(root)
+    bind_widget(panel)
+    root.bind_all("<KeyPress>", handle_key)
+    panel.focus_force()
+
+
+def _create_sim_controls():
+    """Create a small side window for driving the dashboard without Pi hardware."""
+    global serial_connected, last_heartbeat_time
+
+    serial_connected = True
+    last_heartbeat_time = time.time()
+
+    panel = tk.Toplevel(root)
+    panel.title("BBB Simulator")
+    panel.geometry("360x560")
+    panel.configure(bg="#202020")
+
+    status_var = tk.StringVar()
+    flow_var = tk.DoubleVar(value=0)
+    connected_var = tk.BooleanVar(value=True)
+    switchbox_var = tk.BooleanVar(value=True)
+
+    def set_flow_from_slider(_value=None):
+        iolhat.set_flow_gpm(flow_var.get())
+
+    def set_flow(value):
+        flow_var.set(value)
+        iolhat.set_flow_gpm(value)
+
+    def set_iol_connected():
+        iolhat.connected = connected_var.get()
+
+    def set_switchbox_connected():
+        global serial_connected, last_heartbeat_time
+        serial_connected = switchbox_var.get()
+        if serial_connected:
+            last_heartbeat_time = time.time()
+
+    def heartbeat_tick():
+        if switchbox_var.get():
+            _sim_send_command("OK")
+        root.after(2500, heartbeat_tick)
+
+    def update_status():
+        actual_gal = iolhat.totalizer_liters * config.LITERS_TO_GALLONS
+        actual_flow_gpm = iolhat.get_flow_gpm()
+        status_var.set(
+            f"Flow: {actual_flow_gpm:.0f} GPM | Actual: {actual_gal:.1f} gal | "
+            f"IOL: {'on' if iolhat.connected else 'off'} | Switch: {'on' if switchbox_var.get() else 'off'}"
+        )
+        root.after(250, update_status)
+
+    title = ttk.Label(panel, text="BBB Simulator", font=("Helvetica", 18, "bold"))
+    title.pack(pady=(14, 6))
+
+    status = ttk.Label(panel, textvariable=status_var, wraplength=320)
+    status.pack(pady=(0, 12))
+
+    ttk.Label(panel, text="Flow Rate").pack(anchor="w", padx=16)
+    flow_scale = ttk.Scale(panel, from_=0, to=120, variable=flow_var, command=set_flow_from_slider)
+    flow_scale.pack(fill="x", padx=16, pady=(2, 10))
+
+    flow_buttons = ttk.Frame(panel)
+    flow_buttons.pack(fill="x", padx=16, pady=(0, 12))
+    for label, value in [("Stop", 0), ("45 GPM", 45), ("75 GPM", 75), ("100 GPM", 100)]:
+        ttk.Button(flow_buttons, text=label, command=lambda v=value: set_flow(v)).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+    cmd_frame = ttk.LabelFrame(panel, text="Switch Box")
+    cmd_frame.pack(fill="x", padx=16, pady=8)
+    for row in [("+1", "-1", "+10", "-10"), ("OV", "PS", "TU", "RST"), ("FILL", "MIX")]:
+        row_frame = ttk.Frame(cmd_frame)
+        row_frame.pack(fill="x", padx=6, pady=4)
+        for command in row:
+            ttk.Button(row_frame, text=command, command=lambda c=command: _sim_send_command(c)).pack(
+                side="left", expand=True, fill="x", padx=2
+            )
+
+    sensors = ttk.LabelFrame(panel, text="Sensors")
+    sensors.pack(fill="x", padx=16, pady=8)
+    ttk.Checkbutton(
+        sensors,
+        text="IO-Link connected",
+        variable=connected_var,
+        command=set_iol_connected,
+    ).pack(anchor="w", padx=8, pady=4)
+    ttk.Checkbutton(
+        sensors,
+        text="Switch box heartbeat",
+        variable=switchbox_var,
+        command=set_switchbox_connected,
+    ).pack(anchor="w", padx=8, pady=4)
+    ttk.Button(sensors, text="Reset Flow Totalizer", command=iolhat.reset_totalizer).pack(
+        fill="x", padx=8, pady=4
+    )
+    ttk.Button(
+        sensors,
+        text="Tanks Good",
+        command=lambda: (_apply_mopeka(325, 310, 3, 3), _apply_mopeka_raw(640, 610, 25.2, 24.0)),
+    ).pack(fill="x", padx=8, pady=4)
+    ttk.Button(sensors, text="Tanks Offline", command=_mopeka_offline).pack(fill="x", padx=8, pady=4)
+    ttk.Button(sensors, text="Battery 84%", command=lambda: _apply_bms(84, 13.1)).pack(
+        fill="x", padx=8, pady=4
+    )
+
+    ttk.Button(panel, text="Quit Simulator", command=root.destroy).pack(fill="x", padx=16, pady=16)
+
+    heartbeat_tick()
+    update_status()
+    _sim_bind_keyboard_shortcuts(panel)
+
 
 # Initialize GPIO and IO-Link and start serial listener
 gpio_ok = initialize_gpio()
@@ -4638,6 +7751,7 @@ else:
 # Load totals from files
 load_totals()
 load_last_load()
+load_flow_curve_state()
 today_str = time.strftime('%Y-%m-%d')
 if last_reset_date != today_str:
     print(f"Date changed since last reset ({last_reset_date} -> {today_str}) - resetting daily total on startup")
@@ -4653,7 +7767,7 @@ else:
     requested_gallons = mix_requested_gallons
     # Show mode indicator if starting in mix mode
     if mode_indicator_label:
-        mode_indicator_label.place(relx=0.02, rely=0.02, anchor="nw")
+        place_mix_mode_indicator()
 print(f"Loaded mode - Mode: {current_mode}, Requested: {requested_gallons}, Fill preset: {fill_requested_gallons}, Mix preset: {mix_requested_gallons}")
 
 # Redraw requested gallons with the loaded value
@@ -4661,17 +7775,22 @@ draw_requested_number(f"{requested_gallons:.0f}", "red")
 update_last_load_display()
 update_bms_display()
 
-# Start serial listener in background thread (works without IOL)
-serial_thread = threading.Thread(target=serial_listener, daemon=True)
-serial_thread.start()
+if SIM_MODE:
+    root.after(100, _create_sim_controls)
+else:
+    # Start serial listener in background thread (works without IOL)
+    serial_thread = threading.Thread(target=serial_listener, daemon=True)
+    serial_thread.start()
 
-# Start socket command listener in background thread (for BLE server communication)
-socket_thread = threading.Thread(target=socket_command_listener, daemon=True)
-socket_thread.start()
+    # Start socket command listener in background thread (for BLE server communication)
+    socket_thread = threading.Thread(target=socket_command_listener, daemon=True)
+    socket_thread.start()
 
-# Start green button monitor in background thread
-green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
-green_button_thread.start()
+    # Start green button monitor in background thread
+    green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
+    green_button_thread.start()
+
+start_flow_control_thread()
 
 def daily_total_checker():
     """Background thread to check time and reset daily total at 1:00 AM"""
@@ -4732,11 +7851,20 @@ total_checker_thread.start()
 reminder_thread = threading.Thread(target=daily_reminder_checker, daemon=True)
 reminder_thread.start()
 
+update_relay_slowdown_alarm_flash()
 update_dashboard()
+
+if SIM_MODE:
+    root.deiconify()
+    root.lift()
+    root.update_idletasks()
 
 try:
     root.mainloop()
 finally:
+    flow_control_stop_event.set()
+    if flow_control_thread and flow_control_thread.is_alive():
+        flow_control_thread.join(timeout=1.0)
     # Cleanup GPIO on exit
     if GPIO_AVAILABLE:
         GPIO.cleanup()

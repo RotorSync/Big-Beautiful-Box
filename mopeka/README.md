@@ -18,6 +18,19 @@ Lookup table mapping tank level (inches) to gallons for the 1070-gallon spray ta
 - Tank level measured in inches from bottom
 - Used by the BBB Pi to convert raw Mopeka readings to gallons
 
+### Optional per-tank calibration profiles
+Boxes can override the shared 1070-gallon lookup table with per-tank CSVs in:
+
+`/opt/mopeka/calibrations/`
+
+Profile names:
+- Fleet: `trailer-2-front.csv`, `trailer-2-back.csv`, etc.
+- Customer: `customer-front.csv`, `customer-back.csv`
+
+If a matching profile is missing, the converter falls back to
+`calibration-points-1070gal-tank.csv`, so existing fleet boxes keep the factory
+curve until an explicit per-tank profile is added.
+
 ## Notes
 - Height offsets are per-sensor corrections applied before the calibration lookup
 - A negative offset means the sensor reads high (subtract from raw reading)
