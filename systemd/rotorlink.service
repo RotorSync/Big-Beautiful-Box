@@ -1,7 +1,11 @@
 [Unit]
 Description=RotorLink local WiFi link (iPad <-> dashboard bridge)
-# Bridges the dashboard command socket; start after it and the network are up.
-After=network-online.target iol_dashboard.service NetworkManager.service
+# Bridges the dashboard command socket — but connects at runtime with retry, so it
+# must NOT order After=iol_dashboard.service: that service is pulled into graphical.target
+# (ordered after multi-user.target), while this unit is WantedBy=multi-user.target, which
+# creates an ordering cycle that systemd breaks by DROPPING iol_dashboard at boot (dashboard
+# never starts). Order only on the network.
+After=network-online.target NetworkManager.service
 Wants=network-online.target
 
 [Service]
