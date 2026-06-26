@@ -3470,13 +3470,19 @@ def run_system_update():
                 "        parts.append(video_arg)\n"
                 "        p.write_text(' '.join(parts) + '\\n')\n"
                 "PY\n"
+                # RotorLink (WiFi link iPad<->dashboard + WiFi maintenance terminal)
+                "command -v avahi-publish-service >/dev/null 2>&1 || apt-get install -y avahi-utils >/dev/null 2>&1 || true; "
+                "python3 -c 'import websockets' >/dev/null 2>&1 || apt-get install -y python3-websockets >/dev/null 2>&1 || python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 || true; "
+                "mkdir -p /etc/rotorlink; [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk; "
+                "cp /home/pi/Big-Beautiful-Box/systemd/rotorlink.service /etc/systemd/system/rotorlink.service; "
                 "systemctl daemon-reload; "
+                "systemctl enable --now rotorlink.service || true; "
                 "systemctl enable --now bbb-logrotate.timer; "
                 "systemctl start bbb-logrotate.service"
             )
             result = subprocess.run(
                 ['bash', '-lc', f"printf 'raspi\\n' | sudo -S bash -lc {shlex.quote(deploy_cmd)}"],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=180
             )
             if result.returncode != 0:
                 status_text.insert(tk.END, "WARNING: Could not refresh deployed BBB runtime.\n")
@@ -3498,7 +3504,7 @@ def run_system_update():
             # Launch in the background because the current process will be terminated by the restart.
             restart_cmd = (
                 "sleep 1; "
-                "printf 'raspi\n' | sudo -S systemctl restart rotorsync.service rotorsync_watchdog.service iol_dashboard.service"
+                "printf 'raspi\n' | sudo -S systemctl restart rotorsync.service rotorsync_watchdog.service iol_dashboard.service rotorlink.service"
             )
             subprocess.Popen(['bash', '-lc', restart_cmd])
             return
