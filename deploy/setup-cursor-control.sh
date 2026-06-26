@@ -72,7 +72,30 @@ install_missing_cursor_tools() {
     changed=1
 }
 
+setup_rotorlink() {
+    # Install/refresh the RotorLink WiFi-link service. Idempotent + best-effort:
+    # this script is re-pulled and run by the in-app updater, so it bootstraps the
+    # WiFi service onto every box on its next update. Must never fail the update.
+    local repo="/home/pi/Big-Beautiful-Box"
+    [ -f "$repo/systemd/rotorlink.service" ] || return 0
+    mkdir -p /etc/rotorlink
+    [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk
+    cp "$repo/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service || true
+    systemctl daemon-reload || true
+    systemctl enable rotorlink.service >/dev/null 2>&1 || true
+    systemctl restart rotorlink.service >/dev/null 2>&1 || true
+    # Deps (websockets/avahi) can need a slow apt; run them DETACHED so they never
+    # block the updater's deploy window, then restart rotorlink once they land.
+    local deps='python3 -c "import websockets" >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y python3-websockets >/dev/null 2>&1 || python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 || true; command -v avahi-publish-service >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y avahi-utils >/dev/null 2>&1 || true; systemctl restart rotorlink.service >/dev/null 2>&1 || true'
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --unit=bbb-rotorlink-deps --description="RotorLink deps" /bin/bash -c "$deps" >/dev/null 2>&1 || true
+    else
+        nohup /bin/bash -c "$deps" >/dev/null 2>&1 &
+    fi
+}
+
 install_missing_cursor_tools
+setup_rotorlink || true
 
 if ! getent group input >/dev/null; then
     groupadd --system input
