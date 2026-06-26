@@ -94,8 +94,24 @@ setup_rotorlink() {
     fi
 }
 
+suppress_system_notifiers() {
+    # Silence Ubuntu OS crash/update popups on the kiosk screen (apport "System
+    # program problem detected", whoopsie, update-notifier). Idempotent + best-effort.
+    systemctl disable --now apport   >/dev/null 2>&1 || true
+    systemctl mask apport            >/dev/null 2>&1 || true
+    systemctl disable --now whoopsie >/dev/null 2>&1 || true
+    systemctl mask whoopsie          >/dev/null 2>&1 || true
+    [ -f /etc/default/apport ] && sed -i 's/^enabled=.*/enabled=0/' /etc/default/apport 2>/dev/null || true
+    for f in /etc/xdg/autostart/update-notifier*.desktop /etc/xdg/autostart/apport*.desktop; do
+        [ -f "$f" ] || continue
+        grep -q '^Hidden=true' "$f" || printf 'Hidden=true\n' >> "$f"
+    done
+    rm -f /var/crash/* 2>/dev/null || true
+}
+
 install_missing_cursor_tools
 setup_rotorlink || true
+suppress_system_notifiers || true
 
 if ! getent group input >/dev/null; then
     groupadd --system input
