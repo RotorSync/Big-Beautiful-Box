@@ -1,13 +1,20 @@
 [Unit]
 Description=RotorLink local WiFi link (iPad <-> dashboard bridge)
 # Bridges the dashboard command socket; start after it and the network are up.
-After=network-online.target iol_dashboard.service
+After=network-online.target iol_dashboard.service NetworkManager.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+# root: config writes over WiFi and the field-AP (nmcli) switching both require it.
+User=root
 WorkingDirectory=/home/pi/Big-Beautiful-Box
+Environment=PYTHONUNBUFFERED=1
+Environment=ROTORLINK_LOG=INFO
+# Field hotspot (Pi hosts its own WiFi when no known network is in range) is OFF by
+# default so an upgrade never disrupts a box's network. To enable it on a trailer,
+# uncomment the next line, then: systemctl daemon-reload && systemctl restart rotorlink
+# Environment=ROTORLINK_AP_ENABLED=1
 ExecStart=/usr/bin/python3 -m rotorlink
 Restart=always
 RestartSec=3
@@ -15,7 +22,6 @@ RestartSec=3
 # Environment=ROTORLINK_WS_PORT=8765
 # Environment=ROTORLINK_NAME=Trailer 1
 # Environment=ROTORLINK_SERIAL=TS-01
-# Environment=ROTORLINK_ARBITRATION=0
 
 [Install]
 WantedBy=multi-user.target

@@ -476,6 +476,21 @@ sudo systemctl enable iol_dashboard.service
 sudo systemctl enable rotorsync.service
 sudo systemctl enable rotorsync_watchdog.service
 
+# RotorLink: local WiFi link (iPad <-> dashboard bridge) + WiFi maintenance terminal
+if ! python3 -c "import websockets" >/dev/null 2>&1; then
+    sudo apt-get install -y python3-websockets >/dev/null 2>&1 \
+        || sudo python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 \
+        || log_warn "RotorLink needs the python3 'websockets' package (auto-install failed)"
+fi
+command -v avahi-publish-service >/dev/null 2>&1 || sudo apt-get install -y avahi-utils >/dev/null 2>&1 || log_warn "RotorLink mDNS needs avahi-utils"
+sudo mkdir -p /etc/rotorlink
+# WPA2 PSK for the field hotspot; only used when ROTORLINK_AP_ENABLED=1 is set on the unit.
+[ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' | sudo tee /etc/rotorlink/ap.psk >/dev/null
+sudo cp "$SCRIPT_DIR/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now rotorlink.service || log_warn "rotorlink.service did not start"
+log_info "Installed RotorLink WiFi link service (rotorlink.service)"
+
 # Step 7: Configure auto-login, screen, and log retention
 log_step "7/7: Configuring display settings and log retention..."
 
