@@ -75,6 +75,36 @@ HISTORY_RETENTION_SECONDS = _env_int(
     "ROTORLINK_HISTORY_RETENTION_SECONDS", 366 * 24 * 3600
 )
 
+# The trailer's assigned BLE name (e.g. "TrailerSync-TR7") — bumble persists it
+# here when it advertises. We reuse it as the WiFi/mDNS name so BLE + WiFi share
+# ONE device identity (same source the AP SSID uses in network_manager.py).
+BLE_NAME_FILE = _env(
+    "ROTORLINK_BLE_NAME_FILE", "/home/pi/rotorsync_gatt_advertising_ready.json"
+)
+
+
+def trailer_name() -> str:
+    """The assigned trailer name (e.g. 'TrailerSync-TR7') for WiFi/mDNS, matching
+    the BLE advertised name. Read from the file bumble persists; fall back to the
+    mopeka display_name, then the hostname (so a box is still identifiable before
+    a trailer is assigned)."""
+    import json
+    try:
+        with open(BLE_NAME_FILE) as f:
+            name = str(json.load(f).get("name") or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    try:
+        with open(MOPEKA_CONFIG_PATH) as f:
+            dn = str(json.load(f).get("display_name") or "").strip()
+        if dn:
+            return dn
+    except Exception:
+        pass
+    return socket.gethostname()
+
 
 def device_descriptor() -> dict:
     """
@@ -87,7 +117,10 @@ def device_descriptor() -> dict:
     hostname = socket.gethostname()
     return {
         "app": _env("ROTORLINK_APP", "trailersync"),
-        "name": _env("ROTORLINK_NAME", hostname),
+        # WiFi/mDNS name == the assigned trailer (BLE name), not the box serial,
+        # so BLE + WiFi share one identity. serial stays the hostname (the unique
+        # box id + the resolvable .local host).
+        "name": os.environ.get("ROTORLINK_NAME") or trailer_name(),
         "serial": _env("ROTORLINK_SERIAL", hostname),
         "sw": __version__,
         "proto": PROTOCOL_VERSION,

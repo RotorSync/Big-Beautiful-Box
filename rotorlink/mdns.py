@@ -49,6 +49,7 @@ class MDNSAdvertiser:
         self._zc = None
         self._info = None
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._advertised_name: Optional[str] = None
 
     async def start(self) -> None:
         if not config.MDNS_ENABLED:
@@ -70,7 +71,9 @@ class MDNSAdvertiser:
             return False
         try:
             d = config.device_descriptor()
-            instance = "%s.%s.local." % (d["serial"], config.MDNS_SERVICE_TYPE)
+            # Advertise as the trailer NAME (matches BLE) but resolve via the
+            # serial (hostname) .local host, so the box stays reachable.
+            instance = "%s.%s.local." % (d["name"], config.MDNS_SERVICE_TYPE)
             self._zc = Zeroconf()
             self._info = ServiceInfo(
                 type_=config.MDNS_SERVICE_TYPE + ".local.",
@@ -80,6 +83,7 @@ class MDNSAdvertiser:
                 server="%s.local." % d["serial"],
             )
             self._zc.register_service(self._info, allow_name_change=True)
+            self._advertised_name = d["name"]
             logger.info("mDNS advertised via zeroconf: %s", instance)
             return True
         except Exception as e:
@@ -98,7 +102,7 @@ class MDNSAdvertiser:
         txt = ["%s=%s" % (k, v) for k, v in _txt_record().items()]
         args = [
             "avahi-publish-service",
-            d["serial"],
+            d["name"],
             config.MDNS_SERVICE_TYPE,
             str(config.WS_PORT),
             *txt,
@@ -110,9 +114,31 @@ class MDNSAdvertiser:
                 stderr=asyncio.subprocess.DEVNULL,
                 preexec_fn=_die_with_parent,
             )
-            logger.info("mDNS advertised via avahi: %s %s", d["serial"], config.MDNS_SERVICE_TYPE)
+            self._advertised_name = d["name"]
+            logger.info("mDNS advertised via avahi: %s %s", d["name"], config.MDNS_SERVICE_TYPE)
         except Exception as e:
             logger.warning("avahi-publish-service failed; mDNS disabled: %s", e)
+
+    async def maintain(self, interval: float = 20.0) -> None:
+        """Re-advertise if the trailer name changes. On a cold boot bumble writes
+        the BLE name file AFTER we start (so we may have come up on the serial),
+        and a trailer can be reassigned without a reboot — keep mDNS == BLE name."""
+        if not config.MDNS_ENABLED:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                current = config.device_descriptor()["name"]
+            except Exception as e:
+                logger.warning("mDNS name check failed: %s", e)
+                continue
+            if current and current != self._advertised_name:
+                logger.info(
+                    "trailer name changed %r -> %r; re-advertising mDNS",
+                    self._advertised_name, current,
+                )
+                await self.stop()
+                await self.start()
 
     async def stop(self) -> None:
         if self._zc is not None:

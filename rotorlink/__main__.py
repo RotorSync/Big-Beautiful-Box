@@ -37,6 +37,9 @@ async def _amain() -> None:
 
     mdns = MDNSAdvertiser()
     await mdns.start()
+    # Keep the mDNS name == the trailer's BLE name even if it appears/changes after
+    # startup (cold boot before bumble writes it, or a trailer reassignment).
+    mdns_task = asyncio.create_task(mdns.maintain())
     server_task = asyncio.create_task(RotorLinkServer().run())
     # AP/STA field-mode manager (disabled unless ROTORLINK_AP_ENABLED=1 — it only
     # dry-run-logs its decisions otherwise, so it never disrupts the network).
@@ -49,7 +52,8 @@ async def _amain() -> None:
     finally:
         server_task.cancel()
         network_task.cancel()
-        for t in (server_task, network_task):
+        mdns_task.cancel()
+        for t in (server_task, network_task, mdns_task):
             try:
                 await t
             except asyncio.CancelledError:
