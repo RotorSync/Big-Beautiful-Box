@@ -3473,6 +3473,12 @@ def run_system_update():
                 # RotorLink (WiFi link iPad<->dashboard + WiFi maintenance terminal)
                 "command -v avahi-publish-service >/dev/null 2>&1 || apt-get install -y avahi-utils >/dev/null 2>&1 || true; "
                 "python3 -c 'import websockets' >/dev/null 2>&1 || apt-get install -y python3-websockets >/dev/null 2>&1 || python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 || true; "
+                # Ensure bumble/bleak are installed for the SYSTEM interpreter (root) that
+                # runs rotorsync.service. Some boxes only had them in pi's ~/.local, so the
+                # root service crash-looped "No module named 'bumble'" on restart/reboot.
+                # Pinned to match install.sh so the whole fleet converges to one version.
+                # Fail-soft (|| true): a transient offline run must not abort the update.
+                "python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229 > /tmp/bbb-bumble-install.log 2>&1 || true; "
                 "mkdir -p /etc/rotorlink; [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk; "
                 "cp /home/pi/Big-Beautiful-Box/systemd/rotorlink.service /etc/systemd/system/rotorlink.service; "
                 "systemctl daemon-reload; "
