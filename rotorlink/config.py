@@ -84,16 +84,21 @@ BLE_NAME_FILE = _env(
 
 
 def unconfigured_name() -> str:
-    """WiFi/mDNS name for a box with no trailer assigned: clearly 'unconfigured'
-    but still unique per box (so several unassigned boxes on one network don't
-    collide on the mDNS instance name). Uses the short serial from the hostname,
-    e.g. host 'trailersync-sn007' -> 'TrailerSync-Unconfigured-sn007'."""
+    """WiFi/mDNS name for a box with no trailer assigned: clearly unconfigured but
+    still unique per box (so several unassigned boxes on one network don't collide
+    on the mDNS instance name). Uses the short serial from the hostname, e.g. host
+    'trailersync-sn007' -> 'TrailerSync-Uncfg-sn007'.
+
+    KEPT SHORT ('Uncfg', not 'Unconfigured') to match the BLE name bumble
+    advertises: the longer form overflows the BLE scan-response on the fleet's
+    Realtek adapters and crash-loops the box. See _unconfigured_ble_name() in
+    rotorsync_bumble.py. BLE and WiFi must advertise the SAME identity."""
     host = socket.gethostname()
     serial = host
     if serial.lower().startswith("trailersync-"):
         serial = serial[len("trailersync-"):]
     serial = serial.strip()
-    return "TrailerSync-Unconfigured-%s" % serial if serial else "TrailerSync-Unconfigured"
+    return "TrailerSync-Uncfg-%s" % serial if serial else "TrailerSync-Uncfg"
 
 
 def trailer_name() -> str:

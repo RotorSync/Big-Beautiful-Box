@@ -3715,6 +3715,25 @@ def _mopeka_enabled(cfg=None):
     return bool(cfg.get('mopeka_enabled', True))
 
 
+def _unconfigured_ble_name():
+    """BLE/mDNS name for a box with no trailer assigned. Includes the box serial
+    (from the hostname) so several unconfigured boxes don't collide on one name
+    over BLE or mDNS, e.g. host 'trailersync-sn009' -> 'TrailerSync-Uncfg-sn009'.
+    Mirrors rotorlink.config.unconfigured_name() so BLE and WiFi share one identity.
+
+    KEPT SHORT ('Uncfg', not 'Unconfigured'): the full name rides in the BLE
+    scan-response, whose data is length-limited. The longer 'Unconfigured-<serial>'
+    (~30 chars) overflows it on the fleet's Realtek adapters
+    (HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA -> INVALID_COMMAND_PARAMETERS), which
+    aborts advertising and crash-loops the box. 'Uncfg-<serial>' (~23) fits."""
+    host = socket.gethostname()
+    serial = host
+    if serial.lower().startswith('trailersync-'):
+        serial = serial[len('trailersync-'):]
+    serial = serial.strip()
+    return f'TrailerSync-Uncfg-{serial}' if serial else 'TrailerSync-Uncfg'
+
+
 def _compute_ble_name(cfg=None):
     cfg = cfg or load_config()
     mode = _normalize_box_mode(cfg.get('box_mode'))
@@ -3727,12 +3746,18 @@ def _compute_ble_name(cfg=None):
     if trailer not in (None, ''):
         return f'TrailerSync-TR{trailer}'
 
-    return display_name or DEFAULT_FLEET_BLE_NAME
+    return display_name or _unconfigured_ble_name()
 
 
 def _compute_short_ble_advertising_name(ble_name):
-    """Return a compact trailer identity that fits in legacy BLE advertising."""
-    match = re.fullmatch(r'TrailerSync-(TR\d+)', str(ble_name or '').strip())
+    """Return a compact identity that fits in legacy BLE advertising."""
+    name = str(ble_name or '').strip()
+    match = re.fullmatch(r'TrailerSync-(TR\d+)', name)
+    if match:
+        return match.group(1)
+    # Unconfigured boxes: advertise the serial so the full name
+    # ("TrailerSync-Uncfg-<serial>") still has a compact, unique form.
+    match = re.fullmatch(r'TrailerSync-Uncfg-(.+)', name)
     if match:
         return match.group(1)
     return ''

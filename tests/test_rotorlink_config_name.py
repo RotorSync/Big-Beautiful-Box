@@ -8,12 +8,19 @@ from rotorlink import config
 
 def test_unconfigured_name_strips_trailersync_prefix(monkeypatch):
     monkeypatch.setattr(config.socket, "gethostname", lambda: "trailersync-sn007")
-    assert config.unconfigured_name() == "TrailerSync-Unconfigured-sn007"
+    assert config.unconfigured_name() == "TrailerSync-Uncfg-sn007"
 
 
 def test_unconfigured_name_uses_full_host_when_no_prefix(monkeypatch):
     monkeypatch.setattr(config.socket, "gethostname", lambda: "pi-box-42")
-    assert config.unconfigured_name() == "TrailerSync-Unconfigured-pi-box-42"
+    assert config.unconfigured_name() == "TrailerSync-Uncfg-pi-box-42"
+
+
+def test_unconfigured_name_fits_ble_scan_response(monkeypatch):
+    # The full name rides in the BLE scan-response, which overflows on the fleet's
+    # Realtek adapters past ~29 chars. Guard the length so the box keeps advertising.
+    monkeypatch.setattr(config.socket, "gethostname", lambda: "trailersync-sn009")
+    assert len(config.unconfigured_name()) <= 29
 
 
 def test_trailer_name_falls_back_to_unconfigured_when_unassigned(monkeypatch, tmp_path):
@@ -21,7 +28,7 @@ def test_trailer_name_falls_back_to_unconfigured_when_unassigned(monkeypatch, tm
     monkeypatch.setattr(config, "BLE_NAME_FILE", str(tmp_path / "missing-ble.json"))
     monkeypatch.setattr(config, "MOPEKA_CONFIG_PATH", str(tmp_path / "missing-mopeka.json"))
     monkeypatch.setattr(config.socket, "gethostname", lambda: "trailersync-sn007")
-    assert config.trailer_name() == "TrailerSync-Unconfigured-sn007"
+    assert config.trailer_name() == "TrailerSync-Uncfg-sn007"
 
 
 def test_trailer_name_prefers_assigned_ble_name(monkeypatch, tmp_path):
