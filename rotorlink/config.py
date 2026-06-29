@@ -83,11 +83,25 @@ BLE_NAME_FILE = _env(
 )
 
 
+def unconfigured_name() -> str:
+    """WiFi/mDNS name for a box with no trailer assigned: clearly 'unconfigured'
+    but still unique per box (so several unassigned boxes on one network don't
+    collide on the mDNS instance name). Uses the short serial from the hostname,
+    e.g. host 'trailersync-sn007' -> 'TrailerSync-Unconfigured-sn007'."""
+    host = socket.gethostname()
+    serial = host
+    if serial.lower().startswith("trailersync-"):
+        serial = serial[len("trailersync-"):]
+    serial = serial.strip()
+    return "TrailerSync-Unconfigured-%s" % serial if serial else "TrailerSync-Unconfigured"
+
+
 def trailer_name() -> str:
     """The assigned trailer name (e.g. 'TrailerSync-TR7') for WiFi/mDNS, matching
     the BLE advertised name. Read from the file bumble persists; fall back to the
-    mopeka display_name, then the hostname (so a box is still identifiable before
-    a trailer is assigned)."""
+    mopeka display_name, then an explicit 'TrailerSync-Unconfigured-<serial>'
+    marker (so an unassigned box reads as unconfigured rather than a bare serial,
+    while staying unique)."""
     import json
     try:
         with open(BLE_NAME_FILE) as f:
@@ -103,7 +117,7 @@ def trailer_name() -> str:
             return dn
     except Exception:
         pass
-    return socket.gethostname()
+    return unconfigured_name()
 
 
 def device_descriptor() -> dict:
