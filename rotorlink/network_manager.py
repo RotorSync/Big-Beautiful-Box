@@ -73,6 +73,13 @@ EVAL_INTERVAL = float(os.environ.get("ROTORLINK_AP_EVAL_INTERVAL", "20"))
 # The RotorLink WS port — used to count connected clients (idle gate) without
 # coupling to the server module.
 WS_PORT = int(os.environ.get("ROTORLINK_WS_PORT", "8765"))
+# Link-quality gate for joining a known station network (nmcli SIGNAL, 0-100).
+# Only LEAVE the AP to join a known network when its signal clears STA_JOIN; once
+# on STA, STAY until it falls below the lower STA_DROP (or disappears). The gap
+# between the two is hysteresis — it stops the box flapping AP<->STA at the edge
+# of hangar-WiFi range. Set STA_JOIN very high (e.g. 101) to effectively pin AP.
+STA_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_JOIN_SIGNAL", "55"))
+STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "40"))
 
 
 def _run(args, timeout=15):
@@ -99,29 +106,44 @@ class NetworkManager:
         self._mode = "unknown"   # "ap" | "sta" | "unknown"
 
     # --- state queries ----------------------------------------------------
-    def _saved_sta_ssids(self) -> set:
-        """SSIDs of saved NM wifi connections that aren't our AP — the 'known
-        networks' we prefer to join as a station (e.g. the hangar 'Headings')."""
+    def _saved_sta_conns(self) -> dict:
+        """Map {ssid: connection-name} for saved NM wifi connections that aren't
+        our AP — the 'known networks' we prefer to join as a station (e.g. the
+        hangar 'Headings'). We keep the connection NAME because that is what
+        `nmcli con up` needs (it can differ from the SSID)."""
         rc, out = _run(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"])
         names = [
             line.split(":", 1)[0]
             for line in out.splitlines()
             if line.endswith(":802-11-wireless") and not line.startswith(AP_CON_NAME + ":")
         ]
-        ssids = set()
+        conns = {}
         for name in names:
             rc, ssid = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", name])
             ssid = ssid.strip()
             if ssid:
-                ssids.add(ssid)
-        return ssids
+                conns[ssid] = name
+        return conns
 
-    def _visible_ssids(self) -> set:
-        rc, out = _run(["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "--rescan", "no"])
-        return {s.strip() for s in out.splitlines() if s.strip()}
-
-    def _known_network_available(self) -> bool:
-        return bool(self._saved_sta_ssids() & self._visible_ssids())
+    def _best_known(self) -> tuple:
+        """(signal, ssid, connection-name) of the strongest currently-visible
+        SAVED network, or (-1, None, None) if none is visible. Gates joining a
+        station network on link quality (so the box won't leave its AP for a
+        marginal hangar signal) AND names the exact connection to bring up."""
+        conns = self._saved_sta_conns()
+        if not conns:
+            return (-1, None, None)
+        rc, out = _run(["nmcli", "-t", "-f", "SSID,SIGNAL", "device", "wifi", "list", "--rescan", "no"])
+        best_sig, best_ssid = -1, None
+        for line in out.splitlines():
+            if ":" not in line:
+                continue
+            ssid, sig = line.rsplit(":", 1)          # SIGNAL is the numeric last field
+            ssid = ssid.replace("\\:", ":").replace("\\\\", "\\").strip()
+            sig = sig.strip()
+            if ssid in conns and sig.isdigit() and int(sig) > best_sig:
+                best_sig, best_ssid = int(sig), ssid
+        return (best_sig, best_ssid, conns.get(best_ssid))
 
     def _client_count(self) -> int:
         """Connected RotorLink clients (established TCP on the WS port). Pi-level
@@ -159,43 +181,77 @@ class NetworkManager:
         return False
 
     # --- switching --------------------------------------------------------
-    def _activate(self, target: str) -> None:
+    def _activate(self, target: str, sta_conn: str = None) -> None:
         if not AP_ENABLED:
             logger.info("[dry-run] would switch -> %s (ROTORLINK_AP_ENABLED off)", target)
             return
         if target == "ap":
-            self.ensure_ap_profile()
-            _run(["nmcli", "con", "up", AP_CON_NAME])
+            if not self.ensure_ap_profile():
+                logger.error("cannot switch -> ap: AP profile unavailable (check PSK); will retry")
+                return
+            # Single radio (wlan0): the chip can't run AP + STA except on ONE
+            # shared channel, so a lingering STA association makes `con up` of the
+            # AP silently fail. Free the interface FIRST, then raise the AP.
+            _run(["nmcli", "device", "disconnect", AP_IFACE])
+            rc, out = _run(["nmcli", "con", "up", AP_CON_NAME])
+            if rc != 0:
+                logger.error("AP bring-up failed rc=%s: %s — will retry next loop",
+                             rc, out.strip()[:200])
+                return  # leave self._mode unchanged so the next eval retries
         else:
-            # Let NM auto-pick the best known STA connection.
+            # Return to a known station network. Take the AP down, then bring up
+            # the CHOSEN connection BY NAME on wlan0. `nmcli device connect wlan0`
+            # is unreliable coming out of AP mode (it re-activates the AP profile
+            # instead of joining the STA network), so name the connection.
             _run(["nmcli", "con", "down", AP_CON_NAME])
-            _run(["nmcli", "device", "connect", AP_IFACE])
+            if not sta_conn:
+                logger.error("cannot switch -> sta: no known connection resolved; will retry")
+                return  # leave self._mode unchanged so the next eval retries
+            rc, out = _run(["nmcli", "con", "up", sta_conn, "ifname", AP_IFACE])
+            if rc != 0:
+                logger.error("STA bring-up (%s) failed rc=%s: %s — will retry next loop",
+                             sta_conn, rc, out.strip()[:200])
+                return  # leave self._mode unchanged so the next eval retries
         self._mode = target
-        logger.info("switched -> %s", target)
+        logger.info("switched -> %s%s", target, (" (%s)" % sta_conn) if target == "sta" else "")
 
     # --- main loop --------------------------------------------------------
     async def run(self) -> None:
         logger.info(
-            "network manager: AP_ENABLED=%s iface=%s ap_ssid=%s (default=AP, "
-            "STA when a known network is in range + idle)",
-            AP_ENABLED, AP_IFACE, AP_SSID,
+            "network manager: AP_ENABLED=%s iface=%s ap_ssid=%s sta_join>=%s sta_drop<%s "
+            "(default=AP; join known WiFi only above the signal gate, idle-gated)",
+            AP_ENABLED, AP_IFACE, AP_SSID, STA_JOIN_SIGNAL, STA_DROP_SIGNAL,
         )
         self.ensure_ap_profile()  # safe: autoconnect off
         loop = asyncio.get_running_loop()
         while True:
             try:
                 # Run the blocking nmcli/ss probes off the event loop.
-                desired = "sta" if await loop.run_in_executor(None, self._known_network_available) else "ap"
                 current = await loop.run_in_executor(None, self._current_mode)
+                best_sig, best_ssid, best_conn = await loop.run_in_executor(None, self._best_known)
                 clients = await loop.run_in_executor(None, self._client_count)
 
-                if desired != current and current != "unknown":
+                # STA-preferred, but signal-gated with hysteresis: leave the AP to
+                # join a known network only when its signal clears STA_JOIN; once on
+                # STA, stay until it drops below STA_DROP (or vanishes -> best=-1).
+                threshold = STA_DROP_SIGNAL if current == "sta" else STA_JOIN_SIGNAL
+                desired = "sta" if best_sig >= threshold else "ap"
+
+                # a down/disconnected wlan0 reports current=="unknown"; converge
+                # from "unknown" toward desired — exactly the "WiFi dropped, so
+                # start hosting the AP" case the old `current != "unknown"` guard
+                # wrongly refused.
+                if desired != current:
                     if clients > 0:
-                        logger.info("want %s but %d client(s) connected — deferring (idle-gate)", desired, clients)
+                        logger.info("want %s (best known %s signal=%s) but %d client(s) connected — deferring (idle-gate)",
+                                    desired, best_ssid, best_sig, clients)
                     else:
-                        await loop.run_in_executor(None, self._activate, desired)
+                        # pass the resolved STA connection name so the sta switch
+                        # brings up the right network by name (see _activate).
+                        await loop.run_in_executor(None, self._activate, desired, best_conn)
                 else:
-                    logger.debug("mode ok: current=%s desired=%s clients=%d", current, desired, clients)
+                    logger.debug("mode ok: current=%s desired=%s best=%s(%s) clients=%d",
+                                 current, desired, best_sig, best_ssid, clients)
             except Exception as e:
                 logger.warning("network manager loop error: %s", e)
             await asyncio.sleep(EVAL_INTERVAL)

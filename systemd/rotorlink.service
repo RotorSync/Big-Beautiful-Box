@@ -15,10 +15,12 @@ User=root
 WorkingDirectory=/home/pi/Big-Beautiful-Box
 Environment=PYTHONUNBUFFERED=1
 Environment=ROTORLINK_LOG=INFO
-# Field hotspot (Pi hosts its own WiFi when no known network is in range) is OFF by
-# default so an upgrade never disrupts a box's network. To enable it on a trailer,
-# uncomment the next line, then: systemctl daemon-reload && systemctl restart rotorlink
-# Environment=ROTORLINK_AP_ENABLED=1
+# Field hotspot: the Pi hosts its own WiFi AP (SSID = the trailer name) when no
+# known network is in range, and joins a known network (e.g. the hangar) only when
+# its signal clears the gate — see ROTORLINK_STA_JOIN_SIGNAL/STA_DROP_SIGNAL in
+# rotorlink/config-less env (network_manager.py). ARMED fleet-wide. To DISABLE on a
+# specific box: set the line below to 0 (or drop-in), then daemon-reload && restart.
+Environment=ROTORLINK_AP_ENABLED=1
 ExecStart=/usr/bin/python3 -m rotorlink
 Restart=always
 RestartSec=3
