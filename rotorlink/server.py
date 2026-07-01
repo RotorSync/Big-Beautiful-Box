@@ -104,14 +104,34 @@ class RotorLinkServer:
         try:
             # ping keepalive so a hard client drop surfaces as ConnectionClosed
             # (triggering cleanup) instead of lingering as a ghost client.
-            async with websockets.serve(
+            server = await websockets.serve(
                 self._handle,
                 config.WS_HOST,
                 config.WS_PORT,
                 ping_interval=20,
                 ping_timeout=20,
-            ):
+            )
+            try:
                 await asyncio.Future()  # run forever
+            finally:
+                # Shut down FAST. The default teardown waits for every client to
+                # complete the WebSocket close handshake, but after a network
+                # switch (the AP<->STA flip) the client (iPad) is gone and that
+                # wait blocks for tens of seconds — leaving systemd stuck in
+                # "deactivating". Abort the TCP connections immediately so
+                # wait_closed() returns at once; each connection's handler still
+                # runs its finally on the forced close (maintenance shells are
+                # torn down there). Bound the wait anyway as a backstop.
+                server.close()
+                for ws in list(self.clients):
+                    try:
+                        ws.transport.abort()
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(server.wait_closed(), timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
         finally:
             broadcaster.cancel()
 

@@ -24,6 +24,13 @@ Environment=ROTORLINK_AP_ENABLED=1
 ExecStart=/usr/bin/python3 -m rotorlink
 Restart=always
 RestartSec=3
+# Never sit in "deactivating": the app shuts down fast on its own (server.run
+# aborts client connections instead of waiting on a dead client's close
+# handshake), but this is the hard backstop — SIGKILL after 6s so a restart
+# (e.g. the NM re-advertise dispatcher firing after an AP<->STA switch) always
+# completes promptly.
+TimeoutStopSec=6
+KillMode=mixed
 # Tunables (see rotorlink/config.py for the full list):
 # Environment=ROTORLINK_WS_PORT=8765
 # Environment=ROTORLINK_NAME=Trailer 1
