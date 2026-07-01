@@ -1,0 +1,20 @@
+#!/bin/sh
+# NetworkManager dispatcher: restart rotorlink on wlan0 coming up so its mDNS
+# (zeroconf _rotorlink._tcp) re-registers with the current IP. This keeps the
+# box discoverable across the AP<->STA field/hangar switch (wlan0 changes from
+# 10.42.0.1 to 192.168.x and back) — a python-zeroconf registration only
+# re-registers on a NAME change, so it otherwise keeps advertising the stale
+# address. Best-effort.
+#
+# Safe against rotorlink's own network_manager driving the flip: NM emits "up"
+# only after `nmcli con up` has fully activated the new connection, so the flip
+# is complete daemon-side before this restart lands — and network_manager
+# re-derives the live mode from nmcli on startup (no in-process state to lose).
+# Any wlan0 clients were already dropped by the interface transition itself.
+IFACE="$1"
+ACTION="$2"
+[ "$IFACE" = "wlan0" ] || exit 0
+case "$ACTION" in
+  up) systemctl restart rotorlink.service ;;
+esac
+exit 0

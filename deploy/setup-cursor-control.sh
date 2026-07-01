@@ -81,6 +81,15 @@ setup_rotorlink() {
     mkdir -p /etc/rotorlink
     [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk
     cp "$repo/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service || true
+    # mDNS re-advertise on wlan0 up: the AP<->STA flip changes wlan0's IP and a
+    # python-zeroconf registration goes stale (it only re-registers on a NAME
+    # change), so the dispatcher restarts the service on interface-up. Fast and
+    # safe: the unit has TimeoutStopSec=6 + the server aborts client sockets on
+    # stop, and NM only fires "up" after a flip has fully completed.
+    if [ -f "$repo/deploy/90-rotorlink-readvertise" ] && [ -d /etc/NetworkManager/dispatcher.d ]; then
+        install -m 755 -o root -g root "$repo/deploy/90-rotorlink-readvertise" \
+            /etc/NetworkManager/dispatcher.d/90-rotorlink-readvertise || true
+    fi
     systemctl daemon-reload || true
     systemctl enable rotorlink.service >/dev/null 2>&1 || true
     systemctl restart rotorlink.service >/dev/null 2>&1 || true
