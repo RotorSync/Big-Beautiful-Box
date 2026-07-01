@@ -33,6 +33,13 @@ HISTORY_POLL_CYCLES = 20
 
 ARBITRATION = os.environ.get("ROTORLINK_ARBITRATION", "0") in ("1", "true", "yes")
 
+# Cap on a single client's send inside a broadcast. A half-open peer (walked out
+# of range, suspended app) stops ACKing; once its pipe fills, ws.send() awaits
+# drain indefinitely — and the ping keepalive can't reap it, because the ping
+# frame queues behind the same jammed pipe — freezing state updates for every
+# healthy client. On timeout we abort that client's transport instead.
+BROADCAST_SEND_TIMEOUT = float(os.environ.get("ROTORLINK_BROADCAST_SEND_TIMEOUT", "5"))
+
 # Commands that act on equipment (gated by arbitration) vs. side-effect-free.
 _CONTROL_CAP = next(
     c for c in config.capability_manifest() if c["id"] == "trailer.fill.control"
@@ -395,9 +402,29 @@ class RotorLinkServer:
             return
         payload = protocol.encode(message)
         await asyncio.gather(
-            *(self._send_raw(c, payload) for c in list(self.clients.values())),
+            *(self._send_bounded(c, payload) for c in list(self.clients.values())),
             return_exceptions=True,
         )
+
+    async def _send_bounded(self, state: ClientState, payload: str) -> None:
+        """A broadcast send, isolated: one stalled/half-open client must never
+        block the gather (and with it every healthy client's updates). On
+        timeout, abort the offender's transport — that surfaces as a closed
+        connection in its handler, which runs the normal cleanup path."""
+        try:
+            await asyncio.wait_for(state.ws.send(payload), BROADCAST_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "broadcast send to %s stalled >%.0fs; aborting that connection",
+                state.peer, BROADCAST_SEND_TIMEOUT,
+            )
+            try:
+                state.ws.transport.abort()
+            except Exception:
+                pass
+        except Exception:
+            # Drop happens in the connection's own finally; ignore here.
+            pass
 
     # --- send helpers ------------------------------------------------------
     async def _send(self, state: ClientState, message: dict) -> None:
