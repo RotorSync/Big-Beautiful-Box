@@ -1315,7 +1315,12 @@ def set_requested_gallons(value, source):
                 return True, requested_gallons
             return False, "batchmix set failed"
 
-    requested_gallons = max(0.0, target)
+    # Clamp to the same sane upper bound the BLE control path enforces (2140 gal).
+    # Without an upper clamp, a bad/huge value from the socket or serial path sets
+    # an unreachable target and the auto-shutoff (predicted >= requested - threshold)
+    # never fires, so the fill relies entirely on a manual pump-stop.
+    MAX_REQUESTED_GALLONS = 2140.0
+    requested_gallons = min(max(0.0, target), MAX_REQUESTED_GALLONS)
     colors_are_green = False
 
     if current_mode == "fill":
@@ -3410,6 +3415,14 @@ def run_system_update():
             status_text.insert(tk.END, "=== Step 2: Installing update ===\n")
             status_text.update()
 
+            # Remember the currently-running (known-good) commit so we can roll the
+            # working tree back if the incoming code fails to compile — otherwise a
+            # bad push would crash-loop the dashboard with no recovery in the field.
+            old_commit = subprocess.run(
+                ['git', '-C', '/home/pi/Big-Beautiful-Box', 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+
             result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/master'],
                                   capture_output=True, text=True, timeout=30)
             status_text.insert(tk.END, "Updated repository\n")
@@ -3418,6 +3431,32 @@ def run_system_update():
             if result.returncode != 0:
                 status_text.insert(tk.END, "ERROR: Git reset failed!\n")
                 status_text.insert(tk.END, "Press OV to return to menu\n")
+                return
+
+            # Compile-gate the freshly-checked-out code BEFORE deploying/restarting
+            # (mirrors the BLE update path). If it won't even import, roll the tree
+            # back to the last known-good commit and abort WITHOUT restarting, so a
+            # broken push can't brick the box in the field.
+            repo = '/home/pi/Big-Beautiful-Box'
+            compile_main = subprocess.run(
+                ['python3', '-m', 'py_compile', repo + '/dashboard.py', repo + '/rotorsync_bumble.py'],
+                capture_output=True, text=True, timeout=60
+            )
+            compile_src = subprocess.run(
+                ['python3', '-m', 'compileall', '-q', repo + '/src'],
+                capture_output=True, text=True, timeout=60
+            )
+            if compile_main.returncode != 0 or compile_src.returncode != 0:
+                if old_commit:
+                    subprocess.run(['git', '-C', repo, 'reset', '--hard', old_commit],
+                                   capture_output=True, text=True, timeout=30)
+                status_text.insert(tk.END, "ERROR: update failed to compile — rolled back to the running version.\n")
+                status_text.insert(tk.END, "NOT restarting; the box keeps running the previous code.\n")
+                err = (compile_main.stderr or compile_src.stderr or "").strip()
+                if err:
+                    status_text.insert(tk.END, err[:500] + "\n")
+                status_text.insert(tk.END, "Press OV to return to menu\n")
+                status_text.update()
                 return
 
             status_text.insert(tk.END, "Refreshing deployed BBB runtime...\n")
@@ -5537,7 +5576,20 @@ def socket_command_listener():
                 client, addr = sock_server.accept()
                 client.settimeout(5.0)
                 try:
-                    data = client.recv(4096).decode("utf-8").strip()
+                    # Commands are newline-terminated `<cmd>\n` (see
+                    # rotorlink/dashboard_client). Read until the newline rather
+                    # than a single recv(4096): a long payload (e.g. a multi-product
+                    # BATCHMIX:{...}) exceeds 4096 and was truncated into invalid
+                    # JSON and silently dropped, leaving a stale mix target. Decode
+                    # tolerantly so a multibyte char split across a recv boundary
+                    # can't raise UnicodeDecodeError.
+                    raw = b""
+                    while b"\n" not in raw and len(raw) < 65536:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        raw += chunk
+                    data = raw.decode("utf-8", "replace").strip()
                     if data:
                         for line in data.split("\n"):
                             line = line.strip()
