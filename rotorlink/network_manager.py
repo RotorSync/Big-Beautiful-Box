@@ -80,6 +80,10 @@ WS_PORT = int(os.environ.get("ROTORLINK_WS_PORT", "8765"))
 # of hangar-WiFi range. Set STA_JOIN very high (e.g. 101) to effectively pin AP.
 STA_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_JOIN_SIGNAL", "55"))
 STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "40"))
+# A mode switch must be WANTED for this many consecutive evals before we act, so a
+# single transient nmcli read (mid-transition state, a one-off stale scan) can't
+# flap a working link — e.g. tear a healthy hangar STA down to an AP on one blip.
+SWITCH_DEBOUNCE = max(1, int(os.environ.get("ROTORLINK_SWITCH_DEBOUNCE", "2")))
 
 
 def _run(args, timeout=15):
@@ -104,6 +108,8 @@ def _ap_psk() -> str:
 class NetworkManager:
     def __init__(self) -> None:
         self._mode = "unknown"   # "ap" | "sta" | "unknown"
+        self._pending = None     # the mode we're accumulating debounce for
+        self._pending_count = 0  # consecutive evals that wanted self._pending
 
     # --- state queries ----------------------------------------------------
     def _saved_sta_conns(self) -> dict:
@@ -120,7 +126,9 @@ class NetworkManager:
         conns = {}
         for name in names:
             rc, ssid = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", name])
-            ssid = ssid.strip()
+            # Unescape the same way _best_known does, so an SSID with special chars
+            # compares equal on both sides of the `ssid in conns` match.
+            ssid = ssid.replace("\\:", ":").replace("\\\\", "\\").strip()
             if ssid:
                 conns[ssid] = name
         return conns
@@ -152,8 +160,24 @@ class NetworkManager:
         return sum(1 for line in out.splitlines() if (":%d " % WS_PORT) in line or (":%d\t" % WS_PORT) in line)
 
     def _current_mode(self) -> str:
+        """Classify wlan0: "ap" | "sta" | "unknown". Parse the fields properly —
+        the old `"connected" in out.lower()` test also matched "disconnected", so a
+        down interface read as "sta"."""
         rc, out = _run(["nmcli", "-t", "-f", "GENERAL.STATE,GENERAL.CONNECTION", "device", "show", AP_IFACE])
-        return "ap" if AP_CON_NAME in out else ("sta" if "connected" in out.lower() else "unknown")
+        state_code, conn = "", ""
+        for line in out.splitlines():
+            if line.startswith("GENERAL.STATE:"):
+                rest = line.split(":", 1)[1].strip()      # e.g. "100 (connected)"
+                state_code = rest.split()[0] if rest else ""
+            elif line.startswith("GENERAL.CONNECTION:"):
+                conn = line.split(":", 1)[1].strip()       # active connection, or "" / "--"
+        if conn == AP_CON_NAME:
+            return "ap"
+        # NM state 100 == fully connected; anything else (disconnected/unavailable/
+        # connecting/deactivating) is not a settled STA link.
+        if state_code == "100" and conn and conn != "--":
+            return "sta"
+        return "unknown"
 
     # --- AP profile -------------------------------------------------------
     def ensure_ap_profile(self) -> bool:
@@ -237,19 +261,27 @@ class NetworkManager:
                 threshold = STA_DROP_SIGNAL if current == "sta" else STA_JOIN_SIGNAL
                 desired = "sta" if best_sig >= threshold else "ap"
 
-                # a down/disconnected wlan0 reports current=="unknown"; converge
-                # from "unknown" toward desired — exactly the "WiFi dropped, so
-                # start hosting the AP" case the old `current != "unknown"` guard
-                # wrongly refused.
+                # a down/disconnected wlan0 reports current=="unknown"; we converge
+                # from "unknown" toward desired — the "WiFi dropped, so host the AP"
+                # case the old `current != "unknown"` guard wrongly refused. But we
+                # DEBOUNCE: require the same switch to be wanted for SWITCH_DEBOUNCE
+                # consecutive evals, so a single transient read can't flap a link.
                 if desired != current:
+                    self._pending_count = self._pending_count + 1 if self._pending == desired else 1
+                    self._pending = desired
                     if clients > 0:
                         logger.info("want %s (best known %s signal=%s) but %d client(s) connected — deferring (idle-gate)",
                                     desired, best_ssid, best_sig, clients)
-                    else:
+                    elif self._pending_count >= SWITCH_DEBOUNCE:
                         # pass the resolved STA connection name so the sta switch
                         # brings up the right network by name (see _activate).
                         await loop.run_in_executor(None, self._activate, desired, best_conn)
+                        self._pending, self._pending_count = None, 0
+                    else:
+                        logger.info("want %s (current=%s best=%s(%s)) — debouncing %d/%d",
+                                    desired, current, best_sig, best_ssid, self._pending_count, SWITCH_DEBOUNCE)
                 else:
+                    self._pending, self._pending_count = None, 0
                     logger.debug("mode ok: current=%s desired=%s best=%s(%s) clients=%d",
                                  current, desired, best_sig, best_ssid, clients)
             except Exception as e:
