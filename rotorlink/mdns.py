@@ -148,8 +148,26 @@ class MDNSAdvertiser:
                 self._zc.close()
             except Exception:
                 pass
+            self._zc = None
+            self._info = None
         if self._proc is not None and self._proc.returncode is None:
             try:
                 self._proc.terminate()
             except Exception:
                 pass
+            # Reap the child before returning: the maintain() re-advertise path
+            # calls stop() then start(), and if the new avahi-publish-service
+            # races the dying one, avahi still sees the old registration live
+            # and renames the new service ("Name #2"), breaking name-based
+            # discovery. Bounded, with SIGKILL as a backstop.
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                try:
+                    self._proc.kill()
+                    await asyncio.wait_for(self._proc.wait(), timeout=1)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._proc = None
