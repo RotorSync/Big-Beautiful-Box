@@ -38,7 +38,15 @@ ARBITRATION = os.environ.get("ROTORLINK_ARBITRATION", "0") in ("1", "true", "yes
 # drain indefinitely — and the ping keepalive can't reap it, because the ping
 # frame queues behind the same jammed pipe — freezing state updates for every
 # healthy client. On timeout we abort that client's transport instead.
+# Clamp to a sane floor: an env typo of 0 (or negative) would make wait_for
+# time out immediately and abort every client on every broadcast.
 BROADCAST_SEND_TIMEOUT = float(os.environ.get("ROTORLINK_BROADCAST_SEND_TIMEOUT", "5"))
+if BROADCAST_SEND_TIMEOUT <= 0:
+    logger.warning(
+        "ROTORLINK_BROADCAST_SEND_TIMEOUT=%s is not a positive number; using 5s",
+        os.environ.get("ROTORLINK_BROADCAST_SEND_TIMEOUT"),
+    )
+    BROADCAST_SEND_TIMEOUT = 5.0
 
 # Commands that act on equipment (gated by arbitration) vs. side-effect-free.
 _CONTROL_CAP = next(

@@ -80,7 +80,8 @@ setup_rotorlink() {
     [ -f "$repo/systemd/rotorlink.service" ] || return 0
     mkdir -p /etc/rotorlink
     [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk
-    cp "$repo/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service || true
+    cp "$repo/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service \
+        || { echo "setup-cursor-control: WARNING: failed to install rotorlink.service unit" >&2; true; }
     # mDNS re-advertise on wlan0 up: the AP<->STA flip changes wlan0's IP and a
     # python-zeroconf registration goes stale (it only re-registers on a NAME
     # change), so the dispatcher restarts the service on interface-up. Fast and
@@ -88,14 +89,18 @@ setup_rotorlink() {
     # stop, and NM only fires "up" after a flip has fully completed.
     if [ -f "$repo/deploy/90-rotorlink-readvertise" ] && [ -d /etc/NetworkManager/dispatcher.d ]; then
         install -m 755 -o root -g root "$repo/deploy/90-rotorlink-readvertise" \
-            /etc/NetworkManager/dispatcher.d/90-rotorlink-readvertise || true
+            /etc/NetworkManager/dispatcher.d/90-rotorlink-readvertise \
+            || { echo "setup-cursor-control: WARNING: failed to install 90-rotorlink-readvertise dispatcher" >&2; true; }
     fi
     systemctl daemon-reload || true
     systemctl enable rotorlink.service >/dev/null 2>&1 || true
     systemctl restart rotorlink.service >/dev/null 2>&1 || true
     # Deps (websockets/avahi) can need a slow apt; run them DETACHED so they never
     # block the updater's deploy window, then restart rotorlink once they land.
-    local deps='python3 -c "import websockets" >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y python3-websockets >/dev/null 2>&1 || python3 -m pip install --break-system-packages websockets >/dev/null 2>&1 || true; command -v avahi-publish-service >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y avahi-utils >/dev/null 2>&1 || true; systemctl restart rotorlink.service >/dev/null 2>&1 || true'
+    # pip fallback pins websockets==10.4: the fleet runs the legacy websockets
+    # implementation, which 15.x removed — an unpinned install would pull latest
+    # and break the server on any box that hits the pip path.
+    local deps='python3 -c "import websockets" >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y python3-websockets >/dev/null 2>&1 || python3 -m pip install --break-system-packages websockets==10.4 >/dev/null 2>&1 || true; command -v avahi-publish-service >/dev/null 2>&1 || apt-get -o Dpkg::Lock::Timeout=60 install -y avahi-utils >/dev/null 2>&1 || true; systemctl restart rotorlink.service >/dev/null 2>&1 || true'
     if command -v systemd-run >/dev/null 2>&1; then
         systemd-run --unit=bbb-rotorlink-deps --description="RotorLink deps" /bin/bash -c "$deps" >/dev/null 2>&1 || true
     else

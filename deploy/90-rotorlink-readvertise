@@ -14,7 +14,13 @@
 IFACE="$1"
 ACTION="$2"
 [ "$IFACE" = "wlan0" ] || exit 0
+# --no-block: a plain (blocking) restart holds NetworkManager's sequential
+# dispatcher queue for the full stop+start, and during early boot can queue
+# behind a pending network-online.target start job — stalling ALL dispatcher
+# processing for 30-60s. Detach instead; systemd serializes the restart itself.
+# try-restart: only restart if the service is running, so this never resurrects
+# a deliberately-stopped rotorlink.
 case "$ACTION" in
-  up) systemctl restart rotorlink.service ;;
+  up) systemctl --no-block try-restart rotorlink.service ;;
 esac
 exit 0
