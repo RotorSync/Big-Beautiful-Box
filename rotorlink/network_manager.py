@@ -73,6 +73,27 @@ EVAL_INTERVAL = float(os.environ.get("ROTORLINK_AP_EVAL_INTERVAL", "20"))
 # The RotorLink WS port — used to count connected clients (idle gate) without
 # coupling to the server module.
 WS_PORT = int(os.environ.get("ROTORLINK_WS_PORT", "8765"))
+# NetworkManager's shared-mode dnsmasq reads extra config from this drop-in dir
+# (NM spawns it with --conf-dir=/etc/NetworkManager/dnsmasq-shared.d; confirmed
+# on the fleet's NM 1.52). The drop-in below makes the AP LOCAL-ONLY.
+DNSMASQ_SHARED_DROPIN = os.environ.get(
+    "ROTORLINK_AP_DNSMASQ_DROPIN",
+    "/etc/NetworkManager/dnsmasq-shared.d/rotorlink-local-only.conf",
+)
+DNSMASQ_SHARED_DROPIN_CONTENT = """\
+# RotorLink AP is a LOCAL-ONLY link (iPad <-> this box). The box has no
+# internet to offer, so do NOT advertise a default route (option 3) or a DNS
+# server (option 6) via DHCP: NetworkManager shared mode defaults to handing
+# out router+dns=10.42.0.1, so a joined client installs a default route into
+# the box and routes/blackholes its internet traffic there (field reports of
+# iPads losing internet on the trailer AP). mDNS + the :8765 WS are
+# same-subnet and need neither. port=0 disables dnsmasq's DNS listener
+# (DHCP-only). Written/enforced by rotorlink/network_manager.py
+# (ensure_ap_profile) — edits here are overwritten.
+dhcp-option=3
+dhcp-option=6
+port=0
+"""
 # Link-quality gate for joining a known station network (nmcli SIGNAL, 0-100).
 # Only LEAVE the AP to join a known network when its signal clears STA_JOIN; once
 # on STA, STAY until it falls below the lower STA_DROP (or disappears). The gap
@@ -190,7 +211,12 @@ class NetworkManager:
         a stale profile keeps broadcasting the OLD SSID forever, so the app joins
         a network name that no longer exists and field WiFi silently never links
         (seen live on sn009: profile ssid 'trailersync-sn009' vs current
-        'TrailerSync-Uncfg-sn009')."""
+        'TrailerSync-Uncfg-sn009').
+
+        Also enforces the local-only dnsmasq drop-in (same create-once-but-
+        re-sync-existing pattern), so boxes whose profile predates it get it
+        on upgrade."""
+        self._ensure_local_only_dnsmasq()
         rc, out = _run(["nmcli", "-t", "-f", "NAME", "con", "show"])
         if any(line == AP_CON_NAME for line in out.splitlines()):
             rc, ssid = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", AP_CON_NAME])
@@ -223,6 +249,36 @@ class NetworkManager:
             return True
         logger.error("failed to create AP profile: %s", out.strip()[:200])
         return False
+
+    def _ensure_local_only_dnsmasq(self) -> None:
+        """Make the AP LOCAL-ONLY: keep a dnsmasq drop-in in NetworkManager's
+        shared-mode conf-dir so the AP's DHCP stops advertising a default
+        route (option 3) and a DNS server (option 6), and dnsmasq serves DHCP
+        only (port=0). Without it, shared mode tells every client the box is
+        its internet gateway+DNS — a joined iPad then routes/blackholes its
+        internet traffic into the AP. Fail-soft (like the SSID re-sync): the
+        AP still works without the drop-in, just with the old routed
+        behavior. Takes effect when NM (re)spawns dnsmasq, i.e. on the next
+        AP activation — ensure_ap_profile runs before every AP bring-up."""
+        try:
+            try:
+                with open(DNSMASQ_SHARED_DROPIN) as f:
+                    if f.read() == DNSMASQ_SHARED_DROPIN_CONTENT:
+                        return
+            except FileNotFoundError:
+                pass
+            os.makedirs(os.path.dirname(DNSMASQ_SHARED_DROPIN), exist_ok=True)
+            tmp = DNSMASQ_SHARED_DROPIN + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(DNSMASQ_SHARED_DROPIN_CONTENT)
+            os.replace(tmp, DNSMASQ_SHARED_DROPIN)
+            logger.info("wrote local-only AP dnsmasq drop-in %s "
+                        "(applies when dnsmasq respawns on next AP activation)",
+                        DNSMASQ_SHARED_DROPIN)
+        except Exception as e:
+            logger.warning("could not write local-only AP dnsmasq drop-in %s: %s "
+                           "(AP DHCP will keep advertising the box as default "
+                           "route/DNS)", DNSMASQ_SHARED_DROPIN, e)
 
     # --- switching --------------------------------------------------------
     def _activate(self, target: str, sta_conn: str = None) -> None:
