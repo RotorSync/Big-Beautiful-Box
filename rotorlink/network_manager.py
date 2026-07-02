@@ -182,9 +182,29 @@ class NetworkManager:
     # --- AP profile -------------------------------------------------------
     def ensure_ap_profile(self) -> bool:
         """Create the AP NetworkManager connection if absent (autoconnect off, so
-        creating it changes nothing live). Returns True if present/created."""
+        creating it changes nothing live). Returns True if present/created.
+
+        An EXISTING profile's SSID is re-synced to the current AP_SSID: the
+        profile is created once, but the trailer's name (== the AP SSID, and the
+        name the app's field-AP auto-join targets) changes on assignment/rename —
+        a stale profile keeps broadcasting the OLD SSID forever, so the app joins
+        a network name that no longer exists and field WiFi silently never links
+        (seen live on sn009: profile ssid 'trailersync-sn009' vs current
+        'TrailerSync-Uncfg-sn009')."""
         rc, out = _run(["nmcli", "-t", "-f", "NAME", "con", "show"])
         if any(line == AP_CON_NAME for line in out.splitlines()):
+            rc, ssid = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", AP_CON_NAME])
+            ssid = ssid.replace("\\:", ":").replace("\\\\", "\\").strip()
+            if rc == 0 and ssid and ssid != AP_SSID:
+                rc, out = _run(["nmcli", "con", "modify", AP_CON_NAME,
+                                "802-11-wireless.ssid", AP_SSID])
+                if rc == 0:
+                    logger.info("AP profile SSID re-synced: %r -> %r (applies on next AP up)",
+                                ssid, AP_SSID)
+                else:
+                    # Keep the stale-SSID AP rather than no AP at all.
+                    logger.warning("AP profile SSID re-sync failed (%s); keeping ssid=%r",
+                                   out.strip()[:120], ssid)
             return True
         psk = _ap_psk()
         if not (8 <= len(psk) <= 63):
