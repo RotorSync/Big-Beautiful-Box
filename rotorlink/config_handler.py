@@ -9,7 +9,9 @@ WHOLE response JSON in one WebSocket message. We do NOT replicate the BLE CHUNK
 framing or the zlib+base64 compression envelope. We DO keep SEMANTIC pagination
 (page / total_pages / total_items / items / has_more) because the app requests
 pages — but every list fits in a single message, and PAGE just re-serves a page
-from the cached page set for a prior request.
+from the cached page set for a prior request (by cursor_request_id, or falling
+back to the connection's most recent page set when no cursor is supplied, same
+as bumble's _cmd_page falling back to config_response_pages).
 
 Each method returns a plain dict = the same ConfigResponse / PaginatedResponse
 JSON shape the app's parseConfigData / parseConfigResponseData already decodes.
@@ -607,6 +609,15 @@ class ConfigHandler:
         # re-serve a page from a prior list request (mirrors bumble's
         # config_response_pages_by_request). Bounded to avoid unbounded growth.
         self._pages_by_request = {}
+        # Most recent page set produced by ANY paginated command on this
+        # connection — the fallback for cursor-less PAGE requests (app builds
+        # <=81 never send cursor_request_id). Mirrors bumble's
+        # config_response_pages, which is swapped to a per-connection buffer in
+        # process_config_command_for_connection; rotorlink has one handler per
+        # connection, so a per-handler attribute is the same scope. Like
+        # bumble, every non-PAGE command clears it and every paginated list
+        # command sets it.
+        self._last_pages = []
 
     def _store_pages(self, request_id, pages):
         if request_id:
@@ -624,6 +635,7 @@ class ConfigHandler:
             if request_id is not None:
                 p["request_id"] = request_id
         self._store_pages(request_id, pages)
+        self._last_pages = pages
         idx = max(1, min(page, len(pages))) - 1
         envelope = dict(pages[idx])
         envelope["has_more"] = (idx + 1) < len(pages)
@@ -639,6 +651,11 @@ class ConfigHandler:
             return {"ok": False, "error": "command must be a JSON object"}
         op = cmd.get("op", "")
         request_id = cmd.get("request_id")
+        # bumble parity: every command except PAGE resets the connection's
+        # last page set (paginated list handlers then repopulate it via
+        # _paginated). PAGE only reads it.
+        if op != "PAGE":
+            self._last_pages = []
         logger.info("config command: %s", op)
         try:
             return await self._dispatch(op, cmd, request_id)
@@ -963,10 +980,13 @@ class ConfigHandler:
     def _page(self, cmd, request_id):
         page = cmd.get("page", 1)
         cursor_request_id = cmd.get("cursor_request_id")
+        # bumble parity (_cmd_page): with a cursor, serve from that request's
+        # cached set; cursor-less (app builds <=81), fall back to the last
+        # page set produced on this connection.
         pages = (
             self._pages_by_request.get(cursor_request_id)
             if cursor_request_id
-            else None
+            else self._last_pages
         )
         if not pages:
             return {"ok": False, "op": "PAGE", "request_id": request_id, "error": "No paginated data available"}
