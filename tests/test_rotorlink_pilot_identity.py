@@ -116,3 +116,28 @@ def test_pilot_name_sanitized_for_line_protocol():
     server = _server_with_clients(_client("pilot", "Co|dy\nX"))
     asyncio.run(server._push_pilot_status())
     assert server.dashboard.commands == ["WIFI_PILOT_CONNECTED:Co/dy X"]
+
+
+def test_pilot_loc_update_forwarded_to_dashboard():
+    pilot = _client("pilot", "Cody")
+    server = _server_with_clients(pilot)
+    asyncio.run(server._apply_loc(pilot, {"lat": 41.1234567, "lon": -95.65, "acc": 9.34}))
+    assert server.dashboard.commands == ["WIFI_PILOT_LOC:41.123457,-95.65,9.3"]
+    assert pilot.loc["lat"] == 41.123457
+
+
+def test_non_pilot_loc_stored_but_not_forwarded():
+    crew = _client("controller", "Ground Crew iPad")
+    server = _server_with_clients(crew)
+    asyncio.run(server._apply_loc(crew, {"lat": 1.0, "lon": 2.0}))
+    assert server.dashboard.commands == []
+    assert crew.loc == {"lat": 1.0, "lon": 2.0, "ts": crew.loc["ts"]}
+
+
+def test_malformed_loc_ignored():
+    pilot = _client("pilot", "Cody")
+    server = _server_with_clients(pilot)
+    asyncio.run(server._apply_loc(pilot, {"lat": "n/a", "lon": None}))
+    asyncio.run(server._apply_loc(pilot, "41,-95"))
+    assert pilot.loc is None
+    assert server.dashboard.commands == []

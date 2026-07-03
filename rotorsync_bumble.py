@@ -41,6 +41,8 @@ from bumble.core import UUID, AdvertisingData
 from src.mopeka_converter import mm_to_gallons, init as mopeka_init, reload as mopeka_reload
 from src.bluetooth_adapter_selection import list_bluetooth_adapters, select_adapters
 from src.batchmix_payload import batchmix_validation_error
+from src import connection_registry
+from src.fill_history import item_from_line as _shared_fill_item_from_line
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -561,6 +563,12 @@ def _record_client_hello(connection, command):
         'connected_at': float(previous.get('connected_at') or now),
     }
     persist_gatt_connection_state('client_hello')
+    connection_registry.record_event(
+        'hello', 'ble', peer=connection_key, role=role,
+        name=command.get('name'), user_id=command.get('user_id'),
+        device=command.get('device'),
+    )
+    _record_client_loc(connection, command.get('loc'))
     # If this hello carries a wall-clock time and our box clock isn't
     # NTP-synchronized, use it to set the box clock (see _maybe_apply_hello_time).
     try:
@@ -574,6 +582,35 @@ def _record_client_hello(connection, command):
     )
     query_dashboard_status()
     push_pilot_status_to_dashboard()
+
+
+def _record_client_loc(connection, value):
+    """Store a client's location update ({lat, lon[, acc]} — nested hello `loc`
+    or a flat loc_update command); a pilot's location is forwarded to the
+    dashboard (PILOT_LOC) so it can be stamped onto loads at fill time."""
+    if not isinstance(value, dict):
+        return
+    try:
+        lat = round(float(value.get('lat')), 6)
+        lon = round(float(value.get('lon')), 6)
+    except (TypeError, ValueError):
+        return
+    loc = {'lat': lat, 'lon': lon, 'ts': time.time()}
+    try:
+        if value.get('acc') is not None:
+            loc['acc'] = round(float(value['acc']), 1)
+    except (TypeError, ValueError):
+        pass
+    connection_key = _connection_key(connection)
+    metadata = gatt_client_metadata_by_connection.get(connection_key)
+    if metadata is None:
+        return
+    metadata['loc'] = loc
+    if _normalize_client_role(metadata.get('role')) == 'pilot':
+        parts = f"{lat},{lon}"
+        if 'acc' in loc:
+            parts += f",{loc['acc']}"
+        send_dashboard_command(f'PILOT_LOC:{parts}')
 
 
 _last_pushed_pilot_name = None
@@ -1151,6 +1188,7 @@ def persist_gatt_connection_state(reason=''):
     """Record active GATT connection count for watchdog decisions."""
     try:
         client_details = []
+        registry_clients = []
         for peer in sorted(str(peer) for peer in active_gatt_connections):
             metadata = gatt_client_metadata_by_connection.get(peer) or {}
             client_details.append({
@@ -1159,6 +1197,17 @@ def persist_gatt_connection_state(reason=''):
                 'connected_at': float(metadata.get('connected_at') or 0),
                 'last_seen': float(metadata.get('last_seen') or 0),
             })
+            entry = {
+                'transport': 'ble',
+                'peer': peer,
+                'role': _normalize_client_role(metadata.get('role')),
+                'name': metadata.get('name') or None,
+                'user_id': metadata.get('user_id') or None,
+                'device': metadata.get('device') or None,
+                'connected_at': float(metadata.get('connected_at') or 0),
+                'hello_at': float(metadata.get('last_seen') or 0) or None,
+            }
+            registry_clients.append({k: v for k, v in entry.items() if v is not None})
         payload = {
             'timestamp': time.time(),
             'pid': os.getpid(),
@@ -1171,6 +1220,9 @@ def persist_gatt_connection_state(reason=''):
             GATT_CONNECTION_STATE_FILE,
             json.dumps(payload, separators=(',', ':')) + '\n',
         )
+        # Same live view, in the cross-server registry the app relays upstream
+        # (see src/connection_registry.py; rotorlink writes the 'wifi' half).
+        connection_registry.write_snapshot('ble', registry_clients)
     except Exception as e:
         print(f'Failed to persist GATT connection state: {e}', flush=True)
 
@@ -1679,12 +1731,13 @@ def install_gatt_advertising_resume_hook(
     def on_disconnection(peer):
         mark_gatt_controller_changed()
         current_count = active_gatt_connection_counts.get(peer, 0)
+        departed_metadata = {}
         if current_count > 1:
             active_gatt_connection_counts[peer] = current_count - 1
         else:
             active_gatt_connection_counts.pop(peer, None)
             active_gatt_connections.discard(peer)
-            gatt_client_metadata_by_connection.pop(peer, None)
+            departed_metadata = gatt_client_metadata_by_connection.pop(peer, None) or {}
 
         print(
             f'GATT client disconnected from {peer}; '
@@ -1692,6 +1745,13 @@ def install_gatt_advertising_resume_hook(
             flush=True,
         )
         persist_gatt_connection_state('disconnect')
+        connection_registry.record_event(
+            'disconnect', 'ble', peer=peer,
+            role=departed_metadata.get('role'),
+            name=departed_metadata.get('name'),
+            user_id=departed_metadata.get('user_id'),
+            device=departed_metadata.get('device'),
+        )
         push_pilot_status_to_dashboard()
         if active_gatt_connections:
             print(
@@ -1742,6 +1802,7 @@ def install_gatt_advertising_resume_hook(
             flush=True,
         )
         persist_gatt_connection_state('connect')
+        connection_registry.record_event('connect', 'ble', peer=peer)
         hello_deadline_task = asyncio.create_task(
             disconnect_unknown_gatt_client_if_no_hello(connection, peer, now)
         )
@@ -3252,6 +3313,10 @@ def command_write_handler(connection, value):
         _record_client_hello(connection, cmd)
         return
 
+    if command in ('loc_update', 'loc'):
+        _record_client_loc(connection, cmd)
+        return
+
     if command == 'pump_stop':
         _enqueue_control_actions(connection, 'command:pump_stop', 'PS')
         return
@@ -3266,6 +3331,10 @@ def command_write_handler(connection, value):
 
     if command in ('ov', 'override_press', 'switch_ov'):
         _enqueue_control_actions(connection, 'command:ov', 'OV')
+        return
+
+    if command in ('update_box', 'run_update'):
+        _enqueue_control_actions(connection, 'command:update_box', 'RUN_UPDATE', refresh=False)
         return
 
     if command in ('reboot_box', 'restart_box', 'reboot_system'):
@@ -4192,6 +4261,12 @@ def process_config_command(cmd_str):
             _cmd_get_mopeka_history(cmd, request_id=request_id)
         elif op == 'GET_FILL_HISTORY':
             _cmd_get_fill_history(cmd, request_id=request_id)
+        elif op == 'GET_CONNECTIONS':
+            _cmd_get_connections(request_id=request_id)
+        elif op == 'GET_BOX_HEALTH':
+            _cmd_get_box_health(request_id=request_id)
+        elif op == 'GET_CONNECTION_LOG':
+            _cmd_get_connection_log(cmd, request_id=request_id)
         elif op == 'PAGE':
             _cmd_page(cmd, request_id=request_id)
         else:
@@ -5016,40 +5091,9 @@ def _parse_float_token(value):
 
 
 def _fill_history_item_from_line(line):
-    parts = line.strip().split('|')
-    if len(parts) < 3:
-        return None
-
-    timestamp = _history_timestamp_epoch(parts[0].strip())
-    if timestamp is None:
-        return None
-
-    requested = _parse_float_token(_history_named_field(parts, 'Requested'))
-    actual = _parse_float_token(_history_named_field(parts, 'Actual'))
-    if requested is None or actual is None:
-        return None
-
-    shutoff_type = ''
-    for part in parts[3:]:
-        text = part.strip()
-        if text.lower().startswith(('auto', 'manual')):
-            shutoff_type = text
-            break
-
-    return {
-        't': timestamp,
-        'rq': requested,
-        'ag': actual,
-        'df': round(actual - requested, 3),
-        'st': shutoff_type,
-        'tf': _parse_float_token(_history_named_field(parts, 'Temp')),
-        's2t': _parse_float_token(_history_named_field(parts, 'StopToThumb')),
-        # Flow window epochs (None when the box didn't record them — the app
-        # flags such records loudly). _history_timestamp_epoch('') returns None.
-        'fs': _history_timestamp_epoch(_history_named_field(parts, 'FlowStart')),
-        'fe': _history_timestamp_epoch(_history_named_field(parts, 'FlowEnd')),
-        'pl': _history_named_field(parts, 'Pilot').strip() or None,
-    }
+    # One shared parser with the WiFi server (src/fill_history.py) — the two
+    # copies drifted once and loads fetched over WiFi lost pilot attribution.
+    return _shared_fill_item_from_line(line)
 
 
 def _prune_fill_history_file(now):
@@ -5235,6 +5279,50 @@ def _cmd_get_fill_history(cmd, *, request_id=None):
         items,
         request_id=request_id,
         op='GET_FILL_HISTORY',
+        page_size_bytes=450,
+    )
+
+
+def _cmd_get_connections(*, request_id=None):
+    global config_response_pages
+    config_response_pages = []
+    payload = {
+        'ok': True,
+        'op': 'GET_CONNECTIONS',
+        'connections': connection_registry.read_connections(),
+    }
+    if request_id is not None:
+        payload['request_id'] = request_id
+    _set_config_response_obj(payload)
+
+
+def _cmd_get_box_health(*, request_id=None):
+    global config_response_pages
+    config_response_pages = []
+    payload = {
+        'ok': True,
+        'op': 'GET_BOX_HEALTH',
+        'health': connection_registry.box_health(),
+    }
+    if request_id is not None:
+        payload['request_id'] = request_id
+    _set_config_response_obj(payload)
+
+
+def _cmd_get_connection_log(cmd, *, request_id=None):
+    try:
+        since = float(cmd.get('since', 0))
+    except (TypeError, ValueError):
+        since = 0.0
+    try:
+        limit = max(1, min(int(cmd.get('limit', 500)), 500))
+    except (TypeError, ValueError):
+        limit = 500
+    items = connection_registry.read_log_since(since, limit=limit)
+    _set_paginated_config_response(
+        items,
+        request_id=request_id,
+        op='GET_CONNECTION_LOG',
         page_size_bytes=450,
     )
 

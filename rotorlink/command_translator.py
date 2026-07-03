@@ -76,6 +76,8 @@ def translate(cmd: dict) -> Optional[str]:
         return "RESET"
     if command in ("ov", "override_press", "switch_ov"):
         return "OV"
+    if command in ("update_box", "run_update"):
+        return "RUN_UPDATE"
     if command in ("reboot_box", "restart_box", "reboot_system"):
         return "REBOOT"
     if command in ("shutdown_box", "poweroff_box", "shutdown_system"):

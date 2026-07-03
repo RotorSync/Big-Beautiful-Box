@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 
 from . import config
+from src import connection_registry
+from src.fill_history import item_from_line as _shared_fill_item_from_line
 
 logger = logging.getLogger("rotorlink.config")
 
@@ -459,37 +461,9 @@ def _parse_float_token(value):
 
 
 def _fill_history_item_from_line(line):
-    parts = line.strip().split("|")
-    if len(parts) < 3:
-        return None
-    timestamp = _history_timestamp_epoch(parts[0].strip())
-    if timestamp is None:
-        return None
-    requested = _parse_float_token(_history_named_field(parts, "Requested"))
-    actual = _parse_float_token(_history_named_field(parts, "Actual"))
-    if requested is None or actual is None:
-        return None
-    shutoff_type = ""
-    for part in parts[3:]:
-        text = part.strip()
-        if text.lower().startswith(("auto", "manual")):
-            shutoff_type = text
-            break
-    return {
-        "t": timestamp,
-        "rq": requested,
-        "ag": actual,
-        "df": round(actual - requested, 3),
-        "st": shutoff_type,
-        "tf": _parse_float_token(_history_named_field(parts, "Temp")),
-        "s2t": _parse_float_token(_history_named_field(parts, "StopToThumb")),
-        # Flow window epochs (None when the box didn't record them — the app
-        # flags such records loudly). Same fields as rotorsync_bumble's parser:
-        # loads fetched over WiFi must not lose pilot/flow attribution.
-        "fs": _history_timestamp_epoch(_history_named_field(parts, "FlowStart")),
-        "fe": _history_timestamp_epoch(_history_named_field(parts, "FlowEnd")),
-        "pl": _history_named_field(parts, "Pilot").strip() or None,
-    }
+    # One shared parser with the BLE server (src/fill_history.py) — the two
+    # copies drifted once and loads fetched over WiFi lost pilot attribution.
+    return _shared_fill_item_from_line(line)
 
 
 def _history_newest_first_requested(cmd):
@@ -704,6 +678,12 @@ class ConfigHandler:
             return self._get_mopeka_history(cmd, request_id)
         if op == "GET_FILL_HISTORY":
             return self._get_fill_history(cmd, request_id)
+        if op == "GET_CONNECTIONS":
+            return self._get_connections(request_id)
+        if op == "GET_BOX_HEALTH":
+            return self._get_box_health(request_id)
+        if op == "GET_CONNECTION_LOG":
+            return self._get_connection_log(cmd, request_id)
         if op == "PAGE":
             return self._page(cmd, request_id)
         # Unknown op — same body bumble returns. (Note: CONFIG_META is NOT
@@ -979,6 +959,41 @@ class ConfigHandler:
             op="GET_FILL_HISTORY",
             request_id=request_id,
             page_size_bytes=450,
+            page=cmd.get("page", 1),
+        )
+
+    # --- connections / health (src/connection_registry.py) -----------------
+    def _get_connections(self, request_id):
+        return {
+            "ok": True,
+            "op": "GET_CONNECTIONS",
+            "request_id": request_id,
+            "connections": connection_registry.read_connections(),
+        }
+
+    def _get_box_health(self, request_id):
+        return {
+            "ok": True,
+            "op": "GET_BOX_HEALTH",
+            "request_id": request_id,
+            "health": connection_registry.box_health(),
+        }
+
+    def _get_connection_log(self, cmd, request_id):
+        try:
+            since = float(cmd.get("since", 0))
+        except (TypeError, ValueError):
+            since = 0.0
+        try:
+            limit = max(1, min(int(cmd.get("limit", 500)), 500))
+        except (TypeError, ValueError):
+            limit = 500
+        items = connection_registry.read_log_since(since, limit=limit)
+        return self._paginated(
+            items,
+            op="GET_CONNECTION_LOG",
+            request_id=request_id,
+            page_size_bytes=2048,
             page=cmd.get("page", 1),
         )
 
