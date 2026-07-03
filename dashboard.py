@@ -5857,6 +5857,21 @@ def socket_command_listener():
                             elif line == "FILL":
                                 root.after(0, lambda: switch_mode("fill"))
 
+                            elif line == "RUN_UPDATE":
+                                msg = "Socket: Software update command received"
+                                print(msg)
+                                with open(debug_log, "a") as f:
+                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                if update_mode:
+                                    client.send(b"UPDATE_ALREADY_RUNNING\n")
+                                else:
+                                    # Same entry point as the box menu's SYSTEM
+                                    # UPDATE — fullscreen progress on the box
+                                    # screen, services restart at the end.
+                                    root.after(0, run_system_update)
+                                    client.send(b"UPDATE_STARTED\n")
+                                continue
+
                             elif line == "REBOOT":
                                 msg = "Socket: Reboot command received"
                                 print(msg)

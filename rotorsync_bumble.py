@@ -3333,6 +3333,10 @@ def command_write_handler(connection, value):
         _enqueue_control_actions(connection, 'command:ov', 'OV')
         return
 
+    if command in ('update_box', 'run_update'):
+        _enqueue_control_actions(connection, 'command:update_box', 'RUN_UPDATE', refresh=False)
+        return
+
     if command in ('reboot_box', 'restart_box', 'reboot_system'):
         _enqueue_control_actions(connection, 'command:reboot_box', 'REBOOT', refresh=False)
         return
