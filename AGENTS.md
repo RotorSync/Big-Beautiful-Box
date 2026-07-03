@@ -26,7 +26,19 @@ close the gap (see the self-heal patterns below) or document exactly why not.
    the new deploy step — it has to already be in the deploy step of the version
    the box is coming *from*, or be idempotent/self-healing on the next cycle.
 
-2. **Stale git origin → "Already up to date" forever.** Many field boxes have
+2. **Git-current but `/opt`-stale (cloned / hand-pulled boxes).** The updater
+   judged "up to date" from git commit count alone and **skipped the deploy** —
+   so a box whose git tree was advanced out-of-band (SD-card clone, a manual
+   `git pull`, or a half-finished update) reported current forever while its
+   RUNNING code in `/opt` stayed old. `rotorsync_bumble.py` + `src/` run from
+   `/opt` (the dashboard/updater run from the repo), so this surfaced as old BLE
+   code with a hard-pinned adapter MAC on a cloned box. The updater now
+   drift-checks `/opt` vs the repo and **re-deploys even when git is current**
+   (`_deployed_runtime_stale` in `run_update`) — a stale box self-heals on its
+   next update. Prefer a clean `install.sh` over cloning; if you must clone, run
+   a full update/deploy after (never just `git pull`).
+
+3. **Stale git origin → "Already up to date" forever.** Many field boxes have
    `origin` pointing at a stale LOCAL mirror (e.g. `/home/pi/Big-Beautiful-box`),
    not GitHub, so `git fetch` never advances and the updater silently no-ops.
    Fix: `git -C /home/pi/Big-Beautiful-Box remote set-url origin
@@ -36,7 +48,7 @@ close the gap (see the self-heal patterns below) or document exactly why not.
    won't advance after a crew "updates." **Remote fix without a site visit:** the
    admin maintenance shell (see below) — one command, no SSH.
 
-3. **Bumble-as-root BLE crash-loop (latent, surfaces on restart/reboot).**
+4. **Bumble-as-root BLE crash-loop (latent, surfaces on restart/reboot).**
    `rotorsync.service` runs as ROOT for HCI access; if `bumble` is only in pi's
    `~/.local`, root can't import it → `No module named bumble` crash-loop that is
    **invisible until the next service restart/reboot** (which an update performs).
@@ -46,13 +58,13 @@ close the gap (see the self-heal patterns below) or document exactly why not.
    from *pre-system-install* firmware runs its OLD deploy (no system bumble) then
    restarts → can crash-loop until that same update finishes installing it.
 
-4. **`websockets` library version variance.** The fleet historically ran
+5. **`websockets` library version variance.** The fleet historically ran
    `websockets==10.4` (legacy asyncio impl). `>=14` removed that impl; the code
    works on both, but **pin `websockets==10.4` in any pip fallback** so a box
    doesn't silently jump to an incompatible API. Some boxes now run 15/16 — test
    changes against both the legacy and new impl if you touch the WS server.
 
-5. **The deploy_cmd is one giant `sudo bash -lc "<string>"`.** It's assembled by
+6. **The deploy_cmd is one giant `sudo bash -lc "<string>"`.** It's assembled by
    string-concatenation in `dashboard.py` (`run_update`). Heredocs work inside it
    (there are `python3 - <<'PY'` blocks) but quoting is fragile — a stray quote
    breaks the whole deploy. When you add a step: mirror an existing block's
@@ -60,7 +72,7 @@ close the gap (see the self-heal patterns below) or document exactly why not.
    the update and half-provision a box, and **verify it composes on a real box**
    (run the block via `sudo bash -lc` on sn009) before shipping.
 
-6. **Maintenance secret is FIRST-WINS-FOREVER.** A box persists the first admin
+7. **Maintenance secret is FIRST-WINS-FOREVER.** A box persists the first admin
    maintenance key it ever adopts (`_install_maintenance_secret` refuses to
    overwrite) and then can only verify frames signed with THAT key — so a box
    that adopted a wrong/retired key is locked out of the maintenance shell with

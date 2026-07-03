@@ -3355,6 +3355,39 @@ def run_system_update():
 
     def run_update():
         import subprocess
+
+        def _deployed_runtime_stale():
+            # True when the RUNNING code in /opt has drifted from the repo — e.g.
+            # the git tree was advanced (SD-card clone, or a manual `git pull`)
+            # without the deploy step ever copying repo -> /opt. "Up to date" is
+            # judged from git commits alone, so such a box would otherwise report
+            # current forever and never repair its stale runtime (this is exactly
+            # how a cloned box ran old BLE code with a hard-pinned adapter MAC).
+            repo = '/home/pi/Big-Beautiful-Box'
+
+            def _same(a, b):
+                try:
+                    with open(a, 'rb') as fa, open(b, 'rb') as fb:
+                        return fa.read() == fb.read()
+                except OSError:
+                    return False
+
+            for name in ('rotorsync_bumble.py', 'rotorsync_watchdog.py'):
+                src = os.path.join(repo, name)
+                if os.path.exists(src) and not _same(src, os.path.join('/opt', name)):
+                    return True
+            src_dir = os.path.join(repo, 'src')
+            if os.path.isdir(src_dir):
+                for root, _dirs, files in os.walk(src_dir):
+                    for fn in files:
+                        if not fn.endswith('.py'):
+                            continue
+                        s = os.path.join(root, fn)
+                        rel = os.path.relpath(s, src_dir)
+                        if not _same(s, os.path.join('/opt/src', rel)):
+                            return True
+            return False
+
         status_text.insert(tk.END, "Starting BBB software update from GitHub...\n\n")
         status_text.update()
 
@@ -3392,27 +3425,31 @@ def run_system_update():
                 capture_output=True, text=True, timeout=10
             )
             updates_available = int(result.stdout.strip() or "0")
+            # Self-heal a stale runtime even when git is already current — a
+            # cloned/hand-pulled box can be "up to date" on commits yet still run
+            # old code in /opt because the deploy step never ran.
+            runtime_stale = _deployed_runtime_stale()
 
             # Get the version we're updating to
             result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'log', 'origin/master', '-1', '--format=%s'],
                                   capture_output=True, text=True, timeout=10)
             new_version_msg = result.stdout.strip()
             new_version = _read_git_ref_version('origin/master') or "(version file missing)"
-            if updates_available == 0:
+            if updates_available == 0 and not runtime_stale:
                 status_text.insert(tk.END, "\nAlready up to date.\n")
                 status_text.insert(tk.END, f"Latest Version: {new_version}\n")
                 status_text.insert(tk.END, f"Latest commit:\n{new_version_msg}\n\n")
                 status_text.insert(tk.END, "Press OV to return to menu\n")
                 status_text.update()
                 return
+            if updates_available == 0 and runtime_stale:
+                status_text.insert(tk.END, "\nSoftware is current, but the deployed runtime is stale.\n")
+                status_text.insert(tk.END, "Repairing the running code (re-deploying to /opt)...\n\n")
+                status_text.update()
 
             status_text.insert(tk.END, f"\nNew Version Available: {new_version}\n")
             status_text.insert(tk.END, f"Commit:\n{new_version_msg}\n")
             status_text.insert(tk.END, f"Commits to apply: {updates_available}\n\n")
-            status_text.update()
-
-            # Step 2: Reset to latest origin/master
-            status_text.insert(tk.END, "=== Step 2: Installing update ===\n")
             status_text.update()
 
             # Remember the currently-running (known-good) commit so we can roll the
@@ -3423,15 +3460,23 @@ def run_system_update():
                 capture_output=True, text=True, timeout=10
             ).stdout.strip()
 
-            result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/master'],
-                                  capture_output=True, text=True, timeout=30)
-            status_text.insert(tk.END, "Updated repository\n")
-            status_text.update()
+            # Only touch the git tree when there are real commits to apply. In the
+            # runtime-repair path (git already current, /opt stale) the tree is
+            # correct — skip the reset and go straight to compile-gate + deploy.
+            if updates_available > 0:
+                # Step 2: Reset to latest origin/master
+                status_text.insert(tk.END, "=== Step 2: Installing update ===\n")
+                status_text.update()
 
-            if result.returncode != 0:
-                status_text.insert(tk.END, "ERROR: Git reset failed!\n")
-                status_text.insert(tk.END, "Press OV to return to menu\n")
-                return
+                result = subprocess.run(['git', '-C', '/home/pi/Big-Beautiful-Box', 'reset', '--hard', 'origin/master'],
+                                      capture_output=True, text=True, timeout=30)
+                status_text.insert(tk.END, "Updated repository\n")
+                status_text.update()
+
+                if result.returncode != 0:
+                    status_text.insert(tk.END, "ERROR: Git reset failed!\n")
+                    status_text.insert(tk.END, "Press OV to return to menu\n")
+                    return
 
             # Compile-gate the freshly-checked-out code BEFORE deploying/restarting
             # (mirrors the BLE update path). If it won't even import, roll the tree
