@@ -483,6 +483,12 @@ def _fill_history_item_from_line(line):
         "st": shutoff_type,
         "tf": _parse_float_token(_history_named_field(parts, "Temp")),
         "s2t": _parse_float_token(_history_named_field(parts, "StopToThumb")),
+        # Flow window epochs (None when the box didn't record them — the app
+        # flags such records loudly). Same fields as rotorsync_bumble's parser:
+        # loads fetched over WiFi must not lose pilot/flow attribution.
+        "fs": _history_timestamp_epoch(_history_named_field(parts, "FlowStart")),
+        "fe": _history_timestamp_epoch(_history_named_field(parts, "FlowEnd")),
+        "pl": _history_named_field(parts, "Pilot").strip() or None,
     }
 
 

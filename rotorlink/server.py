@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Dict, Optional, Set
 
 import websockets
@@ -63,6 +64,12 @@ def _command_verb(command: str) -> str:
     return command.split(":", 1)[0].strip().upper()
 
 
+def _sanitize_pilot_name(name) -> str:
+    """Mirror rotorsync_bumble._sanitize_pilot_name: the name rides in a
+    line-based dashboard command, so it must stay single-line and '|'-free."""
+    return str(name or "").replace("\n", " ").replace("\r", " ").replace("|", "/").strip()[:80]
+
+
 class ClientState:
     """Per-connection bookkeeping."""
 
@@ -74,6 +81,9 @@ class ClientState:
         self.user: Optional[str] = None
         self.device: Optional[dict] = None
         self.hello_received = False
+        # When the latest client_hello arrived — the most recent pilot hello wins
+        # pilot attribution, mirroring the BLE server's last_seen semantics.
+        self.hello_at: float = 0.0
         # One remote-maintenance PTY shell per connection, lazily created on the
         # first maintenance frame; torn down on disconnect. None until then.
         self.maintenance: Optional[MaintenanceHandler] = None
@@ -100,6 +110,9 @@ class RotorLinkServer:
         # Last broadcast trailer-config JSON, so we only re-emit `trailer_config`
         # when the trailer assignment / sensor offsets actually change.
         self._last_trailer_config_json: Optional[str] = None
+        # Last pilot name pushed to the dashboard (None = none pushed / cleared),
+        # so WIFI_PILOT_* lines are only sent on change, like the BLE server.
+        self._last_pushed_pilot: Optional[str] = None
 
     # --- lifecycle ---------------------------------------------------------
     async def run(self) -> None:
@@ -201,6 +214,43 @@ class RotorLinkServer:
             logger.info(
                 "client disconnected: %s (%d total)", state.peer, len(self.clients)
             )
+            try:
+                await self._push_pilot_status()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("pilot status push failed on disconnect: %s", e)
+
+    # --- pilot attribution ---------------------------------------------------
+
+    def _current_pilot_name(self) -> Optional[str]:
+        """Name of the connected WiFi client whose role is 'pilot' (most recent
+        hello wins), mirroring rotorsync_bumble._current_pilot_name."""
+        best_name = None
+        best_at = -1.0
+        for state in self.clients.values():
+            if str(state.role or "").strip().lower() != "pilot":
+                continue
+            name = _sanitize_pilot_name(state.user)
+            if name and state.hello_at >= best_at:
+                best_at = state.hello_at
+                best_name = name
+        return best_name
+
+    async def _push_pilot_status(self) -> None:
+        """Tell the dashboard which WiFi pilot is connected, on change only.
+
+        Uses WIFI_PILOT_CONNECTED/WIFI_PILOT_DISCONNECTED (not the BLE server's
+        PILOT_* verbs) so the dashboard can track the two transports separately —
+        a WiFi drop must never clear a pilot who is still connected over BLE.
+        Dashboards that predate the verbs just ignore them."""
+        name = self._current_pilot_name()
+        if name == self._last_pushed_pilot:
+            return
+        previous = self._last_pushed_pilot
+        self._last_pushed_pilot = name
+        if name:
+            await self.dashboard.send_command(f"WIFI_PILOT_CONNECTED:{name}")
+        elif previous:
+            await self.dashboard.send_command(f"WIFI_PILOT_DISCONNECTED:{previous}")
 
     async def _on_message(self, state: ClientState, raw: str) -> None:
         message = protocol.decode(raw)
@@ -211,13 +261,15 @@ class RotorLinkServer:
         if mtype == "client_hello":
             state.hello_received = True
             state.role = str(message.get("role", "viewer"))  # explicit from now on
-            state.user = message.get("user")
+            state.user = message.get("user") or message.get("name")
             state.device = message.get("device")
+            state.hello_at = time.time()
             if ARBITRATION and state.role == "controller" and self._controller is None:
                 self._controller = state
             logger.info(
                 "client_hello from %s role=%s user=%s", state.peer, state.role, state.user
             )
+            await self._push_pilot_status()
         elif mtype == "command":
             await self._handle_command(state, message)
         elif mtype == "config_command":
@@ -246,10 +298,12 @@ class RotorLinkServer:
                 state.role = str(message.get("role", state.role or "viewer"))
                 state.user = message.get("name") or message.get("user") or state.user
                 state.device = message.get("device") or state.device
+                state.hello_at = time.time()
                 logger.info(
                     "client_hello (cmd) from %s role=%s user=%s", state.peer, state.role, state.user
                 )
                 await self._send(state, protocol.build_command_result(cmd_id, True, "hello"))
+                await self._push_pilot_status()
                 return
             command = command_translator.translate(message)
             if command is None:
