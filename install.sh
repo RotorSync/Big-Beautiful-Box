@@ -317,6 +317,9 @@ sudo apt install -y \
 
 sudo usermod -a -G dialout $INSTALL_USER
 sudo "$SCRIPT_DIR/deploy/setup-cursor-control.sh"
+# Quiet the Ubuntu update/release nags — the fleet is held at one OS level and
+# upgraded out of season on the bench (see AGENTS.md); the login banner is noise.
+[ -x "$SCRIPT_DIR/deploy/quiet-os-update-nag.sh" ] && sudo "$SCRIPT_DIR/deploy/quiet-os-update-nag.sh" || true
 configure_bluetooth_usb_power
 sudo systemctl enable ssh
 sudo systemctl start ssh

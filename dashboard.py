@@ -3519,6 +3519,11 @@ def run_system_update():
                 "if [ -x /home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh ]; then "
                 "/home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh --restart-dashboard; "
                 "fi; "
+                # Quiet the Ubuntu update/release nags fleet-wide (held at one OS
+                # level, upgraded out of season — see AGENTS.md). Fail-soft.
+                "if [ -x /home/pi/Big-Beautiful-Box/deploy/quiet-os-update-nag.sh ]; then "
+                "/home/pi/Big-Beautiful-Box/deploy/quiet-os-update-nag.sh || true; "
+                "fi; "
                 "chmod 755 /opt/rotorsync_bumble.py /opt/rotorsync_watchdog.py; "
                 "python3 - <<'PY'\n"
                 "from pathlib import Path\n"
