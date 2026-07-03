@@ -326,7 +326,11 @@ sudo systemctl start ssh
 # available to the system interpreter rather than only the pi user's site-packages.
 # Do not self-upgrade distro-managed pip here. Ubuntu's deb-packaged pip does
 # not carry uninstall metadata that pip expects for a replace-in-place upgrade.
-sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229
+sudo python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229 || {
+    log_error "Failed to install bleak/bumble system-wide — the box needs a working network connection during provisioning."
+    log_error "Connect the Pi to the internet and re-run ./install.sh."
+    exit 1
+}
 
 # Step 3: Install vendored IOL-HAT
 log_step "3/7: Setting up IOL-HAT..."
@@ -487,6 +491,17 @@ sudo mkdir -p /etc/rotorlink
 # WPA2 PSK for the field hotspot; only used when ROTORLINK_AP_ENABLED=1 is set on the unit.
 [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' | sudo tee /etc/rotorlink/ap.psk >/dev/null
 sudo cp "$SCRIPT_DIR/systemd/rotorlink.service" /etc/systemd/system/rotorlink.service
+# mDNS re-advertise dispatcher: restarts rotorlink on wlan0-up so the box's
+# advertisement isn't stale after an AP<->STA flip changes wlan0's IP. Install
+# it directly here (from the running checkout) rather than relying on the
+# setup-cursor-control.sh hook, which runs in Step 2 before the repo is placed
+# at its final path and would no-op on a fresh box — leaving the box
+# undiscoverable over WiFi after its first flip until the next in-app update.
+if [ -f "$SCRIPT_DIR/deploy/90-rotorlink-readvertise" ] && [ -d /etc/NetworkManager/dispatcher.d ]; then
+    sudo install -m 755 -o root -g root "$SCRIPT_DIR/deploy/90-rotorlink-readvertise" \
+        /etc/NetworkManager/dispatcher.d/90-rotorlink-readvertise \
+        || log_warn "Could not install 90-rotorlink-readvertise dispatcher (WiFi re-advertise after AP/STA flip)"
+fi
 sudo systemctl daemon-reload
 sudo systemctl enable --now rotorlink.service || log_warn "rotorlink.service did not start"
 log_info "Installed RotorLink WiFi link service (rotorlink.service)"

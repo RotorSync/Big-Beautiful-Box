@@ -275,7 +275,7 @@ The installer then layers the BBB-specific configuration on top of that default 
 ### Install Steps
 
 ```bash
-git clone https://github.com/austins05/Big-Beautiful-Box.git
+git clone https://github.com/RotorSync/Big-Beautiful-Box.git
 cd Big-Beautiful-Box
 chmod +x install.sh
 ./install.sh
