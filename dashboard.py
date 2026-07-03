@@ -357,6 +357,11 @@ wifi_pilot_name = ""  # Name of the most recent pilot reported by the RotorLink 
 wifi_pilot_connected = False  # True while that WiFi pilot is actively connected
 last_wifi_pilot_disconnect_at = 0.0  # Wall time the WiFi pilot last disconnected
 PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS = 99 * 60  # Stop attributing loads after this gap
+# Last reported pilot location per transport ({lat, lon, acc?, ts}) — stamped
+# onto recorded loads (| Loc: lat,lon[,acc]) when fresh; see current_pilot_loc().
+ble_pilot_loc = None
+wifi_pilot_loc = None
+PILOT_LOC_MAX_AGE_SECONDS = 15 * 60
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
 pending_fill_flow_gpm = 0.0  # Flow snapshot associated with the completed fill
@@ -1987,6 +1992,44 @@ def update_wifi_pilot_status(connected, name):
         last_wifi_pilot_disconnect_at = time.time()
 
 
+def update_pilot_loc(source, payload):
+    """Parse a PILOT_LOC/WIFI_PILOT_LOC payload ('lat,lon[,acc]')."""
+    global ble_pilot_loc, wifi_pilot_loc
+    try:
+        tokens = [t.strip() for t in str(payload).split(",")]
+        loc = {"lat": float(tokens[0]), "lon": float(tokens[1]), "ts": time.time()}
+        if len(tokens) >= 3:
+            loc["acc"] = float(tokens[2])
+    except (TypeError, ValueError, IndexError):
+        return
+    if source == "wifi":
+        wifi_pilot_loc = loc
+    else:
+        ble_pilot_loc = loc
+
+
+def current_pilot_loc():
+    """Location to stamp on a load — same source precedence as the pilot label
+    (connected BLE pilot, then connected WiFi pilot, then whichever pilot
+    disconnected most recently); dropped entirely once it goes stale."""
+    if current_pilot_connected and current_pilot_name:
+        loc = ble_pilot_loc
+    elif wifi_pilot_connected and wifi_pilot_name:
+        loc = wifi_pilot_loc
+    else:
+        pairs = []
+        if current_pilot_name and last_pilot_disconnect_at > 0:
+            pairs.append((last_pilot_disconnect_at, ble_pilot_loc))
+        if wifi_pilot_name and last_wifi_pilot_disconnect_at > 0:
+            pairs.append((last_wifi_pilot_disconnect_at, wifi_pilot_loc))
+        loc = max(pairs, key=lambda p: p[0])[1] if pairs else None
+    if not loc:
+        return None
+    if time.time() - loc.get("ts", 0) > PILOT_LOC_MAX_AGE_SECONDS:
+        return None
+    return loc
+
+
 def current_pilot_label():
     """Pilot name to stamp on a load (see record_pending_fill)."""
     if current_pilot_connected and current_pilot_name:
@@ -2031,6 +2074,12 @@ def record_pending_fill():
 
         # Write to fill history log
         pilot_label = current_pilot_label()
+        pilot_loc = current_pilot_loc()
+        loc_field = ""
+        if pilot_loc:
+            loc_field = f" | Loc: {pilot_loc['lat']:.6f},{pilot_loc['lon']:.6f}"
+            if pilot_loc.get('acc') is not None:
+                loc_field += f",{pilot_loc['acc']:.1f}"
         with open(fill_log, 'a') as f:
             f.write(
                 f"{timestamp} | Requested: {pending_fill_requested:.3f} gal"
@@ -2040,6 +2089,7 @@ def record_pending_fill():
                 f"{_format_flow_meter_temp_field(pending_fill_temp_f)}"
                 f"{_format_stop_to_thumb_field(stop_to_thumb_seconds)}"
                 f"{_format_flow_window_fields(pending_fill_flow_started_at, pending_fill_flow_ended_at)}"
+                f"{loc_field}"
                 f" | Pilot: {pilot_label}\n"
             )
 
@@ -5790,6 +5840,18 @@ def socket_command_listener():
                                 pilot_name = line[len("WIFI_PILOT_DISCONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_wifi_pilot_status(False, n))
                                 client.send(b"PILOT_OK\n")
+                                continue
+
+                            elif line.startswith("PILOT_LOC:"):
+                                loc_payload = line[len("PILOT_LOC:"):].strip()
+                                root.after(0, lambda p=loc_payload: update_pilot_loc("ble", p))
+                                client.send(b"LOC_OK\n")
+                                continue
+
+                            elif line.startswith("WIFI_PILOT_LOC:"):
+                                loc_payload = line[len("WIFI_PILOT_LOC:"):].strip()
+                                root.after(0, lambda p=loc_payload: update_pilot_loc("wifi", p))
+                                client.send(b"LOC_OK\n")
                                 continue
 
                             elif line == "FILL":

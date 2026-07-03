@@ -25,6 +25,7 @@ from . import command_translator, config, protocol, state_encoder
 from .config_handler import ConfigHandler, _current_trailer_info
 from .dashboard_client import DashboardClient
 from .maintenance_handler import MaintenanceHandler, log_maintenance_secret_status
+from src import connection_registry
 
 logger = logging.getLogger("rotorlink.server")
 
@@ -80,10 +81,16 @@ class ClientState:
         self.role: Optional[str] = None
         self.user: Optional[str] = None
         self.device: Optional[dict] = None
+        self.user_id: Optional[str] = None
         self.hello_received = False
         # When the latest client_hello arrived — the most recent pilot hello wins
         # pilot attribution, mirroring the BLE server's last_seen semantics.
         self.hello_at: float = 0.0
+        self.connected_at: float = time.time()
+        # wifi_lan | wifi_ap, classified from the peer IP at accept time.
+        self.transport: str = connection_registry.classify_wifi_peer(self.peer_ip)
+        # Last location update from this client: {lat, lon, acc, ts} or None.
+        self.loc: Optional[dict] = None
         # One remote-maintenance PTY shell per connection, lazily created on the
         # first maintenance frame; torn down on disconnect. None until then.
         self.maintenance: Optional[MaintenanceHandler] = None
@@ -94,6 +101,13 @@ class ClientState:
             return "%s:%s" % self.ws.remote_address[:2]
         except Exception:
             return "?"
+
+    @property
+    def peer_ip(self) -> str:
+        try:
+            return str(self.ws.remote_address[0])
+        except Exception:
+            return ""
 
 
 class RotorLinkServer:
@@ -176,6 +190,8 @@ class RotorLinkServer:
         state = ClientState(websocket)
         self.clients[websocket] = state
         logger.info("client connected: %s (%d total)", state.peer, len(self.clients))
+        connection_registry.record_event("connect", state.transport, peer=state.peer)
+        self._write_wifi_snapshot()
         try:
             await self._send(state, protocol.build_hello())
             # Send the current snapshot immediately so a new client isn't blank
@@ -214,10 +230,65 @@ class RotorLinkServer:
             logger.info(
                 "client disconnected: %s (%d total)", state.peer, len(self.clients)
             )
+            connection_registry.record_event(
+                "disconnect", state.transport, peer=state.peer, role=state.role,
+                name=state.user, user_id=state.user_id, device=state.device,
+            )
+            self._write_wifi_snapshot()
             try:
                 await self._push_pilot_status()
             except Exception as e:  # noqa: BLE001
                 logger.warning("pilot status push failed on disconnect: %s", e)
+
+    # --- connection registry -------------------------------------------------
+
+    def _write_wifi_snapshot(self) -> None:
+        clients = []
+        for s in self.clients.values():
+            entry = {
+                "transport": s.transport,
+                "peer": s.peer,
+                "role": s.role,
+                "name": s.user,
+                "user_id": s.user_id,
+                "device": s.device if isinstance(s.device, str) else None,
+                "connected_at": round(s.connected_at, 3),
+                "hello_at": round(s.hello_at, 3) if s.hello_at else None,
+            }
+            clients.append({k: v for k, v in entry.items() if v is not None})
+        connection_registry.write_snapshot("wifi", clients)
+
+    # --- location ------------------------------------------------------------
+
+    @staticmethod
+    def _parse_loc(value) -> Optional[dict]:
+        """Accepts a nested hello `loc` dict or a flat loc_update message —
+        anything carrying numeric `lat`/`lon` (and optional `acc`)."""
+        if not isinstance(value, dict):
+            return None
+        try:
+            lat = float(value.get("lat"))
+            lon = float(value.get("lon"))
+        except (TypeError, ValueError):
+            return None
+        loc = {"lat": round(lat, 6), "lon": round(lon, 6), "ts": round(time.time(), 3)}
+        try:
+            if value.get("acc") is not None:
+                loc["acc"] = round(float(value["acc"]), 1)
+        except (TypeError, ValueError):
+            pass
+        return loc
+
+    async def _apply_loc(self, state: ClientState, value) -> None:
+        loc = self._parse_loc(value)
+        if loc is None:
+            return
+        state.loc = loc
+        if str(state.role or "").strip().lower() == "pilot":
+            parts = f"{loc['lat']},{loc['lon']}"
+            if "acc" in loc:
+                parts += f",{loc['acc']}"
+            await self.dashboard.send_command(f"WIFI_PILOT_LOC:{parts}")
 
     # --- pilot attribution ---------------------------------------------------
 
@@ -262,6 +333,7 @@ class RotorLinkServer:
             state.hello_received = True
             state.role = str(message.get("role", "viewer"))  # explicit from now on
             state.user = message.get("user") or message.get("name")
+            state.user_id = message.get("user_id")
             state.device = message.get("device")
             state.hello_at = time.time()
             if ARBITRATION and state.role == "controller" and self._controller is None:
@@ -269,6 +341,12 @@ class RotorLinkServer:
             logger.info(
                 "client_hello from %s role=%s user=%s", state.peer, state.role, state.user
             )
+            connection_registry.record_event(
+                "hello", state.transport, peer=state.peer, role=state.role,
+                name=state.user, user_id=state.user_id, device=state.device,
+            )
+            self._write_wifi_snapshot()
+            await self._apply_loc(state, message.get("loc"))
             await self._push_pilot_status()
         elif mtype == "command":
             await self._handle_command(state, message)
@@ -297,13 +375,27 @@ class RotorLinkServer:
             if str(message.get("cmd", "")).strip().lower() in ("client_hello", "hello"):
                 state.role = str(message.get("role", state.role or "viewer"))
                 state.user = message.get("name") or message.get("user") or state.user
+                state.user_id = message.get("user_id") or state.user_id
                 state.device = message.get("device") or state.device
                 state.hello_at = time.time()
                 logger.info(
                     "client_hello (cmd) from %s role=%s user=%s", state.peer, state.role, state.user
                 )
+                connection_registry.record_event(
+                    "hello", state.transport, peer=state.peer, role=state.role,
+                    name=state.user, user_id=state.user_id, device=state.device,
+                )
+                self._write_wifi_snapshot()
+                await self._apply_loc(state, message.get("loc") or message)
                 await self._send(state, protocol.build_command_result(cmd_id, True, "hello"))
                 await self._push_pilot_status()
+                return
+            # Lightweight location update — {"cmd":"loc_update","lat":..,"lon":..,
+            # "acc":..}. Stored per client; a pilot's location is forwarded to
+            # the dashboard so it can be stamped onto loads (see WIFI_PILOT_LOC).
+            if str(message.get("cmd", "")).strip().lower() in ("loc_update", "loc"):
+                await self._apply_loc(state, message)
+                await self._send(state, protocol.build_command_result(cmd_id, True, "loc"))
                 return
             command = command_translator.translate(message)
             if command is None:
