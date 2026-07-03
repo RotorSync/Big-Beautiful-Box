@@ -3477,6 +3477,38 @@ def run_system_update():
                 "if [ \"$base_name\" = \"mopeka_config.json\" ] && [ -f /opt/mopeka/mopeka_config.json ]; then continue; fi; "
                 "cp \"$mopeka_file\" /opt/mopeka/; "
                 "done; "
+                # Purge a RETIRED maintenance secret so the box re-adopts the
+                # current shared fleet key on its next maintenance session. A box
+                # that adopted a now-retired key (e.g. a company's interim key
+                # before all servers converged on the shared key) is otherwise
+                # locked out forever - it can't verify the new key's frames to
+                # receive a replacement, and the persisted secret is first-wins.
+                # We ship only sha256 fingerprints of retired keys (repo is
+                # public); a match means delete-and-re-adopt. Mirrors the
+                # runtime read (bytes.strip()) exactly. Fail-soft.
+                "python3 - <<'PYRETIRE'\n"
+                "import hashlib, pathlib\n"
+                "retired=set()\n"
+                "rp=pathlib.Path('/home/pi/Big-Beautiful-Box/deploy/retired-maintenance-secrets.txt')\n"
+                "try:\n"
+                "    if rp.exists():\n"
+                "        for line in rp.read_text().splitlines():\n"
+                "            line=line.strip()\n"
+                "            if line and not line.startswith('#'):\n"
+                "                retired.add(line.lower())\n"
+                "except OSError:\n"
+                "    retired=set()\n"
+                "for p in (pathlib.Path('/etc/rotorsync/maintenance.secret'), pathlib.Path('/home/pi/.rotorsync-maintenance-secret')):\n"
+                "    try:\n"
+                "        if not p.exists():\n"
+                "            continue\n"
+                "        fp=hashlib.sha256(p.read_bytes().strip()).hexdigest().lower()\n"
+                "        if fp in retired:\n"
+                "            p.unlink()\n"
+                "            print('[update] retired maintenance secret purged from %s; box will re-adopt the current fleet key on next session' % p)\n"
+                "    except OSError as e:\n"
+                "        print('[update] could not check %s: %s' % (p, e))\n"
+                "PYRETIRE\n"
                 "if [ ! -s /etc/rotorsync/maintenance.secret ] && [ ! -s /home/pi/.rotorsync-maintenance-secret ]; then "
                 "if [ -n \"${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}\" ]; then "
                 "umask 077; printf '%s' \"${BBB_MAINTENANCE_SECRET:-${MAINTENANCE_RELAY_SECRET:-}}\" > /home/pi/.rotorsync-maintenance-secret; chown pi:pi /home/pi/.rotorsync-maintenance-secret; chmod 600 /home/pi/.rotorsync-maintenance-secret; "
