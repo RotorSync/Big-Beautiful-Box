@@ -350,6 +350,12 @@ pending_fill_gallons = 0.0  # Gallons from last fill, waiting for thumbs up conf
 current_pilot_name = ""  # Name of the most recent pilot (role='pilot') reported by BLE server
 current_pilot_connected = False  # True while that pilot is actively connected
 last_pilot_disconnect_at = 0.0  # Wall time the pilot last disconnected
+# WiFi (RotorLink) pilot, tracked separately from the BLE pilot so a WiFi drop
+# never clears a pilot who is still connected over BLE (and vice versa).
+# current_pilot_label() prefers the BLE pilot when both are connected.
+wifi_pilot_name = ""  # Name of the most recent pilot reported by the RotorLink server
+wifi_pilot_connected = False  # True while that WiFi pilot is actively connected
+last_wifi_pilot_disconnect_at = 0.0  # Wall time the WiFi pilot last disconnected
 PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS = 99 * 60  # Stop attributing loads after this gap
 pending_fill_requested = 0.0  # Requested gallons from last fill
 pending_fill_shutoff_type = ""  # Shutoff type from last fill
@@ -1966,16 +1972,41 @@ def update_pilot_status(connected, name):
         last_pilot_disconnect_at = time.time()
 
 
+def update_wifi_pilot_status(connected, name):
+    """Update the tracked pilot identity reported by the RotorLink WiFi server."""
+    global wifi_pilot_name, wifi_pilot_connected, last_wifi_pilot_disconnect_at
+    name = (name or "").strip()
+    if connected:
+        if name:
+            wifi_pilot_name = name
+        wifi_pilot_connected = True
+    else:
+        if name:
+            wifi_pilot_name = name
+        wifi_pilot_connected = False
+        last_wifi_pilot_disconnect_at = time.time()
+
+
 def current_pilot_label():
     """Pilot name to stamp on a load (see record_pending_fill)."""
     if current_pilot_connected and current_pilot_name:
         return current_pilot_name
+    if wifi_pilot_connected and wifi_pilot_name:
+        return wifi_pilot_name
+    # Neither transport has a pilot right now: attribute to whichever pilot
+    # disconnected most recently, within the attribution window.
+    candidates = []
     if current_pilot_name and last_pilot_disconnect_at > 0:
-        elapsed = time.time() - last_pilot_disconnect_at
+        candidates.append((last_pilot_disconnect_at, current_pilot_name))
+    if wifi_pilot_name and last_wifi_pilot_disconnect_at > 0:
+        candidates.append((last_wifi_pilot_disconnect_at, wifi_pilot_name))
+    if candidates:
+        disconnect_at, name = max(candidates)
+        elapsed = time.time() - disconnect_at
         if 0 <= elapsed <= PILOT_DISCONNECT_ATTRIBUTION_MAX_SECONDS:
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
-            return f"{current_pilot_name}/disconnected-({minutes}m{seconds}sec)"
+            return f"{name}/disconnected-({minutes}m{seconds}sec)"
     return "Unknown"
 
 
@@ -5746,6 +5777,18 @@ def socket_command_listener():
                             elif line.startswith("PILOT_DISCONNECTED:"):
                                 pilot_name = line[len("PILOT_DISCONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_pilot_status(False, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
+
+                            elif line.startswith("WIFI_PILOT_CONNECTED:"):
+                                pilot_name = line[len("WIFI_PILOT_CONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_wifi_pilot_status(True, n))
+                                client.send(b"PILOT_OK\n")
+                                continue
+
+                            elif line.startswith("WIFI_PILOT_DISCONNECTED:"):
+                                pilot_name = line[len("WIFI_PILOT_DISCONNECTED:"):].strip()
+                                root.after(0, lambda n=pilot_name: update_wifi_pilot_status(False, n))
                                 client.send(b"PILOT_OK\n")
                                 continue
 

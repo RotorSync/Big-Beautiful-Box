@@ -3740,6 +3740,18 @@ def _unconfigured_ble_name():
     return f'TrailerSync-Uncfg-{serial}' if serial else 'TrailerSync-Uncfg'
 
 
+def _clamp_ble_name(name):
+    """The full name rides in the BLE scan-response: COMPLETE_LOCAL_NAME inside a
+    31-byte AD structure leaves 29 usable bytes. An over-long name (e.g. a long
+    customer display_name) overflows it on the fleet's Realtek adapters
+    (HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA -> INVALID_COMMAND_PARAMETERS), which
+    aborts advertising and crash-loops the box — the same failure the
+    unconfigured-name path already guards against. Clamp on UTF-8 bytes so a
+    multi-byte character is dropped whole, never split."""
+    encoded = str(name or '').encode('utf-8')[:29]
+    return encoded.decode('utf-8', 'ignore').strip()
+
+
 def _compute_ble_name(cfg=None):
     cfg = cfg or load_config()
     mode = _normalize_box_mode(cfg.get('box_mode'))
@@ -3747,12 +3759,12 @@ def _compute_ble_name(cfg=None):
     trailer = _get_assigned_trailer(cfg)
 
     if mode == 'customer':
-        return display_name or DEFAULT_CUSTOMER_BLE_NAME
+        return _clamp_ble_name(display_name or DEFAULT_CUSTOMER_BLE_NAME)
 
     if trailer not in (None, ''):
-        return f'TrailerSync-TR{trailer}'
+        return _clamp_ble_name(f'TrailerSync-TR{trailer}')
 
-    return display_name or _unconfigured_ble_name()
+    return _clamp_ble_name(display_name or _unconfigured_ble_name())
 
 
 def _compute_short_ble_advertising_name(ble_name):
