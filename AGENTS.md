@@ -85,21 +85,21 @@ close the gap (see the self-heal patterns below) or document exactly why not.
 
 ## NON-UPDATE PITFALLS (runtime / networking)
 
-7. **Field AP must stay LOCAL-ONLY.** `ipv4.method shared` hands out a default
+8. **Field AP must stay LOCAL-ONLY.** `ipv4.method shared` hands out a default
    route + DNS by default, which makes a joined iPad try to route *internet*
    through the box and blackhole (cellular iPads lose live MQTT). `ensure_ap_profile`
    installs a dnsmasq drop-in (`dhcp-option=3`/`6` cleared, `port=0`) to make the
    AP a routeless local network. Don't regress that. Verify after any AP change:
    join the SSID and confirm a `10.42.0.x` lease with **no** default route.
 
-8. **AP SSID goes stale after a trailer rename.** The AP broadcasts the SSID it
+9. **AP SSID goes stale after a trailer rename.** The AP broadcasts the SSID it
    was *created* with; a renamed trailer's box keeps the old SSID (so the app's
    auto-join, which targets the current name, never joins). `ensure_ap_profile`
    re-syncs the SSID to the current name — but only when it runs (service start /
    AP cycle). `AP_SSID` is computed at import, so a rename while rotorlink is
    running needs a service restart to take effect.
 
-9. **mDNS goes stale across the AP↔STA flip.** The flip changes wlan0's IP; a
+10. **mDNS goes stale across the AP↔STA flip.** The flip changes wlan0's IP; a
    python-zeroconf registration only re-registers on a NAME change. The NM
    dispatcher `deploy/90-rotorlink-readvertise` restarts rotorlink on wlan0-up to
    re-advertise. It must be installed both by `install.sh` (directly) and the
@@ -108,12 +108,12 @@ close the gap (see the self-heal patterns below) or document exactly why not.
    itself and is immune; check `journalctl -u rotorlink | grep "mDNS advertised
    via"` to know which a box uses.
 
-10. **Single radio can't AP-2.4 and STA-5GHz simultaneously.** The Pi has one
+11. **Single radio can't AP-2.4 and STA-5GHz simultaneously.** The Pi has one
     WiFi radio; the network manager idle-gates the AP↔STA switch (won't flip
     while a client is connected). Don't assume a box can host its AP and be on
     the shop WiFi at once.
 
-11. **Fast shutdown matters.** The rotorlink WS server aborts client transports
+12. **Fast shutdown matters.** The rotorlink WS server aborts client transports
     on stop and the unit sets `TimeoutStopSec`/`KillMode` so `systemctl restart`
     doesn't hang ~40s on a half-open client. Broadcasts are per-client isolated
     (`asyncio.wait_for`) so one wedged iPad can't freeze state/history for the
