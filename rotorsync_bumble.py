@@ -3728,9 +3728,15 @@ def _unconfigured_ble_name():
     aborts advertising and crash-loops the box. 'Uncfg-<serial>' (~23) fits."""
     host = socket.gethostname()
     serial = host
-    if serial.lower().startswith('trailersync-'):
-        serial = serial[len('trailersync-'):]
-    serial = serial.strip()
+    for _prefix in ('trailersync-', 'rotorsync-'):
+        if serial.lower().startswith(_prefix):
+            serial = serial[len(_prefix):]
+            break
+    # Hard length clamp: 'TrailerSync-Uncfg-' is 18 chars and the full name rides
+    # in the length-limited BLE scan-response — an unexpected hostname (e.g. one
+    # not following the 'trailersync-<serial>' convention) must never overflow it
+    # and crash-loop the box (HCI_LE_SET_EXTENDED_..._DATA INVALID_COMMAND_PARAMS).
+    serial = serial.strip()[:11]
     return f'TrailerSync-Uncfg-{serial}' if serial else 'TrailerSync-Uncfg'
 
 

@@ -95,9 +95,14 @@ def unconfigured_name() -> str:
     rotorsync_bumble.py. BLE and WiFi must advertise the SAME identity."""
     host = socket.gethostname()
     serial = host
-    if serial.lower().startswith("trailersync-"):
-        serial = serial[len("trailersync-"):]
-    serial = serial.strip()
+    for _prefix in ("trailersync-", "rotorsync-"):
+        if serial.lower().startswith(_prefix):
+            serial = serial[len(_prefix):]
+            break
+    # Same clamp as _unconfigured_ble_name() in rotorsync_bumble.py — BLE and WiFi
+    # must produce the SAME name, and an unexpected hostname must never overflow
+    # the length-limited BLE scan-response and crash-loop the box.
+    serial = serial.strip()[:11]
     return "TrailerSync-Uncfg-%s" % serial if serial else "TrailerSync-Uncfg"
 
 
