@@ -41,7 +41,7 @@ class FlowMeterReading:
     @property
     def totalizer_gallons(self) -> float:
         """Get totalizer value in gallons."""
-        return abs(self.totalizer_liters) * 0.264172
+        return self.totalizer_liters * 0.264172
 
     @property
     def flow_rate_gpm(self) -> float:
@@ -138,9 +138,9 @@ class FlowMeter:
         if raw_data == b'\x00' * len(raw_data):
             raise ValueError("Device not responding (all-zero data)")
 
-        # Parse totalizer (bytes 4-7, big-endian float)
-        # Note: The flow meter returns negative totalizer values, so we use abs()
-        totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
+        # Parse signed totalizer (bytes 4-7, big-endian float). Negative values
+        # are unsafe drift/fault evidence and must not be hidden with abs().
+        totalizer_liters = struct.unpack('>f', raw_data[4:8])[0]
 
         # Parse flow rate (bytes 8-11, big-endian float)
         flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]

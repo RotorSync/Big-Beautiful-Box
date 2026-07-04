@@ -131,8 +131,9 @@ class FlowHandler:
             if raw_data == b'\x00' * len(raw_data):
                 raise ValueError("Device not responding (all-zero data)")
             
-            # Decode Picomag format
-            totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
+            # Decode signed Picomag totalizer. Negative values are safety-fault
+            # evidence and must not be hidden with abs().
+            totalizer_liters = struct.unpack('>f', raw_data[4:8])[0]
             flow_rate_l_per_s = struct.unpack('>f', raw_data[8:12])[0]
             
             reading = FlowReading(

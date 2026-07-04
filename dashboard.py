@@ -24,6 +24,11 @@ from src.batchmix_payload import (
     parse_field_color,
     scaled_batchmix_payload_for_water,
 )
+from src.flow_safety import (
+    negative_flow_status,
+    negative_totalizer_status,
+    positive_drift_status,
+)
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
@@ -254,7 +259,7 @@ class _SimIOLHat:
 
             packet = (
                 b"\x00\x00\x00\x00"
-                + struct.pack(">f", abs(self.totalizer_liters))
+                + struct.pack(">f", self.totalizer_liters)
                 + struct.pack(">f", self.flow_rate_l_per_s)
                 + struct.pack(">h", int(round(self.temperature_c * 10)))
                 + bytes([0])
@@ -281,6 +286,7 @@ if SIM_MODE:
 
 # Global variables
 last_totalizer_liters = 0.0
+last_signed_totalizer_liters = 0.0
 last_flow_rate = 0.0
 last_flow_meter_temp_f = None
 previous_totalizer_liters = 0.0
@@ -401,6 +407,7 @@ flow_control_audit_loop_ms_max = 0.0
 relay_slowdown_watch_active = False
 relay_slowdown_alarm_active = False
 relay_slowdown_alarm_visible = False
+negative_totalizer_alarm_visible = False
 relay_slowdown_trigger_time = 0.0
 relay_slowdown_trigger_flow_gpm = 0.0
 pump_stop_relay_lock = threading.Lock()
@@ -408,6 +415,21 @@ pump_stop_pulse_count = 0
 last_pump_stop_relay_activated_at = 0.0
 pump_stop_fault_hold_active = False
 pump_stop_fault_hold_reason = ""
+negative_totalizer_fault_active = False
+negative_totalizer_fault_reason = ""
+negative_totalizer_relay_hold_active = False
+last_negative_totalizer_gallons = 0.0
+negative_flow_fault_active = False
+negative_flow_fault_reason = ""
+negative_flow_started_at = 0.0
+last_negative_flow_gpm = 0.0
+positive_drift_fault_active = False
+positive_drift_fault_reason = ""
+positive_drift_relay_hold_active = False
+positive_drift_low_flow_started_at = 0.0
+positive_drift_baseline_liters = 0.0
+positive_drift_gallons = 0.0
+positive_drift_flow_gpm = 0.0
 flow_meter_reconnect_fresh_reads = 0
 flow_meter_reconnect_started_at = 0.0
 flow_meter_reconnect_last_status_check = 0.0
@@ -425,6 +447,7 @@ last_daily_total_text = None  # Cache daily total footer text
 last_daily_total_mode = None  # Track mode used for daily total rendering
 last_flow_rate_text = None  # Cache flow rate footer text
 last_flow_rate_mode = None  # Track mode used for flow footer rendering
+last_flow_rate_color = None  # Track flow footer color for negative-flow flashing
 last_visible_cursor_check = 0.0
 
 # Shared menu order.
@@ -695,7 +718,7 @@ def _set_pump_stop_output(active, reason):
     return True
 
 
-def set_pump_stop_fault_hold(active, reason="flow meter fault"):
+def set_pump_stop_fault_hold(active, reason="flow meter fault", pulse_on_latch=True):
     """Latch flow-meter fault status and pulse pump stop when the fault starts."""
     global pump_stop_fault_hold_active, pump_stop_fault_hold_reason
 
@@ -710,7 +733,7 @@ def set_pump_stop_fault_hold(active, reason="flow meter fault"):
                 return
             pump_stop_fault_hold_active = True
             pump_stop_fault_hold_reason = reason
-            pulse_fault_stop = True
+            pulse_fault_stop = bool(pulse_on_latch)
             log_flow_control(f"pump_stop_fault_latch_active | reason={reason}")
         else:
             if not pump_stop_fault_hold_active:
@@ -728,6 +751,292 @@ def set_pump_stop_fault_hold(active, reason="flow meter fault"):
         start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
 
+def set_negative_totalizer_relay_hold(active, reason):
+    """Hold pump-stop relay HIGH until the negative-totalizer fault clears."""
+    global negative_totalizer_relay_hold_active
+
+    reason = reason or "NEGATIVE FLOW METER - RESET REQUIRED"
+    with pump_stop_relay_lock:
+        if active:
+            if negative_totalizer_relay_hold_active:
+                return
+            negative_totalizer_relay_hold_active = True
+            if _set_pump_stop_output(True, f"negative totalizer hold: {reason}"):
+                log_flow_control(f"negative_totalizer_relay_hold_active | reason={reason}")
+            return
+
+        if not negative_totalizer_relay_hold_active:
+            return
+        negative_totalizer_relay_hold_active = False
+        if pump_stop_pulse_count == 0:
+            if positive_drift_relay_hold_active:
+                log_flow_control(
+                    "negative_totalizer_relay_hold_cleared_positive_hold_active"
+                    f" | reason={reason}"
+                )
+            elif _set_pump_stop_output(False, f"negative totalizer hold cleared: {reason}"):
+                log_flow_control(f"negative_totalizer_relay_hold_cleared | reason={reason}")
+        else:
+            log_flow_control(
+                "negative_totalizer_relay_hold_cleared_pending_pulse"
+                f" | reason={reason}"
+                f" | active_pulses={pump_stop_pulse_count}"
+            )
+
+
+def set_positive_drift_relay_hold(active, reason):
+    """Hold pump-stop relay HIGH for positive idle drift unless override is active."""
+    global positive_drift_relay_hold_active
+
+    reason = reason or "FLOW METER DRIFT - GALLON RESET REQUIRED"
+    with pump_stop_relay_lock:
+        if active:
+            if override_mode:
+                active = False
+            else:
+                if positive_drift_relay_hold_active:
+                    return
+                positive_drift_relay_hold_active = True
+                if _set_pump_stop_output(True, f"positive drift hold: {reason}"):
+                    log_flow_control(f"positive_drift_relay_hold_active | reason={reason}")
+                return
+
+        if not positive_drift_relay_hold_active:
+            return
+        positive_drift_relay_hold_active = False
+        if pump_stop_pulse_count == 0:
+            if negative_totalizer_relay_hold_active:
+                log_flow_control(
+                    "positive_drift_relay_hold_cleared_negative_hold_active"
+                    f" | reason={reason}"
+                )
+            elif _set_pump_stop_output(False, f"positive drift hold cleared: {reason}"):
+                log_flow_control(f"positive_drift_relay_hold_cleared | reason={reason}")
+        else:
+            log_flow_control(
+                "positive_drift_relay_hold_cleared_pending_pulse"
+                f" | reason={reason}"
+                f" | active_pulses={pump_stop_pulse_count}"
+            )
+
+
+def _clear_positive_drift_pump_hold_if_owned(reason=None):
+    owned_reason = reason or positive_drift_fault_reason
+    if (
+        owned_reason
+        and pump_stop_fault_hold_active
+        and pump_stop_fault_hold_reason == owned_reason
+    ):
+        set_pump_stop_fault_hold(False)
+
+
+def _reset_positive_drift_monitor(totalizer_liters):
+    global positive_drift_low_flow_started_at, positive_drift_baseline_liters
+    global positive_drift_gallons, positive_drift_flow_gpm
+
+    positive_drift_low_flow_started_at = 0.0
+    positive_drift_baseline_liters = totalizer_liters
+    positive_drift_gallons = 0.0
+    positive_drift_flow_gpm = 0.0
+
+
+def update_positive_drift_fault(signed_totalizer_liters, flow_rate_l_per_s):
+    """Latch positive totalizer drift under low-flow readings."""
+    global positive_drift_fault_active, positive_drift_fault_reason
+    global positive_drift_low_flow_started_at, positive_drift_baseline_liters
+    global positive_drift_gallons, positive_drift_flow_gpm
+
+    now = time.time()
+    signed_gallons = signed_totalizer_liters * config.LITERS_TO_GALLONS
+    flow_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    low_flow = flow_gpm < config.FLOW_METER_POSITIVE_DRIFT_LOW_FLOW_GPM
+
+    if negative_totalizer_fault_active or negative_flow_fault_active:
+        if positive_drift_fault_active:
+            reason = positive_drift_fault_reason
+            positive_drift_fault_active = False
+            positive_drift_fault_reason = ""
+            set_positive_drift_relay_hold(False, reason)
+            _clear_positive_drift_pump_hold_if_owned(reason)
+        _reset_positive_drift_monitor(signed_totalizer_liters)
+        return
+
+    if positive_drift_fault_active and (
+        abs(signed_gallons) <= config.FLOW_METER_NEGATIVE_TOTALIZER_CLEAR_GALLONS
+        or not low_flow
+    ):
+        reason = positive_drift_fault_reason
+        positive_drift_fault_active = False
+        positive_drift_fault_reason = ""
+        set_positive_drift_relay_hold(False, reason)
+        _clear_positive_drift_pump_hold_if_owned(reason)
+        _reset_positive_drift_monitor(signed_totalizer_liters)
+        clear_reason = "gallon_reset" if low_flow else "flow_above_threshold"
+        log_flow_control(
+            "positive_drift_fault_cleared"
+            f" | totalizer_gal={signed_gallons:.3f}"
+            f" | flow_gpm={flow_gpm:.2f}"
+            f" | clear_reason={clear_reason}"
+            f" | reason={reason}"
+        )
+        return
+
+    if positive_drift_low_flow_started_at <= 0 or not low_flow:
+        if not positive_drift_fault_active:
+            _reset_positive_drift_monitor(signed_totalizer_liters)
+        if low_flow:
+            positive_drift_low_flow_started_at = now
+            positive_drift_baseline_liters = signed_totalizer_liters
+        return
+
+    if signed_totalizer_liters < positive_drift_baseline_liters:
+        positive_drift_baseline_liters = signed_totalizer_liters
+
+    elapsed = now - positive_drift_low_flow_started_at
+    status = positive_drift_status(
+        baseline_totalizer_liters=positive_drift_baseline_liters,
+        current_totalizer_liters=signed_totalizer_liters,
+        flow_rate_l_per_s=flow_rate_l_per_s,
+        low_flow_elapsed_seconds=elapsed,
+        liters_to_gallons=config.LITERS_TO_GALLONS,
+        liters_per_sec_to_gpm=config.LITERS_PER_SEC_TO_GPM,
+        low_flow_threshold_gpm=config.FLOW_METER_POSITIVE_DRIFT_LOW_FLOW_GPM,
+        drift_threshold_gallons=config.FLOW_METER_POSITIVE_DRIFT_FAULT_GALLONS,
+        min_low_flow_seconds=config.FLOW_METER_POSITIVE_DRIFT_SECONDS,
+    )
+    positive_drift_gallons = max(0.0, status.drift_gallons)
+    positive_drift_flow_gpm = status.flow_gpm
+
+    if status.fault:
+        should_log_fault = (
+            not positive_drift_fault_active
+            or positive_drift_fault_reason != status.reason
+        )
+        positive_drift_fault_active = True
+        positive_drift_fault_reason = status.reason
+        if override_mode:
+            set_positive_drift_relay_hold(False, status.reason)
+            _clear_positive_drift_pump_hold_if_owned()
+        else:
+            set_pump_stop_fault_hold(True, status.reason, pulse_on_latch=False)
+            set_positive_drift_relay_hold(True, status.reason)
+        if should_log_fault:
+            log_flow_control(
+                "positive_drift_fault"
+                f" | drift_gal={status.drift_gallons:.3f}"
+                f" | flow_gpm={status.flow_gpm:.2f}"
+                f" | elapsed={elapsed:.2f}"
+                f" | threshold={config.FLOW_METER_POSITIVE_DRIFT_FAULT_GALLONS:.3f}"
+            )
+
+
+def update_negative_flow_fault(signed_totalizer_liters, flow_rate_l_per_s):
+    """Latch a reset-required fault when signed flow stays negative."""
+    global negative_flow_fault_active, negative_flow_fault_reason
+    global negative_flow_started_at, last_negative_flow_gpm
+
+    now = time.time()
+    signed_gallons = signed_totalizer_liters * config.LITERS_TO_GALLONS
+    flow_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    last_negative_flow_gpm = flow_gpm
+
+    if (
+        negative_flow_fault_active
+        and abs(signed_gallons) <= config.FLOW_METER_NEGATIVE_TOTALIZER_CLEAR_GALLONS
+    ):
+        reason = negative_flow_fault_reason
+        negative_flow_fault_active = False
+        negative_flow_fault_reason = ""
+        negative_flow_started_at = 0.0
+        if not negative_totalizer_fault_active:
+            set_negative_totalizer_relay_hold(False, reason)
+            set_pump_stop_fault_hold(False)
+        log_flow_control(
+            "negative_flow_fault_cleared"
+            f" | totalizer_gal={signed_gallons:.3f}"
+            f" | flow_gpm={flow_gpm:.2f}"
+            f" | reason={reason}"
+        )
+        return
+
+    if flow_gpm > -config.FLOW_METER_NEGATIVE_FLOW_FAULT_GPM:
+        if not negative_flow_fault_active:
+            negative_flow_started_at = 0.0
+        return
+
+    if negative_flow_started_at <= 0:
+        negative_flow_started_at = now
+        return
+
+    elapsed = now - negative_flow_started_at
+    status = negative_flow_status(
+        flow_rate_l_per_s=flow_rate_l_per_s,
+        negative_flow_elapsed_seconds=elapsed,
+        liters_per_sec_to_gpm=config.LITERS_PER_SEC_TO_GPM,
+        fault_threshold_gpm=config.FLOW_METER_NEGATIVE_FLOW_FAULT_GPM,
+        min_negative_flow_seconds=config.FLOW_METER_NEGATIVE_FLOW_SECONDS,
+    )
+    last_negative_flow_gpm = status.flow_gpm
+
+    if status.fault:
+        should_log_fault = (
+            not negative_flow_fault_active
+            or negative_flow_fault_reason != status.reason
+        )
+        negative_flow_fault_active = True
+        negative_flow_fault_reason = status.reason
+        set_pump_stop_fault_hold(True, status.reason, pulse_on_latch=False)
+        set_negative_totalizer_relay_hold(True, status.reason)
+        if should_log_fault:
+            log_flow_control(
+                "negative_flow_fault"
+                f" | flow_gpm={status.flow_gpm:.2f}"
+                f" | elapsed={elapsed:.2f}"
+                f" | threshold={config.FLOW_METER_NEGATIVE_FLOW_FAULT_GPM:.2f}"
+            )
+
+
+def update_negative_totalizer_fault(signed_totalizer_liters):
+    """Latch a reset-required fault when the Picomag totalizer drifts negative."""
+    global negative_totalizer_fault_active, negative_totalizer_fault_reason
+    global last_negative_totalizer_gallons
+
+    status = negative_totalizer_status(
+        signed_totalizer_liters=signed_totalizer_liters,
+        liters_to_gallons=config.LITERS_TO_GALLONS,
+        fault_threshold_gallons=config.FLOW_METER_NEGATIVE_TOTALIZER_FAULT_GALLONS,
+        clear_threshold_gallons=config.FLOW_METER_NEGATIVE_TOTALIZER_CLEAR_GALLONS,
+    )
+    last_negative_totalizer_gallons = status.signed_gallons
+
+    if status.fault:
+        should_log_fault = (
+            not negative_totalizer_fault_active
+            or negative_totalizer_fault_reason != status.reason
+        )
+        negative_totalizer_fault_active = True
+        negative_totalizer_fault_reason = status.reason
+        set_pump_stop_fault_hold(True, status.reason, pulse_on_latch=False)
+        set_negative_totalizer_relay_hold(True, status.reason)
+        if should_log_fault:
+            log_flow_control(
+                "negative_totalizer_fault"
+                f" | signed_gal={status.signed_gallons:.3f}"
+                f" | threshold={config.FLOW_METER_NEGATIVE_TOTALIZER_FAULT_GALLONS:.3f}"
+            )
+    elif negative_totalizer_fault_active and status.reset_clear:
+        reason = negative_totalizer_fault_reason
+        negative_totalizer_fault_active = False
+        negative_totalizer_fault_reason = ""
+        if not negative_flow_fault_active:
+            set_negative_totalizer_relay_hold(False, reason)
+            set_pump_stop_fault_hold(False)
+        log_flow_control(
+            "negative_totalizer_fault_cleared"
+            f" | signed_gal={status.signed_gallons:.3f}"
+            f" | reason={reason}"
+        )
+
 def update_flow_meter_fault_hold(flow_meter_disconnected=None):
     """Pulse pump stop and latch warning while the flow meter is disconnected or stale."""
     global flow_meter_reconnect_fresh_reads
@@ -737,6 +1046,34 @@ def update_flow_meter_fault_hold(flow_meter_disconnected=None):
     if flow_meter_disconnected is None:
         flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
 
+    if negative_totalizer_fault_active or negative_flow_fault_active:
+        reason = (
+            negative_totalizer_fault_reason
+            or negative_flow_fault_reason
+            or "NEGATIVE FLOW METER - RESET REQUIRED"
+        )
+        set_pump_stop_fault_hold(
+            True,
+            reason,
+            pulse_on_latch=False,
+        )
+        set_negative_totalizer_relay_hold(True, reason)
+        return
+    if positive_drift_fault_active:
+        if override_mode:
+            set_positive_drift_relay_hold(False, positive_drift_fault_reason)
+            _clear_positive_drift_pump_hold_if_owned()
+        else:
+            set_pump_stop_fault_hold(
+                True,
+                positive_drift_fault_reason or "FLOW METER DRIFT - GALLON RESET REQUIRED",
+                pulse_on_latch=False,
+            )
+            set_positive_drift_relay_hold(
+                True,
+                positive_drift_fault_reason or "FLOW METER DRIFT - GALLON RESET REQUIRED",
+            )
+            return
     if connection_error:
         flow_meter_reconnect_fresh_reads = 0
         flow_meter_reconnect_started_at = 0.0
@@ -1932,19 +2269,28 @@ def update_bms_display():
     )
 
 
-def update_flow_rate_display(flow_rate_gpm):
+def update_flow_rate_display(flow_rate_gpm, alert=False):
     """Draw the current flow rate in the bottom-right corner."""
-    global last_flow_rate_text, last_flow_rate_mode
+    global last_flow_rate_text, last_flow_rate_mode, last_flow_rate_color
 
     flow_text = f"Flow:\n{flow_rate_gpm:.1f} GPM"
+    if alert:
+        flow_color = "red" if int(time.time() * 4) % 2 == 0 else "black"
+    else:
+        flow_color = "cyan"
     if current_mode == "mix":
         if last_flow_rate_mode != "mix":
             canvas.delete("flow_rate")
         last_flow_rate_mode = "mix"
         last_flow_rate_text = None
+        last_flow_rate_color = None
         return
 
-    if last_flow_rate_mode == current_mode and last_flow_rate_text == flow_text:
+    if (
+        last_flow_rate_mode == current_mode
+        and last_flow_rate_text == flow_text
+        and last_flow_rate_color == flow_color
+    ):
         return
 
     canvas.delete("flow_rate")
@@ -1955,12 +2301,24 @@ def update_flow_rate_display(flow_rate_gpm):
         _canvas_height() - 10,
         text=flow_text,
         font=("Helvetica", 72, "bold"),
-        fill="cyan",
+        fill=flow_color,
         anchor="se",
         tags="flow_rate",
     )
     last_flow_rate_text = flow_text
     last_flow_rate_mode = current_mode
+    last_flow_rate_color = flow_color
+
+
+def clear_flow_rate_display():
+    """Hide the normal flow footer when a higher-priority warning owns the screen."""
+    global last_flow_rate_text, last_flow_rate_mode, last_flow_rate_color
+
+    canvas.delete("flow_rate")
+    last_flow_rate_text = None
+    last_flow_rate_mode = None
+    last_flow_rate_color = None
+
 
 def update_pilot_status(connected, name):
     """Update the tracked pilot identity reported by the BLE server."""
@@ -2183,8 +2541,15 @@ def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
         with pump_stop_relay_lock:
             pump_stop_pulse_count = max(0, pump_stop_pulse_count - 1)
             if pump_stop_pulse_count == 0:
-                _set_pump_stop_output(False, "pulse complete")
-                relay_released = True
+                if negative_totalizer_relay_hold_active or positive_drift_relay_hold_active:
+                    hold_reason = (
+                        "negative totalizer hold"
+                        if negative_totalizer_relay_hold_active else "positive drift hold"
+                    )
+                    log_relay_event(f"Pulse complete; relay remains HIGH by {hold_reason}")
+                else:
+                    _set_pump_stop_output(False, "pulse complete")
+                    relay_released = True
             else:
                 log_relay_event(
                     "Pulse complete; relay remains HIGH "
@@ -2194,7 +2559,7 @@ def pump_stop_relay(duration=config.PUMP_STOP_DURATION):
         msg = (
             f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) deactivated"
             if relay_released
-            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH by active pulse"
+            else f"Alert relay (GPIO {config.PUMP_STOP_RELAY_PIN}) pulse complete; relay held HIGH"
         )
         print(msg)
         log_relay_event(msg)
@@ -2670,6 +3035,20 @@ def _build_dashboard_state_snapshot():
         "pump_stop_latched": bool(auto_shutoff_latched),
         "relay_slowdown_alarm": bool(relay_slowdown_alarm_active),
         "flow_meter_connected": bool(flow_meter_connected),
+        "negative_totalizer_fault": bool(negative_totalizer_fault_active),
+        "negative_totalizer_gal": round(last_negative_totalizer_gallons, 3),
+        "negative_flow_fault": bool(negative_flow_fault_active),
+        "negative_flow_gpm": round(last_negative_flow_gpm, 2),
+        "positive_drift_fault": bool(positive_drift_fault_active),
+        "positive_drift_gal": round(positive_drift_gallons, 3),
+        "positive_drift_flow_gpm": round(positive_drift_flow_gpm, 2),
+        "flow_meter_fault_reason": negative_totalizer_fault_reason or (
+            negative_flow_fault_reason or (
+                positive_drift_fault_reason or (
+                    pump_stop_fault_hold_reason if pump_stop_fault_hold_active else ""
+                )
+            )
+        ),
         "switch_box_connected": bool(switch_box_connected),
         "bms_soc": None if bms_soc is None else int(round(bms_soc)),
         "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
@@ -4851,7 +5230,8 @@ def _describe_iol_status_fault(st):
 
 def read_flow_meter():
     """Read data from the Picomag flow meter via IO-Link"""
-    global last_totalizer_liters, last_flow_rate, connection_error, error_message, last_successful_read_time
+    global last_totalizer_liters, last_signed_totalizer_liters, last_flow_rate
+    global connection_error, error_message, last_successful_read_time
     global last_flow_meter_temp_f
     global last_flow_read_was_fresh, last_fresh_flow_read_time
     global consecutive_identical_raw, last_raw_data
@@ -4938,13 +5318,20 @@ def read_flow_meter():
                 consecutive_identical_raw = 0
             last_raw_data = raw_data
 
-            # Decode the data according to Picomag format
-            totalizer_liters = abs(struct.unpack('>f', raw_data[4:8])[0])
+            # Decode the data according to Picomag format. Keep the signed
+            # totalizer so negative idle drift becomes a fault instead of a
+            # plausible positive fill volume.
+            signed_totalizer_liters = struct.unpack('>f', raw_data[4:8])[0]
+            update_negative_totalizer_fault(signed_totalizer_liters)
+            update_negative_flow_fault(signed_totalizer_liters, raw_flow_rate_l_per_s)
+            update_positive_drift_fault(signed_totalizer_liters, raw_flow_rate_l_per_s)
+            totalizer_liters = signed_totalizer_liters
             flow_rate_l_per_s = raw_flow_rate_l_per_s
             flow_meter_temp_f = _decode_flow_meter_temp_f(raw_data)
             detect_totalizer_reset(totalizer_liters)
 
             last_totalizer_liters = totalizer_liters
+            last_signed_totalizer_liters = signed_totalizer_liters
             last_flow_rate = flow_rate_l_per_s
             last_flow_meter_temp_f = flow_meter_temp_f
             # Clear error state - set LED green on reconnect
@@ -5012,6 +5399,10 @@ def _flow_control_process_sample(actual, now, loop_dt_ms):
     flow_control_was_flowing = is_flowing
     _update_relay_slowdown_watch(is_flowing, current_flow_gpm, now)
 
+    if negative_totalizer_fault_active or negative_flow_fault_active:
+        return
+    if positive_drift_fault_active and not override_mode:
+        return
     if not is_flowing or override_mode or flow_meter_disconnected or last_alert_triggered:
         return
 
@@ -6967,6 +7358,65 @@ def _canvas_height():
     return SIM_WINDOW_HEIGHT if SIM_MODE else height
 
 
+def update_negative_totalizer_fault_flash():
+    """Flash a top-screen reset-required warning for negative totalizer drift."""
+    global negative_totalizer_alarm_visible
+
+    flash_hz = 4.0
+    interval_ms = max(1, int(1000 / flash_hz))
+
+    if negative_totalizer_fault_active or negative_flow_fault_active or positive_drift_fault_active:
+        phase = int(time.time() * flash_hz) % 2
+        bg = "red" if phase == 0 else "black"
+        fg = "white" if phase == 0 else "yellow"
+        canvas.delete("negative_totalizer_alarm")
+        width = _canvas_width()
+        height = _canvas_height()
+        band_height = max(260, int(height * 0.44))
+        signed_flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+        if negative_totalizer_fault_active or negative_flow_fault_active:
+            warning_text = (
+                "NEGATIVE FLOW METER\n"
+                f"TOTALIZER: {last_negative_totalizer_gallons:.1f} GAL\n"
+                f"FLOW: {signed_flow_gpm:.1f} GPM\n"
+                "GALLON RESET REQUIRED\n"
+                "PUMP WILL NOT START UNTIL RESET"
+            )
+        else:
+            warning_text = (
+                "FLOW METER DRIFT\n"
+                f"DRIFT: +{positive_drift_gallons:.1f} GAL\n"
+                f"FLOW: {positive_drift_flow_gpm:.1f} GPM\n"
+                "GALLON RESET REQUIRED\n"
+                + ("OVERRIDE ACTIVE" if override_mode else "PUMP STOPPED - OVERRIDE ALLOWED")
+            )
+        canvas.create_rectangle(
+            0,
+            0,
+            width,
+            band_height,
+            fill=bg,
+            outline="",
+            tags="negative_totalizer_alarm",
+        )
+        canvas.create_text(
+            width // 2,
+            band_height // 2,
+            text=warning_text,
+            font=("Helvetica", max(38, int(band_height * 0.14)), "bold"),
+            fill=fg,
+            justify="center",
+            tags="negative_totalizer_alarm",
+        )
+        canvas.tag_raise("negative_totalizer_alarm")
+        negative_totalizer_alarm_visible = True
+    elif negative_totalizer_alarm_visible:
+        canvas.delete("negative_totalizer_alarm")
+        negative_totalizer_alarm_visible = False
+
+    root.after(interval_ms, update_negative_totalizer_fault_flash)
+
+
 def update_relay_slowdown_alarm_flash():
     """Flash the whole display while auto-stop relay has not slowed flow."""
     global relay_slowdown_alarm_visible
@@ -7645,7 +8095,11 @@ def update_dashboard():
                               font=("Helvetica", 72, "bold"), fill="cyan", anchor="sw", tags="daily_total")
         last_daily_total_text = daily_total_text
         last_daily_total_mode = current_mode
-    update_flow_rate_display(display_flow_rate_gpm)
+    signed_flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+    if signed_flow_gpm < 0:
+        update_flow_rate_display(signed_flow_gpm, alert=True)
+    else:
+        update_flow_rate_display(display_flow_rate_gpm)
 
     # Draw skull icons on sides when flow meter is disconnected (3 inches ~= 288pt at 96 DPI)
     # Pulse animation: size varies between 240pt and 288pt with 1-second cycle
@@ -7665,6 +8119,11 @@ def update_dashboard():
     # Draw warnings on canvas - collect all active warnings and cycle through them
     canvas.delete("warning")
     canvas.delete("caution_blocks")  # Delete caution blocks from previous frame
+    flow_meter_drift_alarm_active = (
+        negative_totalizer_fault_active
+        or negative_flow_fault_active
+        or positive_drift_fault_active
+    )
 
     # Special handling for override/caution mode - draw flashing red blocks with caution symbols
     if override_mode:
@@ -7723,7 +8182,11 @@ def update_dashboard():
         canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.88),
                          text="MANUAL", font=("Helvetica", 90, "bold"),
                          fill="orange", tags="warning")
-        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
+        if (
+            pump_stop_fault_hold_active
+            and not startup_iol_warning_suppressed
+            and not flow_meter_drift_alarm_active
+        ):
             canvas.create_text(_canvas_width() // 2, int(_canvas_height() * 0.15),
                              text=f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
                              font=("Helvetica", 72, "bold"),
@@ -7733,7 +8196,11 @@ def update_dashboard():
         # Build list of active warnings (in priority order) - only when NOT in override mode
         active_warnings = []
 
-        if pump_stop_fault_hold_active and not startup_iol_warning_suppressed:
+        if (
+            pump_stop_fault_hold_active
+            and not startup_iol_warning_suppressed
+            and not flow_meter_drift_alarm_active
+        ):
             active_warnings.append((
                 f"IO-LINK FAULT\n{pump_stop_fault_hold_reason}",
                 "Helvetica",
@@ -7766,6 +8233,12 @@ def update_dashboard():
 
     if relay_slowdown_alarm_active and relay_slowdown_alarm_visible:
         canvas.tag_raise("relay_slowdown_alarm")
+    if (
+        negative_totalizer_fault_active
+        or negative_flow_fault_active
+        or positive_drift_fault_active
+    ) and negative_totalizer_alarm_visible:
+        canvas.tag_raise("negative_totalizer_alarm")
 
     root.after(config.UPDATE_INTERVAL, update_dashboard)
 
@@ -8110,6 +8583,7 @@ total_checker_thread.start()
 reminder_thread = threading.Thread(target=daily_reminder_checker, daemon=True)
 reminder_thread.start()
 
+update_negative_totalizer_fault_flash()
 update_relay_slowdown_alarm_flash()
 update_dashboard()
 
