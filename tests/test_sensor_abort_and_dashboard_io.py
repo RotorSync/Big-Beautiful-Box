@@ -107,6 +107,13 @@ def test_submit_dashboard_io_runs_and_swallows_errors():
     assert ok.wait(5), 'worker thread died after an exception'
 
 
+class _FakeDevice:
+    def __init__(self):
+        self.l2cap_channel_manager = type(
+            'FakeManager', (), {'connection_parameters_update_response': None}
+        )()
+
+
 def test_relax_connection_parameters_requests_l2cap_update():
     calls = {}
 
@@ -120,7 +127,9 @@ def test_relax_connection_parameters_requests_l2cap_update():
         rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 0
         rb.active_gatt_connections.add('AA:BB')
         try:
-            await rb.relax_gatt_connection_parameters(FakeConnection(), 'AA:BB')
+            await rb.relax_gatt_connection_parameters(
+                _FakeDevice(), FakeConnection(), 'AA:BB'
+            )
         finally:
             rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = old_delay
             rb.active_gatt_connections.discard('AA:BB')
@@ -140,9 +149,71 @@ def test_relax_skips_already_disconnected_peer():
         rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 0
         rb.active_gatt_connections.discard('GONE')
         try:
-            await rb.relax_gatt_connection_parameters(FakeConnection(), 'GONE')
+            await rb.relax_gatt_connection_parameters(
+                _FakeDevice(), FakeConnection(), 'GONE'
+            )
         finally:
             rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = old_delay
+
+    asyncio.run(main())
+
+
+def test_relax_hang_times_out_and_unpoisons_slot():
+    """A link drop mid-request used to hang the relax task forever AND leave
+    bumble's single per-device response slot poisoned (every later request
+    raises InvalidStateError). The relax must time out and clear a done
+    (cancelled) future from the slot, while leaving a PENDING future (a
+    concurrent legit request) untouched."""
+
+    class HangingConnection:
+        async def update_parameters(self, *a, **kw):
+            await asyncio.sleep(3600)
+
+    async def main():
+        old_delay = rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS
+        rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 0
+        rb.active_gatt_connections.add('CC:DD')
+        device = _FakeDevice()
+        # Simulate the poisoned slot: wait_for's cancellation leaves a
+        # cancelled (done) future behind.
+        poisoned = asyncio.get_running_loop().create_future()
+        poisoned.cancel()
+        device.l2cap_channel_manager.connection_parameters_update_response = poisoned
+        orig_wait_for = asyncio.wait_for
+
+        async def fast_wait_for(awaitable, timeout):
+            return await orig_wait_for(awaitable, timeout=0.05)
+
+        asyncio.wait_for = fast_wait_for
+        try:
+            await rb.relax_gatt_connection_parameters(
+                device, HangingConnection(), 'CC:DD'
+            )
+        finally:
+            asyncio.wait_for = orig_wait_for
+            rb.GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = old_delay
+            rb.active_gatt_connections.discard('CC:DD')
+        assert (
+            device.l2cap_channel_manager.connection_parameters_update_response
+            is None
+        ), 'done future not cleared from the slot'
+
+        # A pending future (someone else's in-flight request) must survive.
+        pending = asyncio.get_running_loop().create_future()
+        device.l2cap_channel_manager.connection_parameters_update_response = pending
+        rb.active_gatt_connections.add('CC:DD')
+        asyncio.wait_for = fast_wait_for
+        try:
+            await rb.relax_gatt_connection_parameters(
+                device, HangingConnection(), 'CC:DD'
+            )
+        finally:
+            asyncio.wait_for = orig_wait_for
+            rb.active_gatt_connections.discard('CC:DD')
+        assert (
+            device.l2cap_channel_manager.connection_parameters_update_response
+            is pending
+        ), 'pending (foreign) future must not be cleared'
 
     asyncio.run(main())
 

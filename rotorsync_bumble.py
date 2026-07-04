@@ -285,7 +285,7 @@ def _gatt_connection_is_known_closed(connection):
 
 
 def _is_pilot_connected():
-    for connection_key in active_gatt_connections:
+    for connection_key in list(active_gatt_connections):
         if _client_role_for_connection_key(connection_key) == 'pilot':
             return True
     return False
@@ -438,7 +438,7 @@ GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS = 5000.0
 GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 2.0
 
 
-async def relax_gatt_connection_parameters(connection, peer):
+async def relax_gatt_connection_parameters(device, connection, peer):
     """Ask the central for relaxed connection parameters shortly after connect.
 
     iOS defaults to a ~15ms connection interval and a 2s supervision timeout
@@ -456,12 +456,15 @@ async def relax_gatt_connection_parameters(connection, peer):
     if update is None:
         return
     try:
-        await update(
-            GATT_RELAXED_CONN_INTERVAL_MIN_MS,
-            GATT_RELAXED_CONN_INTERVAL_MAX_MS,
-            GATT_RELAXED_CONN_LATENCY,
-            GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS,
-            use_l2cap=True,
+        await asyncio.wait_for(
+            update(
+                GATT_RELAXED_CONN_INTERVAL_MIN_MS,
+                GATT_RELAXED_CONN_INTERVAL_MAX_MS,
+                GATT_RELAXED_CONN_LATENCY,
+                GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS,
+                use_l2cap=True,
+            ),
+            timeout=10.0,
         )
         print(
             f'Requested relaxed connection parameters for {peer} '
@@ -474,6 +477,20 @@ async def relax_gatt_connection_parameters(connection, peer):
             f'{type(e).__name__}: {e}',
             flush=True,
         )
+        # bumble 0.0.229 keeps ONE pending L2CAP parameter-update response
+        # slot per device and never clears it if the link drops mid-request;
+        # a stuck (even cancelled) future there makes every later request
+        # raise InvalidStateError, silently disabling relaxation until
+        # restart. Best-effort un-poison so the next connection can retry.
+        try:
+            manager = getattr(device, 'l2cap_channel_manager', None)
+            pending = getattr(
+                manager, 'connection_parameters_update_response', None
+            )
+            if pending is not None and pending.done():
+                manager.connection_parameters_update_response = None
+        except Exception:
+            pass
 
 
 def _kernel_clock_is_synchronized():
@@ -1998,10 +2015,6 @@ def install_gatt_advertising_resume_hook(
             disconnect_unknown_gatt_client_if_no_hello(connection, peer, now)
         )
         hello_deadline_task.add_done_callback(_handle_background_task_done)
-        relax_params_task = asyncio.create_task(
-            relax_gatt_connection_parameters(connection, peer)
-        )
-        relax_params_task.add_done_callback(_handle_background_task_done)
         if hasattr(connection, 'on'):
             connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
         else:
@@ -2017,6 +2030,10 @@ def install_gatt_advertising_resume_hook(
                 flush=True,
             )
             return
+        relax_params_task = asyncio.create_task(
+            relax_gatt_connection_parameters(device, connection, peer)
+        )
+        relax_params_task.add_done_callback(_handle_background_task_done)
         if len(active_gatt_connections) > 1:
             global connected_advertising_maintainer_task
             if (
@@ -2166,7 +2183,10 @@ def make_live_telemetry_read_handler():
         global last_live_telemetry_client_read_at
         mark_gatt_client_seen(connection)
         last_live_telemetry_client_read_at = time.time()
-        query_live_telemetry()
+        # Serve the cached snapshot (the poller keeps it fresh while clients
+        # read) and refresh on the I/O worker; a socket call here would run
+        # on the Bumble event loop and stall BLE for every connected pilot.
+        submit_dashboard_io(query_live_telemetry)
         value = dashboard_status.get('live_json', '{}')
         print(f'ReadValue live: {value[:80]}', flush=True)
         return bytes(value, 'utf-8')
