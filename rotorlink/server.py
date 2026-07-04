@@ -24,7 +24,11 @@ import websockets
 from . import command_translator, config, protocol, state_encoder
 from .config_handler import ConfigHandler, _current_trailer_info
 from .dashboard_client import DashboardClient
-from .maintenance_handler import MaintenanceHandler, log_maintenance_secret_status
+from .maintenance_handler import (
+    MaintenanceHandler,
+    MaintenanceSessionRegistry,
+    log_maintenance_secret_status,
+)
 from src import connection_registry
 
 logger = logging.getLogger("rotorlink.server")
@@ -127,6 +131,11 @@ class RotorLinkServer:
         # Last pilot name pushed to the dashboard (None = none pushed / cleared),
         # so WIFI_PILOT_* lines are only sent on change, like the BLE server.
         self._last_pushed_pilot: Optional[str] = None
+        # Shared across connections so a maintenance shell survives its
+        # WebSocket dropping (no-internet AP resets the socket every ~4 min);
+        # a reconnecting client reattaches to the same shell. Lazy-created once
+        # the event loop is running (see _maintenance_registry).
+        self._maintenance: Optional[MaintenanceSessionRegistry] = None
 
     # --- lifecycle ---------------------------------------------------------
     async def run(self) -> None:
@@ -219,13 +228,16 @@ class RotorLinkServer:
             self.clients.pop(websocket, None)
             if self._controller is state:
                 self._controller = None
-            # Terminate this connection's maintenance shell (if any) so a dropped
-            # WiFi link never strands a live root shell on the Pi.
+            # Detach (not kill) this connection's maintenance shell: the shared
+            # registry keeps it alive for a reconnect and reaps it only if the
+            # session is genuinely orphaned (no reattach within the grace
+            # window) — so a root shell never leaks, but a socket blip on the
+            # no-internet AP no longer nukes the operator's terminal.
             if state.maintenance is not None:
                 try:
                     await state.maintenance.shutdown()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("maintenance teardown error for %s: %s", state.peer, e)
+                    logger.warning("maintenance detach error for %s: %s", state.peer, e)
                 state.maintenance = None
             logger.info(
                 "client disconnected: %s (%d total)", state.peer, len(self.clients)
@@ -444,8 +456,15 @@ class RotorLinkServer:
         # trailer_config to every client if so (cheap; only broadcasts on change).
         await self._broadcast_trailer_config()
 
+    @property
+    def _maintenance_registry(self) -> MaintenanceSessionRegistry:
+        # Lazy: the running loop only exists once serving has begun.
+        if self._maintenance is None:
+            self._maintenance = MaintenanceSessionRegistry(asyncio.get_running_loop())
+        return self._maintenance
+
     async def _handle_maintenance(self, state: ClientState, message: dict, *, kind: str) -> None:
-        """Relay a signed remote-maintenance frame to this connection's PTY shell.
+        """Relay a signed remote-maintenance frame to a session PTY shell.
 
         The admin server signs control/stdin/resize frames and the iPad forwards
         the SAME bytes verbatim under `frame` (we verify, never re-sign). Output
@@ -461,7 +480,9 @@ class RotorLinkServer:
             async def _emit(out_frame: dict) -> None:
                 await self._send(state, protocol.build_maintenance_output(out_frame))
 
-            state.maintenance = MaintenanceHandler(_emit, asyncio.get_running_loop())
+            state.maintenance = MaintenanceHandler(
+                _emit, asyncio.get_running_loop(), registry=self._maintenance_registry
+            )
 
         if kind == "control":
             await state.maintenance.handle_control(frame)

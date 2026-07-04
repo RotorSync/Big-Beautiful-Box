@@ -49,10 +49,23 @@ import logging
 import os
 import struct
 import termios
+import time
+from collections import deque
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Dict, Optional
 
 logger = logging.getLogger("rotorlink.maintenance")
+
+# How long a maintenance PTY shell survives after its WebSocket drops, waiting
+# for the client to reconnect and reattach. On a no-internet trailer AP iOS
+# resets the box socket every ~4 min; the client auto-reconnects in ~16s, so a
+# shell that respawned each time was never usable. We keep the shell (cwd,
+# history, running commands) alive across the gap and reap it only when the
+# session is genuinely orphaned. Env-overridable for tests.
+ORPHAN_REAP_SECONDS = float(os.environ.get("ROTORLINK_MAINTENANCE_ORPHAN_REAP", "120"))
+# Bytes of recent PTY output replayed to a reattaching client so the terminal
+# redraws its current screen instead of coming back blank.
+REATTACH_REPLAY_BYTES = 16 * 1024
 
 # --- secret loading (mirrors rotorsync_bumble.py exactly) -------------------
 MAINTENANCE_SECRET_PATHS = (
@@ -257,6 +270,33 @@ class MaintenanceSession:
         self._pending_rows: Optional[int] = None
         self._pending_cols: Optional[int] = None
         self._closing = False
+        # Ring of recent raw PTY bytes, replayed when a reconnecting client
+        # reattaches so the terminal redraws instead of coming back blank.
+        self._replay_buffer: "deque[bytes]" = deque()
+        self._replay_bytes = 0
+        # Set by the registry so a shell that exits on its own (or is closed)
+        # is dropped from the session store.
+        self.on_closed: Optional[Callable[[str], None]] = None
+
+    def rebind_emit(self, emit: OutputEmitter) -> None:
+        """Point this live shell's output at a (re)connected client's socket.
+        Output produced while detached still went into the replay buffer, so a
+        reattaching client can redraw via replay_recent()."""
+        self._emit = emit
+
+    def _buffer_output(self, data: bytes) -> None:
+        self._replay_buffer.append(data)
+        self._replay_bytes += len(data)
+        while self._replay_bytes > REATTACH_REPLAY_BYTES and len(self._replay_buffer) > 1:
+            self._replay_bytes -= len(self._replay_buffer.popleft())
+
+    async def replay_recent(self) -> None:
+        """Re-emit the recent PTY output to the current emitter (post-rebind)."""
+        if not self._replay_buffer:
+            return
+        combined = b"".join(self._replay_buffer)
+        with contextlib.suppress(Exception):
+            await self._emit_pty_bytes(combined, buffer=False)
 
     # --- output framing ----------------------------------------------------
     def _next_seq(self) -> int:
@@ -276,9 +316,11 @@ class MaintenanceSession:
                 frame[k] = v
         await self._emit(frame)
 
-    async def _emit_pty_bytes(self, data: bytes) -> None:
+    async def _emit_pty_bytes(self, data: bytes, *, buffer: bool = True) -> None:
         # FIXED WIRE CONTRACT: PTY output rides the existing maintenance-frame
         # shape with enc="pty" and base64(raw PTY bytes) in `text`. Full-rate.
+        if buffer:
+            self._buffer_output(data)
         frame = {
             "type": "output",
             "seq": self._next_seq(),
@@ -450,34 +492,132 @@ class MaintenanceSession:
         with contextlib.suppress(Exception):
             await self._emit_status("closed", reason=reason)
         logger.info("maintenance PTY shell closed (session=%s, reason=%s)", self.session_id, reason)
+        if self.on_closed is not None:
+            with contextlib.suppress(Exception):
+                self.on_closed(self.session_id)
+
+
+class MaintenanceSessionRegistry:
+    """Server-wide store of live PTY shells keyed by session_id, so a shell
+    outlives the WebSocket connection that started it.
+
+    When a connection drops we do NOT kill its shell — we start an orphan-reap
+    timer. If the client reconnects (a new WebSocket for the same session_id)
+    before the timer fires, its output is rebound to the new connection and the
+    recent screen is replayed; the user keeps their shell across the blip. If no
+    one reattaches, the shell is reaped (root shells never leak)."""
+
+    def __init__(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        self._loop = loop or asyncio.get_event_loop()
+        self._sessions: Dict[str, MaintenanceSession] = {}
+        self._reap_handles: Dict[str, asyncio.TimerHandle] = {}
+
+    def attach(self, session_id: str, emit: OutputEmitter) -> tuple:
+        """Get-or-create the shell for session_id and bind its output to `emit`.
+        Returns (session, reattached) — reattached=True when an existing live
+        shell was resumed (caller should replay recent output)."""
+        self._cancel_reap(session_id)
+        session = self._sessions.get(session_id)
+        if session is not None and not session._closing:
+            session.rebind_emit(emit)
+            logger.info("maintenance session %s reattached", session_id)
+            return session, True
+        session = MaintenanceSession(emit, self._loop)
+        session.session_id = session_id
+        session.on_closed = self.note_closed
+        self._sessions[session_id] = session
+        return session, False
+
+    def detach(self, session_id: str) -> None:
+        """The client for this session dropped — arm the orphan-reap timer."""
+        session = self._sessions.get(session_id)
+        if session is None or session._closing:
+            self._sessions.pop(session_id, None)
+            return
+        self._cancel_reap(session_id)
+        logger.info(
+            "maintenance session %s detached; reaping in %.0fs if no reattach",
+            session_id, ORPHAN_REAP_SECONDS,
+        )
+        self._reap_handles[session_id] = self._loop.call_later(
+            ORPHAN_REAP_SECONDS,
+            lambda: self._loop.create_task(self._reap(session_id)),
+        )
+
+    async def _reap(self, session_id: str) -> None:
+        self._reap_handles.pop(session_id, None)
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            logger.info("maintenance session %s orphaned — reaping shell", session_id)
+            with contextlib.suppress(Exception):
+                await session.close("orphaned (client did not reconnect)")
+
+    def _cancel_reap(self, session_id: str) -> None:
+        handle = self._reap_handles.pop(session_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    async def close(self, session_id: str, reason: str) -> None:
+        """Explicitly end a session (remote close) — no reap grace."""
+        self._cancel_reap(session_id)
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            with contextlib.suppress(Exception):
+                await session.close(reason)
+
+    def note_closed(self, session_id: str) -> None:
+        """A shell closed itself (exit); drop it from the registry."""
+        self._cancel_reap(session_id)
+        self._sessions.pop(session_id, None)
+
+    async def shutdown_all(self) -> None:
+        for session_id in list(self._reap_handles):
+            self._cancel_reap(session_id)
+        for session_id, session in list(self._sessions.items()):
+            with contextlib.suppress(Exception):
+                await session.close("server shutdown")
+        self._sessions.clear()
 
 
 class MaintenanceHandler:
     """Per-connection maintenance dispatcher.
 
-    Owns at most one `MaintenanceSession`. `handle_control` verifies the signed
-    control frame then acts on it (open/close/resize/heartbeat/stdin); the BLE
-    bumble update_* frame types are NOT supported here (firmware updates stay on
-    the BLE path). `handle_input` carries raw keystrokes (the existing stdin
-    payload path) and resize control frames. `shutdown` tears the shell down on
-    disconnect.
+    Verifies signed control frames then acts on them (open/close/resize/
+    heartbeat/stdin); the BLE bumble update_* frame types are NOT supported here
+    (firmware updates stay on the BLE path). `handle_input` carries raw
+    keystrokes and resize frames. The PTY shells themselves live in a shared
+    `MaintenanceSessionRegistry` so they survive this connection dropping —
+    `shutdown` detaches (arming the orphan reap) rather than killing the shell.
     """
 
-    def __init__(self, emit: OutputEmitter, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    def __init__(
+        self,
+        emit: OutputEmitter,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        registry: Optional[MaintenanceSessionRegistry] = None,
+    ) -> None:
         self._emit = emit
         self._loop = loop or asyncio.get_event_loop()
+        # A shared registry keeps shells alive across reconnects; without one
+        # (older call sites / tests) fall back to a private per-connection
+        # registry so behaviour is still correct, just not cross-connection.
+        self._registry = registry or MaintenanceSessionRegistry(self._loop)
         self._session: Optional[MaintenanceSession] = None
+        self._session_id: str = "unknown"
 
-    def _ensure_session(self) -> MaintenanceSession:
-        if self._session is None:
-            self._session = MaintenanceSession(self._emit, self._loop)
-        return self._session
+    async def _bind_session(self, session_id: Optional[str]) -> MaintenanceSession:
+        sid = str(session_id) if session_id else self._session_id
+        self._session_id = sid
+        session, reattached = self._registry.attach(sid, self._emit)
+        self._session = session
+        if reattached:
+            await session.replay_recent()
+        return session
 
     async def _emit_error(self, message: str, frame_type: Optional[str] = None) -> None:
-        session_id = self._session.session_id if self._session else "unknown"
         frame = {
             "type": "error",
-            "session_id": session_id,
+            "session_id": self._session_id,
             "text": f"{message}\n",
             "reason": message,
         }
@@ -509,15 +649,14 @@ class MaintenanceHandler:
             await self._emit_error(str(e), frame_type or None)
             return
 
-        session = self._ensure_session()
-        if session_id:
-            session.session_id = str(session_id)
+        session = await self._bind_session(session_id)
 
         try:
             if frame_type == "open":
                 await session.open(str(session_id) if session_id else None)
             elif frame_type == "close":
-                await session.close("remote close requested")
+                await self._registry.close(self._session_id, "remote close requested")
+                self._session = None
             elif frame_type == "resize":
                 rows, cols = _frame_rows_cols(frame)
                 await session.resize(rows, cols)
@@ -561,7 +700,7 @@ class MaintenanceHandler:
             await self._emit_error(str(e), frame_type or None)
             return
 
-        session = self._ensure_session()
+        session = await self._bind_session(session_id)
         try:
             if frame_type == "resize":
                 rows, cols = _frame_rows_cols(frame)
@@ -578,9 +717,11 @@ class MaintenanceHandler:
             await self._emit_error(str(e), frame_type or None)
 
     async def shutdown(self) -> None:
-        if self._session is not None:
-            await self._session.close("connection closed")
-            self._session = None
+        """This connection dropped. Do NOT kill the shell — detach it so the
+        registry keeps it alive for a reconnect and reaps it only if orphaned."""
+        if self._session is not None and self._session_id != "unknown":
+            self._registry.detach(self._session_id)
+        self._session = None
 
 
 # --- frame field helpers ----------------------------------------------------
