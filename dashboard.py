@@ -5328,7 +5328,7 @@ def read_flow_meter():
                         status_ok = False
                         st = None
 
-                    if status_ok and abs(raw_flow_rate_l_per_s) < config.FLOW_STOPPED_THRESHOLD:
+                    if status_ok and abs(raw_flow_rate_l_per_s) < config.FLOW_METER_ZERO_THRESHOLD:
                         if consecutive_identical_raw == stale_threshold:
                             print("Flow meter identical idle data accepted with healthy IO-Link status", flush=True)
                             log_flow_control(

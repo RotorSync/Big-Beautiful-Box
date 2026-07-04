@@ -53,7 +53,13 @@ IOL_PORT = 2  # Flow meter on X1 (port 0)
 DATA_LENGTH = 15              # Expected data length from flow meter
 
 # Flow meter monitoring thresholds
-FLOW_STOPPED_THRESHOLD = 0.001       # L/s - flow is considered stopped below this
+FLOW_STOPPED_THRESHOLD = 0.25236     # L/s - 4 GPM: flow below this is not a fill event.
+#   The pump idles at 25-30 GPM and fills at ~80, so anything under 4 GPM is
+#   meter noise or a post-shutoff dribble - those were generating flow edges
+#   that overwrote the pending fill's window/stats (TR12 2026-07-04).
+FLOW_METER_ZERO_THRESHOLD = 0.001    # L/s - "effectively zero" for the stale-idle
+#   raw-frame acceptance ONLY. Do not raise: a frozen meter frame claiming a
+#   small nonzero flow must still be flagged stale, not accepted as idle.
 NEW_FILL_CYCLE_THRESHOLD = 0.630902  # L/s - 10 GPM; clear thumbs/pending fill above this
 NEW_FILL_CYCLE_HOLD_SECONDS = 3.0    # seconds - require sustained new-fill flow
 NEW_FILL_CYCLE_FRESH_GRACE_SECONDS = 0.25  # seconds - latest high-flow sample must be fresh/recent

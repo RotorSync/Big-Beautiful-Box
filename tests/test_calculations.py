@@ -78,8 +78,18 @@ class TestFlowThreshold:
 class TestFlowDetection:
     """Tests for flow state detection."""
 
-    def test_stopped_threshold_stays_near_zero(self):
-        assert config.FLOW_STOPPED_THRESHOLD < (1 / config.LITERS_PER_SEC_TO_GPM)
+    def test_stopped_threshold_is_4gpm_below_pump_idle(self):
+        # 4 GPM by design (2026-07-04): the pump idles at 25-30 GPM and fills
+        # at ~80, so sub-4-GPM readings are noise/post-shutoff dribbles and
+        # must not create flow events (they overwrote pending-fill windows).
+        gpm = config.FLOW_STOPPED_THRESHOLD * config.LITERS_PER_SEC_TO_GPM
+        assert abs(gpm - 4.0) < 0.01
+        assert gpm < 25  # stays well under pump idle so real flow always registers
+
+    def test_meter_zero_threshold_stays_near_zero(self):
+        # The stale-idle raw-frame acceptance must keep a true near-zero gate;
+        # a frozen frame claiming a small flow has to be flagged stale.
+        assert config.FLOW_METER_ZERO_THRESHOLD < (1 / config.LITERS_PER_SEC_TO_GPM)
 
     def test_new_fill_clear_threshold_is_10gpm_and_debounced(self):
         assert abs(config.NEW_FILL_CYCLE_THRESHOLD * config.LITERS_PER_SEC_TO_GPM - 10) < 0.001
