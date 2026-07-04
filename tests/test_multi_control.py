@@ -654,6 +654,15 @@ def test_live_telemetry_active_flow_notify_is_immediate_for_multipoint(bumble_mo
     )
 
 
+def test_negative_flow_counts_as_live_telemetry_activity(bumble_module):
+    assert bumble_module._state_live_telemetry_active({'flow_gpm': -6.5})
+    assert bumble_module._state_live_telemetry_active({
+        'flow_gpm': 0.0,
+        'flow_fault_active': True,
+    })
+    assert not bumble_module._state_live_telemetry_active({'flow_gpm': 0.0})
+
+
 def test_live_telemetry_active_flow_notify_is_throttled_for_pilot_priority(bumble_module):
     assert not bumble_module._live_telemetry_notify_due(
         controller_count=2,

@@ -294,7 +294,7 @@ def _pilot_priority_active(state=None):
     return (
         len(active_gatt_connections) > 1
         and _is_pilot_connected()
-        and _state_flow_gpm(state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+        and _state_live_telemetry_active(state)
     )
 
 
@@ -793,10 +793,24 @@ def _state_flow_gpm(state):
         return 0.0
 
 
+def _state_live_telemetry_active(state):
+    if not isinstance(state, dict):
+        return False
+    if bool(state.get('flow_fault_active')):
+        return True
+    if (
+        state.get('negative_totalizer_fault')
+        or state.get('negative_flow_fault')
+        or state.get('positive_drift_fault')
+    ):
+        return True
+    return abs(_state_flow_gpm(state)) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+
+
 def _state_notify_should_suppress_live_fields(controller_count, state):
     return (
         controller_count > 1
-        and _state_flow_gpm(state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+        and _state_live_telemetry_active(state)
     )
 
 
@@ -5726,25 +5740,19 @@ async def poll_live_telemetry(device, live_char):
         try:
             now = time.time()
             cached_state = dashboard_status.get('state') or {}
-            cached_flow = 0.0
-            if isinstance(cached_state, dict):
-                try:
-                    cached_flow = float(cached_state.get('flow_gpm', 0.0))
-                except (TypeError, ValueError):
-                    cached_flow = 0.0
             recent_client_read = (
                 now - last_live_telemetry_client_read_at
                 <= LIVE_TELEMETRY_FAST_READ_WINDOW
             )
             should_poll = (
                 active_gatt_connections
-                and (recent_client_read or cached_flow > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM)
+                and (recent_client_read or _state_live_telemetry_active(cached_state))
             )
             if should_poll:
                 updated = query_live_telemetry()
                 current_live_json = dashboard_status.get('live_json', '{}')
                 current_state = dashboard_status.get('state') or {}
-                flow_active = _state_flow_gpm(current_state) > LIVE_TELEMETRY_ACTIVE_FLOW_THRESHOLD_GPM
+                flow_active = _state_live_telemetry_active(current_state)
                 notify_due = _live_telemetry_notify_due(
                     len(active_gatt_connections),
                     now,

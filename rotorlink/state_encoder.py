@@ -14,8 +14,8 @@ If pilot state is ever needed for WiFi clients, bumble would have to publish it
 somewhere RotorLink can read.
 """
 
-import json
 import re
+import math
 
 
 def _put_if_present(target, key, value):
@@ -46,6 +46,38 @@ def _compact_curve_value(value):
     return text[:24]
 
 
+def _compact_fault_reason(value, limit=96):
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _float_if_finite(value, digits):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def _flow_fault_summary_from_state(state):
+    reason = _compact_fault_reason(state.get("flow_meter_fault_reason"))
+    if state.get("negative_totalizer_fault"):
+        return True, "negative_totalizer", reason or "Negative flow meter totalizer"
+    if state.get("negative_flow_fault"):
+        return True, "negative_flow", reason or "Negative flow meter"
+    if state.get("positive_drift_fault"):
+        return True, "positive_drift", reason or "Positive flow meter drift"
+    if state.get("flow_fault_active"):
+        return True, state.get("flow_fault_code") or "flow_meter", reason
+    if reason:
+        return True, state.get("flow_fault_code") or "flow_meter", reason
+    return False, None, None
+
+
 def encode_ble_state(state: dict, client_count: int = 1) -> dict:
     """Return the compact state dict (matches the BLE STATE payload shape)."""
     compact = {
@@ -68,6 +100,25 @@ def encode_ble_state(state: dict, client_count: int = 1) -> dict:
     # pilot / prio: BLE-only, intentionally omitted over WiFi (default false).
     _put_if_present(compact, "cc", _compact_curve_value(state.get("current_curve")))
     _put_if_present(compact, "pc", _compact_curve_value(state.get("pending_curve")))
+
+    negative_totalizer_fault = bool(state.get("negative_totalizer_fault"))
+    negative_flow_fault = bool(state.get("negative_flow_fault"))
+    positive_drift_fault = bool(state.get("positive_drift_fault"))
+    _put_bool_if_non_default(compact, "ntf", negative_totalizer_fault, False)
+    _put_bool_if_non_default(compact, "nff", negative_flow_fault, False)
+    _put_bool_if_non_default(compact, "pdf", positive_drift_fault, False)
+    if negative_totalizer_fault:
+        _put_if_present(compact, "ntg", _float_if_finite(state.get("negative_totalizer_gal"), 3))
+    if negative_flow_fault:
+        _put_if_present(compact, "nfg", _float_if_finite(state.get("negative_flow_gpm"), 2))
+    if positive_drift_fault:
+        _put_if_present(compact, "pdg", _float_if_finite(state.get("positive_drift_gal"), 3))
+        _put_if_present(compact, "pfg", _float_if_finite(state.get("positive_drift_flow_gpm"), 2))
+
+    flow_fault_active, flow_fault_code, flow_fault_reason = _flow_fault_summary_from_state(state)
+    _put_bool_if_non_default(compact, "ff", flow_fault_active, False)
+    _put_if_present(compact, "fc", flow_fault_code if flow_fault_active else None)
+    _put_if_present(compact, "fmr", flow_fault_reason if flow_fault_active else None)
     return compact
 
 

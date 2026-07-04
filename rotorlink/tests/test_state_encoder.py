@@ -49,6 +49,41 @@ eq("active compact", se.encode_ble_state(active, client_count=3), {
     # cc 'no pending' -> dropped; pc None -> dropped
 })
 
+positive_drift = dict(idle)
+positive_drift.update({
+    "actual_gal": 4.25,
+    "flow_gpm": 7.5,
+    "pump_stop_latched": True,
+    "positive_drift_fault": True,
+    "positive_drift_gal": 4.25,
+    "positive_drift_flow_gpm": 7.5,
+    "flow_meter_fault_reason": "FLOW METER DRIFT +4.2 GAL - GALLON RESET REQUIRED",
+})
+eq("positive drift fault compact", se.encode_ble_state(positive_drift, client_count=1), {
+    "ver": "V2.20", "req": 91.388, "act": 4.25, "flow": 7.5, "mode": "mix",
+    "bc": 1, "latch": True, "cc": "Factory", "pc": "+0.75",
+    "pdf": True, "pdg": 4.25, "pfg": 7.5,
+    "ff": True, "fc": "positive_drift",
+    "fmr": "FLOW METER DRIFT +4.2 GAL - GALLON RESET REQUIRED",
+})
+
+negative_flow = dict(idle)
+negative_flow.update({
+    "actual_gal": 99.152,
+    "flow_gpm": -10.45,
+    "pump_stop_latched": True,
+    "negative_flow_fault": True,
+    "negative_flow_gpm": -10.45,
+    "flow_meter_fault_reason": "NEGATIVE FLOW METER -10.4 GPM FOR 5S - GALLON RESET REQUIRED",
+})
+eq("negative flow fault compact", se.encode_ble_state(negative_flow, client_count=1), {
+    "ver": "V2.20", "req": 91.388, "act": 99.152, "flow": -10.45, "mode": "mix",
+    "bc": 1, "latch": True, "cc": "Factory", "pc": "+0.75",
+    "nff": True, "nfg": -10.45,
+    "ff": True, "fc": "negative_flow",
+    "fmr": "NEGATIVE FLOW METER -10.4 GPM FOR 5S - GALLON RESET REQUIRED",
+})
+
 # bc floor
 eq("bc floor at 1", se.encode_ble_state(idle, client_count=0)["bc"], 1)
 
