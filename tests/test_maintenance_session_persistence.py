@@ -65,6 +65,24 @@ def test_registry_reattach_keeps_same_session():
     asyncio.run(run())
 
 
+def test_same_connection_frames_do_not_replay():
+    async def run():
+        reg = MaintenanceSessionRegistry(asyncio.get_running_loop())
+        conn = _Sink()
+        # A connection binds ONE stable emit (the handler stores self._emit
+        # once). A repeat attach with that same object — e.g. the ~15s
+        # heartbeat — must NOT count as a reattach, else every heartbeat
+        # replays the whole screen.
+        emit = conn.emit
+        _s1, r1 = reg.attach("sess-1", emit)
+        assert r1 is False
+        _s2, r2 = reg.attach("sess-1", emit)
+        assert r2 is False
+        _s3, r3 = reg.attach("sess-1", emit)
+        assert r3 is False
+    asyncio.run(run())
+
+
 def test_shell_survives_reconnect_same_pid():
     async def run():
         reg = MaintenanceSessionRegistry(asyncio.get_running_loop())

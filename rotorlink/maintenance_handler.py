@@ -514,11 +514,17 @@ class MaintenanceSessionRegistry:
 
     def attach(self, session_id: str, emit: OutputEmitter) -> tuple:
         """Get-or-create the shell for session_id and bind its output to `emit`.
-        Returns (session, reattached) — reattached=True when an existing live
-        shell was resumed (caller should replay recent output)."""
+        Returns (session, reattached) — reattached=True ONLY when a DIFFERENT
+        connection resumed an existing shell (caller replays recent output).
+
+        A frame from the SAME connection (e.g. the ~15s heartbeat) must not
+        count as a reattach — otherwise every heartbeat would rebind and replay
+        the whole screen, flooding the terminal."""
         self._cancel_reap(session_id)
         session = self._sessions.get(session_id)
         if session is not None and not session._closing:
+            if session._emit is emit:
+                return session, False          # same connection, ordinary frame
             session.rebind_emit(emit)
             logger.info("maintenance session %s reattached", session_id)
             return session, True
