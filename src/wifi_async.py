@@ -49,8 +49,21 @@ class AsyncWifiControl:
         self._refresh_done = None  # Event for the in-flight refresh, if any
         self._connect_thread = None
         self._connect_ssid = ''
-        self._connect_started_at = 0.0
         self._last_connect_result = None
+
+    def _start_daemon(self, target, name, args=()):
+        """Start a daemon thread; None (never raises) if the OS refuses.
+
+        Thread creation can fail on a long-running Pi (thread/memory
+        exhaustion). Callers must treat failure as 'work not started' and
+        leave no state pointing at it -- a wedged Event here would freeze
+        WiFi status until a dashboard restart."""
+        thread = threading.Thread(target=target, args=args, daemon=True, name=name)
+        try:
+            thread.start()
+        except Exception:
+            return None
+        return thread
 
     # -- status -----------------------------------------------------------
 
@@ -92,11 +105,11 @@ class AsyncWifiControl:
                 return self._refresh_done
             done = threading.Event()
             self._refresh_done = done
-        thread = threading.Thread(
-            target=self._run_refresh, args=(done,), daemon=True,
-            name='wifi-status-refresh',
-        )
-        thread.start()
+        if self._start_daemon(self._run_refresh, 'wifi-status-refresh', (done,)) is None:
+            with self._lock:
+                if self._refresh_done is done:
+                    self._refresh_done = None
+            done.set()
         return done
 
     def _run_refresh(self, done):
@@ -125,17 +138,25 @@ class AsyncWifiControl:
                     'code': 'BUSY',
                     'message': f'Connect to {self._connect_ssid!r} already in progress',
                 }
-            self._connect_ssid = str(ssid or '')
-            self._connect_started_at = self._now()
+            self._connect_ssid = str(ssid or '').strip()
             self._last_connect_result = None
-            thread = threading.Thread(
-                target=self._run_connect,
-                args=(ssid, password, hidden),
-                daemon=True,
-                name='wifi-connect',
-            )
+        thread = self._start_daemon(
+            self._run_connect, 'wifi-connect', (ssid, password, hidden)
+        )
+        if thread is None:
+            with self._lock:
+                self._last_connect_result = {
+                    'ok': False,
+                    'code': 'THREAD_ERROR',
+                    'message': 'could not start connect worker',
+                }
+            return {
+                'ok': False,
+                'code': 'NMCLI_ERROR',
+                'message': 'could not start connect worker',
+            }
+        with self._lock:
             self._connect_thread = thread
-        thread.start()
         return {
             'ok': True,
             'code': 'ACCEPTED',
@@ -153,7 +174,18 @@ class AsyncWifiControl:
             result = {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
         with self._lock:
             self._last_connect_result = result
-        # The radio state just changed; refresh the cache so the next
-        # WIFI_STATUS poll reflects the attempt's outcome.
-        done = self._kick_or_join_refresh()
-        done.wait(10.0)
+        # The radio state just changed. Refresh the cache on a detached
+        # thread so BUSY clears as soon as nmcli returns, and make sure the
+        # sample lands AFTER any refresh that started before/during the
+        # connect (joining one of those would stamp pre-connect state as
+        # fresh for cache_fresh_seconds).
+        self._start_daemon(self._post_connect_refresh, 'wifi-post-connect-refresh')
+
+    def _post_connect_refresh(self):
+        with self._lock:
+            inflight = self._refresh_done
+        if inflight is not None:
+            inflight.wait(9.0)
+        with self._lock:
+            self._status_cache_at = 0.0
+        self._kick_or_join_refresh()

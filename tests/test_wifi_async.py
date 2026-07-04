@@ -166,3 +166,108 @@ def test_status_fn_exception_becomes_error_status():
     status = control.status()
     assert status['ok'] is False
     assert 'error' in status
+
+
+def test_refresh_does_not_wedge_when_thread_start_fails():
+    """A1 regression: if the OS refuses a refresh thread, _refresh_done must
+    not point at an Event nobody will ever set — status() must stay bounded
+    AND the next status() (threads available again) must recover."""
+    import src.wifi_async as wa
+
+    calls = []
+
+    def counting_status():
+        calls.append(1)
+        return {'ok': True, 'connected': True, 'ssid': 'Recovered'}
+
+    control = make_control(counting_status, lambda *a: {'ok': True},
+                           cache_fresh_seconds=0.0)  # every call refreshes
+
+    real_thread = wa.threading.Thread
+
+    class FailingThread:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    wa.threading.Thread = FailingThread
+    try:
+        started = time.monotonic()
+        status = control.status()
+        assert time.monotonic() - started < 1.0
+        assert status.get('pending') is True
+        assert calls == []
+    finally:
+        wa.threading.Thread = real_thread
+
+    # Threads available again: refresh must run (no wedged Event).
+    status = control.status()
+    assert calls, 'refresh permanently wedged after start() failure'
+    assert status.get('ssid') == 'Recovered'
+
+
+def test_connect_start_failure_reports_error_and_recovers():
+    import src.wifi_async as wa
+
+    control = make_control(
+        lambda: {'ok': True, 'connected': False, 'ssid': ''},
+        lambda *a: {'ok': True, 'code': 'OK'},
+    )
+    real_thread = wa.threading.Thread
+
+    class FailingThread:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    wa.threading.Thread = FailingThread
+    try:
+        result = control.request_connect('Shop', 'pw', False)
+        assert result['ok'] is False
+        assert control.status()['last_connect'] == {'ok': False, 'code': 'THREAD_ERROR'}
+    finally:
+        wa.threading.Thread = real_thread
+
+    assert control.request_connect('Shop', 'pw', False)['code'] == 'ACCEPTED'
+
+
+def test_post_connect_cache_reflects_post_connect_sample():
+    """A2 regression: a status refresh that started BEFORE the connect
+    finished must not be the sample the cache keeps afterwards — the cache
+    must end on a sample taken after nmcli returned."""
+    pre_gate = threading.Event()
+    samples = []
+
+    def phased_status():
+        if not samples:
+            samples.append('pre')
+            pre_gate.wait(5)
+            return {'ok': True, 'connected': False, 'ssid': 'PreConnect'}
+        samples.append('post')
+        return {'ok': True, 'connected': True, 'ssid': 'PostConnect'}
+
+    control = make_control(phased_status, lambda *a: {'ok': True, 'code': 'OK'},
+                           status_wait_seconds=0.1)
+
+    # Kick the pre-connect refresh (hangs on the gate).
+    control.status()
+    # Run a connect that finishes while that refresh is still in flight.
+    control.request_connect('Shop', 'pw', False)
+    time.sleep(0.3)
+    # Let the stale pre-connect sample land now.
+    pre_gate.set()
+
+    deadline = time.time() + 8
+    final = None
+    while time.time() < deadline:
+        final = control.status()
+        if final.get('ssid') == 'PostConnect':
+            break
+        time.sleep(0.1)
+    assert final.get('ssid') == 'PostConnect', (
+        f'cache stuck on pre-connect sample: {final}, samples={samples}'
+    )
