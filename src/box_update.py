@@ -23,6 +23,7 @@ backup so a bad package can never brick the box. Services restart out-of-band
 (systemd-run) so the process applying the update can restart itself.
 """
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -110,6 +111,23 @@ def _copy_path(src, dst) -> None:
     elif src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+def _path_owner(path):
+    stat = Path(path).stat()
+    return stat.st_uid, stat.st_gid
+
+
+def _chown_path_recursive(path, uid, gid) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    os.chown(path, uid, gid)
+    if path.is_dir():
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                with contextlib.suppress(OSError):
+                    os.chown(Path(root) / name, uid, gid)
 
 
 class BoxUpdateReceiver:
@@ -359,6 +377,21 @@ class BoxUpdateReceiver:
             if self._log:
                 self._log.warning("refresh /opt runtime failed: %s", e)
 
+    def _restore_repo_runtime_ownership(self, repo) -> None:
+        """Chown the applied runtime paths back to the repo's owner (the files
+        were written by the root rotorlink process). Mirrors bumble's BLE apply.
+        Best-effort: an ownership failure must not abort a good update."""
+        repo = Path(repo)
+        try:
+            uid, gid = _path_owner(repo)
+        except OSError as e:
+            if self._log:
+                self._log.warning("could not read repo owner for chown: %s", e)
+            return
+        for name in self.runtime_paths:
+            with contextlib.suppress(OSError):
+                _chown_path_recursive(repo / name, uid, gid)
+
     def _apply_tar(self, update_id: str, artifact_path) -> Path:
         extract_dir = Path(self.tmp_dir) / update_id
         if extract_dir.exists():
@@ -400,6 +433,10 @@ class BoxUpdateReceiver:
                 src = update_root / name
                 if src.exists():
                     _copy_path(src, repo / name)
+            # rotorlink runs as root, so the files just copied into the repo are
+            # root-owned; restore them to the repo's owner (pi) or the box's git
+            # tree becomes root-owned and every later `git pull`/reset fails.
+            self._restore_repo_runtime_ownership(repo)
             if self.refresh_opt:
                 self._refresh_opt_runtime(repo)
             subprocess.run(["systemctl", "daemon-reload"],
@@ -407,6 +444,7 @@ class BoxUpdateReceiver:
         except Exception as apply_error:
             try:
                 self._restore_runtime_backup(backup_dir)
+                self._restore_repo_runtime_ownership(repo)
                 if self.refresh_opt:
                     self._refresh_opt_runtime(repo)
             except Exception as rollback_error:
