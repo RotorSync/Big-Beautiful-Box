@@ -660,6 +660,36 @@ def _format_stop_to_thumb_field(seconds):
     return f" | StopToThumb: {seconds:.1f} s"
 
 
+def _is_fill_flow_continuation(
+    previous_pending_gallons,
+    previous_pending_requested,
+    previous_flow_started_at,
+    requested,
+    actual,
+    max_extra_gallons=2.0,
+):
+    """True when the flow segment that just ended is only a post-shutoff
+    dribble (or tiny top-off) of a fill ALREADY staged for thumbs-up: same
+    requested target, totalizer crept up by at most max_extra_gallons.
+
+    Such a segment must FOLD INTO the pending fill instead of replacing it -
+    replacing overwrote a real ~54s flow window (and shutoff type / FlowAtStop
+    / stop-to-thumb stats) with the dribble's 0-1s ones, which is exactly the
+    "FlowStart equals FlowEnd" corruption seen on TR12's loads (2026-07-04).
+    """
+    try:
+        previous_pending_gallons = float(previous_pending_gallons)
+        previous_flow_started_at = float(previous_flow_started_at)
+        delta = float(actual) - previous_pending_gallons
+    except (TypeError, ValueError):
+        return False
+    if previous_flow_started_at <= 0 or previous_pending_gallons <= 0:
+        return False
+    if previous_pending_requested != requested:
+        return False
+    return -0.001 <= delta <= max_extra_gallons
+
+
 def _format_flow_window_fields(start_epoch, end_epoch):
     """FlowStart/FlowEnd fields for a fill-history line.
 
@@ -7984,6 +8014,24 @@ def update_dashboard():
             last_pump_stop_relay_activated_at = 0.0
             recent_flow_rates_l_per_s.clear()
             _refresh_calibration_window()
+        elif _is_fill_flow_continuation(
+            pending_fill_gallons,
+            pending_fill_requested,
+            pending_fill_flow_started_at,
+            requested_gallons,
+            actual,
+        ):
+            # Post-shutoff dribble / tiny top-off of the staged fill: take the
+            # extra volume and extend the flow end, keep everything else from
+            # the real fill (window start, shutoff type, FlowAtStop,
+            # stop-to-thumb). See _is_fill_flow_continuation.
+            print(
+                "Fill dribble folded into pending fill - "
+                f"Actual: {actual:.3f} (+{actual - pending_fill_gallons:.3f} gal, "
+                "flow window kept)"
+            )
+            pending_fill_gallons = actual
+            pending_fill_flow_ended_at = now
         else:
             # Determine if shutoff was automatic or manual
             shutoff_type = "Auto" if auto_shutoff_latched else "Manual"
