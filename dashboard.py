@@ -137,6 +137,7 @@ flow_curve_metadata = {"source": "factory", "reason": "startup"}
 
 # Set up rotating loggers
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
+from src.wifi_async import AsyncWifiControl
 main_logger = get_main_logger()
 serial_logger = get_serial_logger()
 button_logger = get_button_logger()
@@ -5763,6 +5764,25 @@ def _wifi_connect(ssid, password, hidden=False):
         return {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
 
 
+# nmcli work (status ~8s worst case, connect up to ~31s) must never run
+# inline on the serial :9999 listener -- a pump command from another client
+# would queue behind it. Status is cached w/ bounded wait; connect runs on a
+# background thread and reports via WIFI_STATUS polls.
+_wifi_async = AsyncWifiControl(_wifi_status_snapshot, _wifi_connect)
+
+
+def _wifi_request_validation_error(ssid, password):
+    """Fast, radio-free validation (mirrors _wifi_connect's own checks) so
+    obviously-bad requests still fail synchronously like they always did."""
+    if not ssid:
+        return {'code': 'INVALID_SSID', 'message': 'Missing ssid'}
+    if len(ssid) > 64:
+        return {'code': 'INVALID_SSID', 'message': 'SSID too long'}
+    if len(password) > 128:
+        return {'code': 'INVALID_PASSWORD', 'message': 'Password too long'}
+    return None
+
+
 def _mouse_int(value, minimum, maximum, default=0):
     try:
         value = int(value)
@@ -6134,7 +6154,7 @@ def socket_command_listener():
     sock_server = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_STREAM)
     sock_server.setsockopt(sock_module.SOL_SOCKET, sock_module.SO_REUSEADDR, 1)
     sock_server.bind(("127.0.0.1", DASHBOARD_PORT))
-    sock_server.listen(1)
+    sock_server.listen(8)
     sock_server.settimeout(1.0)
 
     print(f"Socket listener started on port {DASHBOARD_PORT}")
@@ -6314,7 +6334,13 @@ def socket_command_listener():
                                     with open(debug_log, "a") as f:
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
-                                    result = _wifi_connect(ssid, password, hidden)
+                                    validation_error = _wifi_request_validation_error(
+                                        str(ssid or '').strip(), str(password or '')
+                                    )
+                                    if validation_error is not None:
+                                        client.send(f"WIFI_ERR:{json.dumps(validation_error, separators=(',', ':'))}\n".encode())
+                                        continue
+                                    result = _wifi_async.request_connect(ssid, password, hidden)
                                     if result.get('ok'):
                                         client.send(f"WIFI_OK:{json.dumps(result, separators=(',', ':'))}\n".encode())
                                     else:
@@ -6330,7 +6356,7 @@ def socket_command_listener():
                                     continue
 
                             elif line == "WIFI_STATUS":
-                                status = _wifi_status_snapshot()
+                                status = _wifi_async.status()
                                 client.send(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
                                 continue
 
