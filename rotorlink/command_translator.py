@@ -17,6 +17,8 @@ import json
 import math
 from typing import Optional
 
+from src.batchmix_payload import batchmix_validation_error
+
 
 def _bounded_int(value, minimum, maximum, default=0) -> int:
     try:
@@ -133,8 +135,12 @@ def translate(cmd: dict) -> Optional[str]:
 
     if command in ("set_batchmix", "batch_mix"):
         data = cmd.get("data")
-        if isinstance(data, dict):
-            return "BATCHMIX:" + json.dumps(data, separators=(",", ":"))
-        return None
+        # Validate exactly like the BLE path (rotorsync_bumble) before forwarding
+        # — an invalid BatchMix must be REJECTED here, not silently trusted by
+        # the dashboard. Returning None makes the server reply command_result
+        # ok=false so the app surfaces the rejection.
+        if not isinstance(data, dict) or batchmix_validation_error(data):
+            return None
+        return "BATCHMIX:" + json.dumps(data, separators=(",", ":"))
 
     return None

@@ -68,7 +68,15 @@ eq("cursor_key enter", t.translate({"cmd": "cursor_key", "key": "enter"}), 'MOUS
 eq("cursor_key invalid -> None", t.translate({"cmd": "cursor_key", "key": "q"}), None)
 
 # Batch mix
-eq("set_batchmix", t.translate({"cmd": "set_batchmix", "data": {"a": 1}}), 'BATCHMIX:{"a":1}')
+# A VALID BatchMix (matches the box contract) is forwarded; an invalid one is
+# REJECTED here (returns None) exactly like the BLE path validates before
+# forwarding — a malformed BatchMix must never be silently trusted over WiFi.
+eq("set_batchmix valid",
+   t.translate({"cmd": "set_batchmix",
+                "data": {"products": [{"name": "X", "amount_oz": 10}], "product_count": 1}}),
+   'BATCHMIX:{"products":[{"name":"X","amount_oz":10}],"product_count":1}')
+eq("set_batchmix invalid -> None",
+   t.translate({"cmd": "set_batchmix", "data": {"a": 1}}), None)
 eq("set_batchmix no data -> None", t.translate({"cmd": "set_batchmix"}), None)
 
 # Non-commands / junk
