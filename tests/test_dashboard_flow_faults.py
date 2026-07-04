@@ -46,6 +46,7 @@ def _dashboard_fault_namespace():
         "update_negative_flow_fault",
         "update_negative_totalizer_fault",
         "update_flow_meter_fault_hold",
+        "_flow_meter_fault_summary",
         "_build_dashboard_state_snapshot",
         "update_flow_rate_display",
     }
@@ -266,6 +267,8 @@ def test_state_snapshot_reports_flow_fault_fields():
     assert snapshot["flow_gpm"] == -1.25
     assert snapshot["negative_flow_fault"] is True
     assert snapshot["negative_flow_gpm"] == -1.25
+    assert snapshot["flow_fault_active"] is True
+    assert snapshot["flow_fault_code"] == "negative_flow"
     assert snapshot["flow_meter_fault_reason"] == ns["negative_flow_fault_reason"]
 
 

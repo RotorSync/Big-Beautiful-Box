@@ -449,8 +449,54 @@ def test_live_telemetry_payload_includes_requested_actual_and_flow(bumble_module
         'act': 12.346,
         'flow': 78.9,
         'rs': False,
+        'ff': False,
     }
-    assert len(json.dumps(payload, separators=(',', ':'))) < 60
+    assert len(json.dumps(payload, separators=(',', ':'))) < 70
+
+
+def test_state_payload_includes_active_flow_fault_summary(bumble_module):
+    payload = json.loads(bumble_module._encode_ble_state_payload({
+        'version': 'V2.30',
+        'requested_gal': 25.0,
+        'actual_gal': -1.25,
+        'flow_gpm': -0.5,
+        'mode': 'fill',
+        'negative_totalizer_fault': True,
+        'negative_totalizer_gal': -1.25,
+        'negative_flow_fault': True,
+        'negative_flow_gpm': -0.5,
+        'flow_meter_fault_reason': 'NEGATIVE FLOW METER - GALLON RESET REQUIRED',
+    }))
+
+    assert payload['ntf'] is True
+    assert payload['ntg'] == -1.25
+    assert payload['nff'] is True
+    assert payload['nfg'] == -0.5
+    assert payload['ff'] is True
+    assert payload['fc'] == 'negative_totalizer'
+    assert payload['fmr'] == 'NEGATIVE FLOW METER - GALLON RESET REQUIRED'
+
+
+def test_live_telemetry_payload_includes_active_flow_fault_summary(bumble_module):
+    payload = json.loads(bumble_module._encode_live_telemetry_payload(
+        10.0,
+        12.3456,
+        3.21,
+        False,
+        True,
+        'positive_drift',
+        'FLOW METER DRIFT - RESET REQUIRED',
+    ))
+
+    assert payload == {
+        'req': 10.0,
+        'act': 12.346,
+        'flow': 3.21,
+        'rs': False,
+        'ff': True,
+        'fc': 'positive_drift',
+        'fmr': 'FLOW METER DRIFT - RESET REQUIRED',
+    }
 
 
 def test_client_hello_marks_pilot_priority_state(bumble_module, monkeypatch):
@@ -532,7 +578,7 @@ def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monke
     monkeypatch.setattr(
         bumble_module,
         'send_dashboard_command',
-        lambda cmd: 'LIVE:{"req":12.0,"act":4.321,"flow":65.5}' if cmd == 'LIVE_TELEMETRY' else None,
+        lambda cmd: 'LIVE:{"req":12.0,"act":4.321,"flow":65.5,"ff":true,"fc":"positive_drift","fmr":"FLOW METER DRIFT"}' if cmd == 'LIVE_TELEMETRY' else None,
     )
 
     read_value = bumble_module.make_live_telemetry_read_handler()
@@ -543,9 +589,37 @@ def test_live_telemetry_read_queries_fresh_dashboard_values(bumble_module, monke
         'act': 4.321,
         'flow': 65.5,
         'rs': False,
+        'ff': True,
+        'fc': 'positive_drift',
+        'fmr': 'FLOW METER DRIFT',
     }
     assert bumble_module.dashboard_status['requested'] == 12.0
     assert bumble_module.dashboard_status['actual'] == 4.321
+
+
+def test_live_telemetry_read_clears_cached_flow_fault_summary(bumble_module, monkeypatch):
+    bumble_module.dashboard_status['state'] = {
+        'requested_gal': 12.0,
+        'actual_gal': -2.0,
+        'flow_gpm': -1.0,
+        'negative_totalizer_fault': True,
+        'negative_totalizer_gal': -2.0,
+        'flow_meter_fault_reason': 'NEGATIVE FLOW METER',
+    }
+    monkeypatch.setattr(
+        bumble_module,
+        'send_dashboard_command',
+        lambda cmd: 'LIVE:{"req":12.0,"act":0.0,"flow":0.0,"ff":false}' if cmd == 'LIVE_TELEMETRY' else None,
+    )
+
+    assert bumble_module.query_live_telemetry() is True
+
+    payload = json.loads(bumble_module.dashboard_status['live_json'])
+    assert payload['ff'] is False
+    state = bumble_module.dashboard_status['state']
+    assert state['flow_fault_active'] is False
+    assert state['negative_totalizer_fault'] is False
+    assert state['flow_meter_fault_reason'] == ''
 
 
 def test_live_telemetry_single_controller_notify_is_immediate(bumble_module):

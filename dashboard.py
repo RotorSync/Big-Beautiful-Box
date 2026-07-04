@@ -3004,6 +3004,25 @@ def _current_tank_calibration_profile_path(tank):
     return os.path.join(_mopeka_calibration_dir(), f"{profile_key}.csv")
 
 
+def _flow_meter_fault_summary():
+    reason = negative_totalizer_fault_reason or (
+        negative_flow_fault_reason or (
+            positive_drift_fault_reason or (
+                pump_stop_fault_hold_reason if pump_stop_fault_hold_active else ""
+            )
+        )
+    )
+    if negative_totalizer_fault_active:
+        return True, "negative_totalizer", reason
+    if negative_flow_fault_active:
+        return True, "negative_flow", reason
+    if positive_drift_fault_active:
+        return True, "positive_drift", reason
+    if reason:
+        return True, "flow_meter", reason
+    return False, "", ""
+
+
 def _build_dashboard_state_snapshot():
     """Build a compact state snapshot for BLE/iPad clients."""
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -3012,6 +3031,7 @@ def _build_dashboard_state_snapshot():
     switch_box_connected = bool(serial_connected and not heartbeat_disconnected)
     fill_pending = pending_fill_gallons > 0
     can_confirm_fill = bool(fill_pending and last_flow_rate < config.FLOW_STOPPED_THRESHOLD)
+    flow_fault_active, flow_fault_code, flow_fault_reason = _flow_meter_fault_summary()
 
     return {
         "version": VERSION,
@@ -3042,13 +3062,9 @@ def _build_dashboard_state_snapshot():
         "positive_drift_fault": bool(positive_drift_fault_active),
         "positive_drift_gal": round(positive_drift_gallons, 3),
         "positive_drift_flow_gpm": round(positive_drift_flow_gpm, 2),
-        "flow_meter_fault_reason": negative_totalizer_fault_reason or (
-            negative_flow_fault_reason or (
-                positive_drift_fault_reason or (
-                    pump_stop_fault_hold_reason if pump_stop_fault_hold_active else ""
-                )
-            )
-        ),
+        "flow_fault_active": bool(flow_fault_active),
+        "flow_fault_code": flow_fault_code,
+        "flow_meter_fault_reason": flow_fault_reason,
         "switch_box_connected": bool(switch_box_connected),
         "bms_soc": None if bms_soc is None else int(round(bms_soc)),
         "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
@@ -6181,12 +6197,18 @@ def socket_command_listener():
                             if line == "LIVE_TELEMETRY":
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
                                 flow_gpm = last_flow_rate * config.LITERS_PER_SEC_TO_GPM
+                                flow_fault_active, flow_fault_code, flow_fault_reason = _flow_meter_fault_summary()
                                 payload = {
                                     "req": round(requested_gallons, 3),
                                     "act": round(actual, 3),
                                     "flow": round(flow_gpm, 2),
                                     "rs": bool(relay_slowdown_alarm_active),
+                                    "ff": bool(flow_fault_active),
                                 }
+                                if flow_fault_active:
+                                    payload["fc"] = flow_fault_code
+                                    if flow_fault_reason:
+                                        payload["fmr"] = flow_fault_reason
                                 client.send(
                                     f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
                                 )

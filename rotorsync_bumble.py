@@ -654,6 +654,41 @@ def push_pilot_status_to_dashboard(force=False):
         send_dashboard_command(f'PILOT_DISCONNECTED:{_sanitize_pilot_name(previous)}')
 
 
+def _compact_fault_reason(value, limit=96):
+    text = str(value or '').replace('\n', ' ').replace('\r', ' ').strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _float_if_finite(value, digits):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def _flow_fault_summary_from_state(state):
+    if not isinstance(state, dict):
+        return False, None, None
+
+    reason = _compact_fault_reason(state.get('flow_meter_fault_reason'))
+    if state.get('negative_totalizer_fault'):
+        return True, 'negative_totalizer', reason or 'Negative flow meter totalizer'
+    if state.get('negative_flow_fault'):
+        return True, 'negative_flow', reason or 'Negative flow meter'
+    if state.get('positive_drift_fault'):
+        return True, 'positive_drift', reason or 'Positive flow meter drift'
+    if state.get('flow_fault_active'):
+        return True, state.get('flow_fault_code') or 'flow_meter', reason
+    if reason:
+        return True, state.get('flow_fault_code') or 'flow_meter', reason
+    return False, None, None
+
+
 def _encode_ble_state_payload(state):
     """Encode the dashboard snapshot into a compact BLE/iOS-friendly JSON payload."""
     def put_if_present(target, key, value):
@@ -702,16 +737,50 @@ def _encode_ble_state_payload(state):
     put_bool_if_non_default(compact, 'prio', _pilot_priority_active(state), False)
     put_if_present(compact, 'cc', compact_curve_value(state.get('current_curve')))
     put_if_present(compact, 'pc', compact_curve_value(state.get('pending_curve')))
+
+    negative_totalizer_fault = bool(state.get('negative_totalizer_fault'))
+    negative_flow_fault = bool(state.get('negative_flow_fault'))
+    positive_drift_fault = bool(state.get('positive_drift_fault'))
+    put_bool_if_non_default(compact, 'ntf', negative_totalizer_fault, False)
+    put_bool_if_non_default(compact, 'nff', negative_flow_fault, False)
+    put_bool_if_non_default(compact, 'pdf', positive_drift_fault, False)
+    if negative_totalizer_fault:
+        put_if_present(compact, 'ntg', _float_if_finite(state.get('negative_totalizer_gal'), 3))
+    if negative_flow_fault:
+        put_if_present(compact, 'nfg', _float_if_finite(state.get('negative_flow_gpm'), 2))
+    if positive_drift_fault:
+        put_if_present(compact, 'pdg', _float_if_finite(state.get('positive_drift_gal'), 3))
+        put_if_present(compact, 'pfg', _float_if_finite(state.get('positive_drift_flow_gpm'), 2))
+
+    flow_fault_active, flow_fault_code, flow_fault_reason = _flow_fault_summary_from_state(state)
+    put_bool_if_non_default(compact, 'ff', flow_fault_active, False)
+    put_if_present(compact, 'fc', flow_fault_code if flow_fault_active else None)
+    put_if_present(compact, 'fmr', flow_fault_reason if flow_fault_active else None)
     return json.dumps(compact, separators=(',', ':'))
 
 
-def _encode_live_telemetry_payload(requested, actual, flow, relay_slowdown_alarm=False):
+def _encode_live_telemetry_payload(
+    requested,
+    actual,
+    flow,
+    relay_slowdown_alarm=False,
+    flow_fault_active=False,
+    flow_fault_code=None,
+    flow_fault_reason=None,
+):
     payload = {
         'req': round(float(requested), 3),
         'act': round(float(actual), 3),
         'flow': round(float(flow), 2),
         'rs': bool(relay_slowdown_alarm),
+        'ff': bool(flow_fault_active),
     }
+    if flow_fault_active:
+        if flow_fault_code:
+            payload['fc'] = flow_fault_code
+        reason = _compact_fault_reason(flow_fault_reason)
+        if reason:
+            payload['fmr'] = reason
     return json.dumps(payload, separators=(',', ':'))
 
 
@@ -866,6 +935,7 @@ def query_dashboard_status():
         try:
             payload = response.split(':', 1)[1]
             state = json.loads(payload)
+            flow_fault_active, flow_fault_code, flow_fault_reason = _flow_fault_summary_from_state(state)
             dashboard_status['state'] = state
             dashboard_status['state_json'] = _encode_ble_state_payload(state)
             dashboard_status['live_json'] = _encode_live_telemetry_payload(
@@ -873,6 +943,9 @@ def query_dashboard_status():
                 state.get('actual_gal', 0.0),
                 state.get('flow_gpm', 0.0),
                 state.get('relay_slowdown_alarm', False),
+                flow_fault_active,
+                flow_fault_code,
+                flow_fault_reason,
             )
             dashboard_status['requested'] = float(state.get('requested_gal', 0.0))
             dashboard_status['actual'] = float(state.get('actual_gal', 0.0))
@@ -930,20 +1003,44 @@ def query_live_telemetry():
                     (dashboard_status.get('state') or {}).get('relay_slowdown_alarm', False),
                 )
             )
+            cached_state = dashboard_status.get('state') or {}
+            cached_fault_active, cached_fault_code, cached_fault_reason = _flow_fault_summary_from_state(cached_state)
+            live_has_flow_fault = 'ff' in live
+            flow_fault_active = bool(live.get('ff', cached_fault_active))
+            flow_fault_code = live.get('fc', cached_fault_code)
+            flow_fault_reason = live.get('fmr', cached_fault_reason)
+            if live_has_flow_fault and not flow_fault_active:
+                flow_fault_code = None
+                flow_fault_reason = None
             dashboard_status['requested'] = requested
             dashboard_status['actual'] = actual
-            state = dashboard_status.get('state') or {}
+            state = cached_state
             if isinstance(state, dict):
                 state['requested_gal'] = requested
                 state['actual_gal'] = actual
                 state['flow_gpm'] = flow
                 state['relay_slowdown_alarm'] = relay_slowdown_alarm
+                state['flow_fault_active'] = flow_fault_active
+                state['flow_fault_code'] = flow_fault_code
+                state['flow_meter_fault_reason'] = flow_fault_reason or ''
+                if live_has_flow_fault:
+                    state['negative_totalizer_fault'] = flow_fault_active and flow_fault_code == 'negative_totalizer'
+                    state['negative_flow_fault'] = flow_fault_active and flow_fault_code == 'negative_flow'
+                    state['positive_drift_fault'] = flow_fault_active and flow_fault_code == 'positive_drift'
+                    if not flow_fault_active:
+                        state['negative_totalizer_gal'] = 0.0
+                        state['negative_flow_gpm'] = 0.0
+                        state['positive_drift_gal'] = 0.0
+                        state['positive_drift_flow_gpm'] = 0.0
                 dashboard_status['state'] = state
             dashboard_status['live_json'] = _encode_live_telemetry_payload(
                 requested,
                 actual,
                 flow,
                 relay_slowdown_alarm,
+                flow_fault_active,
+                flow_fault_code,
+                flow_fault_reason,
             )
             dashboard_status['last_update'] = time.time()
             return True
@@ -954,11 +1051,15 @@ def query_live_telemetry():
     requested = state.get('requested_gal', dashboard_status.get('requested', 0.0))
     actual = state.get('actual_gal', dashboard_status.get('actual', 0.0))
     flow = state.get('flow_gpm', 0.0)
+    flow_fault_active, flow_fault_code, flow_fault_reason = _flow_fault_summary_from_state(state)
     dashboard_status['live_json'] = _encode_live_telemetry_payload(
         requested,
         actual,
         flow,
         state.get('relay_slowdown_alarm', False) if isinstance(state, dict) else False,
+        flow_fault_active,
+        flow_fault_code,
+        flow_fault_reason,
     )
     return False
 
