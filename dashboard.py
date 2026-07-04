@@ -1708,12 +1708,14 @@ def _format_batch_mix_product_amount(ounces):
     else:
         oz_text = f"{remainder_ounces:.2f}"
 
+    decimal_gallons = total_ounces / 128
+    decimal_gallons_text = f"({decimal_gallons:.2f}g)"
+
     if whole_gallons and remainder_ounces:
-        decimal_gallons = total_ounces / 128
-        return f"{whole_gallons} gal {oz_text} oz({decimal_gallons:.1f}g)"
+        return f"{whole_gallons} gal {oz_text} oz{decimal_gallons_text}"
     if whole_gallons:
-        return f"{whole_gallons} gal"
-    return f"{oz_text} oz"
+        return f"{whole_gallons} gal{decimal_gallons_text}"
+    return f"{oz_text} oz{decimal_gallons_text}"
 
 def _format_batch_mix_product_display_amount(prod):
     """Format the product amount from the BatchMix payload."""
