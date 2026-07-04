@@ -292,15 +292,33 @@ class BoxUpdateReceiver:
         self._schedule_service_restart()
 
     # --- validate + apply --------------------------------------------------
+    def _runtime_members(self, members):
+        """The archive members under the runtime paths we actually install.
+
+        A GitHub tarball is the WHOLE repo — including assets we never apply
+        (e.g. web-sim/ holds a symlink). We only install the runtime paths, so
+        we only validate + extract those: unrelated repo content (symlinks and
+        all) is ignored instead of failing the whole update."""
+        result = []
+        for member in members:
+            parts = Path(member.name).parts
+            # Tolerate an optional single top-level dir (GitHub prefixes the tar
+            # with e.g. "Big-Beautiful-Box-master/").
+            rel = parts[1:] if len(parts) >= 2 else parts
+            if rel and rel[0] in self.runtime_paths:
+                result.append(member)
+        return result
+
     def _validate_archive(self, artifact_path) -> None:
         if not tarfile.is_tarfile(artifact_path):
             raise ValueError("update artifact is not a tar archive")
         with tarfile.open(artifact_path) as archive:
             members = archive.getmembers()
-            for member in members:
-                _validate_tar_member(member)
             if not _tar_contains_bbb_snapshot(members):
                 raise ValueError("update tar does not look like a BBB repo snapshot")
+            # Only the members we will extract/install must be safe.
+            for member in self._runtime_members(members):
+                _validate_tar_member(member)
 
     def _backup_current_runtime(self, update_id: str) -> Path:
         backup_dir = Path(self.update_dir) / update_id / "backup"
@@ -348,9 +366,12 @@ class BoxUpdateReceiver:
         extract_dir.mkdir(parents=True, exist_ok=True)
 
         with tarfile.open(artifact_path) as archive:
-            for member in archive.getmembers():
+            runtime_members = self._runtime_members(archive.getmembers())
+            for member in runtime_members:
                 _validate_tar_member(member)
-            archive.extractall(extract_dir)
+            # Extract only the runtime paths we install — never touch unrelated
+            # repo assets (web-sim symlink, etc.).
+            archive.extractall(extract_dir, members=runtime_members)
 
         update_root = _find_extracted_update_root(extract_dir)
         for required in ("dashboard.py", "rotorsync_bumble.py", "src"):

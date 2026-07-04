@@ -107,6 +107,34 @@ def test_streamed_update_applies_in_place(tmp_path, _mock_subprocess):
     assert any("update_applied" == f.get("type") for kind, f in events if kind == "status")
 
 
+def test_symlink_outside_runtime_paths_is_ignored(tmp_path, _mock_subprocess):
+    """A GitHub tarball is the whole repo, including a symlink under web-sim/ we
+    never install. It must not fail the update (regression: real field update
+    tripped on Big-Beautiful-Box-master/web-sim/thumbs_up.png)."""
+    _seed_repo(tmp_path, "V1.00")
+    root = "RotorSync-Big-Beautiful-Box-abc123"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        def add(name, data: bytes):
+            info = tarfile.TarInfo(f"{root}/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        add("dashboard.py", b"print('v')\n")
+        add("rotorsync_bumble.py", b"# b\n")
+        add("src/__init__.py", b"")
+        add("VERSION", b"V9.99\n")
+        # a symlink in a non-runtime asset dir
+        link = tarfile.TarInfo(f"{root}/web-sim/thumbs_up.png")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../assets/thumb.png"
+        tar.addfile(link)
+    tarball = buf.getvalue()
+    rx, _ = _receiver(tmp_path)
+    _stream(rx, tarball)
+    rx.handle_apply({"update_id": "upd-1"})
+    assert (tmp_path / "repo" / "VERSION").read_text().strip() == "V9.99"
+
+
 def test_sha_mismatch_rejected_at_finalize(tmp_path):
     _seed_repo(tmp_path)
     rx, _ = _receiver(tmp_path)
