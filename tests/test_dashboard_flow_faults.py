@@ -304,6 +304,10 @@ def test_batchmix_liquid_amount_formatter_adds_decimal_gallons():
     ns = _dashboard_fault_namespace()
 
     assert ns["_format_batch_mix_product_amount"](34 * 128 + 11.83) == (
-        "34 gal 11.83 oz(34.1g)"
+        "34 gal 11.83 oz(34.09g)"
     )
-    assert ns["_format_batch_mix_product_amount"](34.09) == "34.09 oz"
+    assert ns["_format_batch_mix_product_amount"](5 * 128 + 84.48) == (
+        "5 gal 84.48 oz(5.66g)"
+    )
+    assert ns["_format_batch_mix_product_amount"](34.09) == "34.09 oz(0.27g)"
+    assert ns["_format_batch_mix_product_amount"](128) == "1 gal(1.00g)"
