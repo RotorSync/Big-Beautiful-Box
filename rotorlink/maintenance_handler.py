@@ -54,7 +54,15 @@ from collections import deque
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional
 
+from src.box_update import BoxUpdateReceiver
+
 logger = logging.getLogger("rotorlink.maintenance")
+
+# Software-update frame types that ride the maintenance channel (streamed
+# BBB tarball the iPad supplies; the box has no internet of its own).
+_UPDATE_FRAME_TYPES = frozenset(
+    {"update_begin", "update_chunk", "update_finalize", "update_apply", "update_status"}
+)
 
 # How long a maintenance PTY shell survives after its WebSocket drops, waiting
 # for the client to reconnect and reattach. On a no-internet trailer AP iOS
@@ -610,6 +618,49 @@ class MaintenanceHandler:
         self._registry = registry or MaintenanceSessionRegistry(self._loop)
         self._session: Optional[MaintenanceSession] = None
         self._session_id: str = "unknown"
+        # Lazily-created streamed-update receiver + a buffer its (sync) emit
+        # callbacks append to, drained to the WebSocket after each frame.
+        self._box_update: Optional[BoxUpdateReceiver] = None
+        self._update_emits: list = []
+
+    def _ensure_box_update(self) -> "BoxUpdateReceiver":
+        if self._box_update is None:
+            self._box_update = BoxUpdateReceiver(
+                emit_ack=self._update_emits.append,
+                emit_status=self._update_emits.append,
+                logger=logger,
+            )
+        return self._box_update
+
+    async def _drain_update_emits(self) -> None:
+        # Drain in place — the receiver's emit callbacks are bound to THIS list
+        # object's append, so it must never be reassigned.
+        frames = self._update_emits[:]
+        self._update_emits.clear()
+        for frame in frames:
+            with contextlib.suppress(Exception):
+                await self._emit(frame)
+
+    async def _handle_update_frame(self, frame_type: str, frame: dict) -> None:
+        rx = self._ensure_box_update()
+        try:
+            if frame_type == "update_begin":
+                rx.handle_begin(frame)
+            elif frame_type == "update_chunk":
+                rx.handle_chunk(frame)
+            elif frame_type == "update_finalize":
+                rx.handle_finalize(frame)
+            elif frame_type == "update_status":
+                rx.handle_status(frame)
+            elif frame_type == "update_apply":
+                # Blocking (tar extract, compile-gate, copy, systemctl) — run
+                # off the event loop so state/other clients aren't stalled.
+                await self._drain_update_emits()  # flush "applying" ordering
+                await self._loop.run_in_executor(None, rx.handle_apply, frame)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("box update %s error: %s", frame_type, e)
+            await self._emit_error(str(e), frame_type)
+        await self._drain_update_emits()
 
     async def _bind_session(self, session_id: Optional[str]) -> MaintenanceSession:
         sid = str(session_id) if session_id else self._session_id
@@ -653,6 +704,15 @@ class MaintenanceHandler:
         except Exception as e:  # noqa: BLE001
             logger.info("maintenance control signature rejected: %s", e)
             await self._emit_error(str(e), frame_type or None)
+            return
+
+        # Software-update frames ride the (signature-verified) maintenance
+        # channel, exactly like the BLE server — the iPad streams a BBB repo
+        # tarball it fetched over cellular and the box applies it, so a field
+        # update works with NO box internet. Handled before the PTY-session
+        # binding since updates don't need a shell.
+        if frame_type in _UPDATE_FRAME_TYPES:
+            await self._handle_update_frame(frame_type, frame)
             return
 
         session = await self._bind_session(session_id)
