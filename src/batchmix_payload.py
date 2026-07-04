@@ -3,6 +3,15 @@
 import copy
 
 
+LIQUID_RATE_UNIT_OZ_MULTIPLIERS = {
+    "oz/ac": 1.0,
+    "pt/ac": 16.0,
+    "qt/ac": 32.0,
+    "gal/ac": 128.0,
+}
+LIQUID_RATE_UNIT_TEXT = "one of oz/ac, pt/ac, qt/ac, gal/ac"
+
+
 def is_hex_color(value):
     """Return True for #RRGGBB color strings."""
     if not isinstance(value, str) or len(value) != 7 or not value.startswith("#"):
@@ -21,6 +30,26 @@ def parse_field_color(value):
             return ("stripe", first, second)
 
     return None
+
+
+def _normalized_rate_unit(value):
+    if not isinstance(value, str):
+        return None
+    return value.strip().lower()
+
+
+def _rate_unit_error(amount_key):
+    if amount_key == "amount_oz":
+        return f"rate_unit must be {LIQUID_RATE_UNIT_TEXT}"
+    return "rate_unit must be lb/ac"
+
+
+def _rate_unit_matches_amount(amount_key, rate_unit):
+    if amount_key == "amount_oz":
+        return rate_unit in LIQUID_RATE_UNIT_OZ_MULTIPLIERS
+    if amount_key == "amount_lb":
+        return rate_unit == "lb/ac"
+    return False
 
 
 def batchmix_validation_error(data):
@@ -75,9 +104,9 @@ def batchmix_validation_error(data):
             if not isinstance(rate_unit, str):
                 return f"Product {index} rate_unit must be a string"
 
-            expected_rate_unit = "oz/ac" if amount_key == "amount_oz" else "lb/ac"
-            if rate_unit.strip() != expected_rate_unit:
-                return f"Product {index} rate_unit must be {expected_rate_unit}"
+            normalized_rate_unit = _normalized_rate_unit(rate_unit)
+            if not _rate_unit_matches_amount(amount_key, normalized_rate_unit):
+                return f"Product {index} {_rate_unit_error(amount_key)}"
 
     field_colors = data.get("field_colors", [])
     if field_colors is None:
@@ -132,11 +161,11 @@ def _recalculate_product_amount_from_rate(product, total_acres):
         return False
 
     rate = _positive_float(product.get("rate_per_acre"), "rate_per_acre")
-    rate_unit = product.get("rate_unit")
-    if isinstance(rate_unit, str):
-        rate_unit = rate_unit.strip()
-    if "amount_oz" in product and rate_unit == "oz/ac":
-        product["amount_oz"] = rate * total_acres
+    rate_unit = _normalized_rate_unit(product.get("rate_unit"))
+    if "amount_oz" in product and rate_unit in LIQUID_RATE_UNIT_OZ_MULTIPLIERS:
+        product["amount_oz"] = (
+            rate * LIQUID_RATE_UNIT_OZ_MULTIPLIERS[rate_unit] * total_acres
+        )
         return True
     if "amount_lb" in product and rate_unit == "lb/ac":
         product["amount_lb"] = rate * total_acres

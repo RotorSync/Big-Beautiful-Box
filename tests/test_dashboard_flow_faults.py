@@ -49,6 +49,8 @@ def _dashboard_fault_namespace():
         "_flow_meter_fault_summary",
         "_build_dashboard_state_snapshot",
         "update_flow_rate_display",
+        "_format_batch_mix_product_amount",
+        "_format_batch_mix_product_rate",
     }
     module = ast.Module(
         body=[
@@ -283,3 +285,25 @@ def test_negative_flow_footer_draws_signed_red_text():
     _, _args, kwargs = text_calls[-1]
     assert kwargs["text"] == "Flow:\n-2.5 GPM"
     assert kwargs["fill"] == "red"
+
+
+def test_batchmix_rate_formatter_preserves_liquid_display_units():
+    ns = _dashboard_fault_namespace()
+
+    assert ns["_format_batch_mix_product_rate"]({
+        "rate_per_acre": 1,
+        "rate_unit": "gal/ac",
+    }) == "1gal/ac"
+    assert ns["_format_batch_mix_product_rate"]({
+        "rate_per_acre": 2.5,
+        "rate_unit": "qt/ac",
+    }) == "2.5qt/ac"
+
+
+def test_batchmix_liquid_amount_formatter_adds_decimal_gallons():
+    ns = _dashboard_fault_namespace()
+
+    assert ns["_format_batch_mix_product_amount"](34 * 128 + 11.83) == (
+        "34 gal 11.83 oz(34.1g)"
+    )
+    assert ns["_format_batch_mix_product_amount"](34.09) == "34.09 oz"

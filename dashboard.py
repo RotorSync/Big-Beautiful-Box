@@ -1533,8 +1533,8 @@ def refresh_batch_mix_tank_levels():
                           fill="#ff0000", anchor="ne", tags="batchmix_tanks")
         return
 
-    front_text = f"Front: {mopeka1_gallons:.0f} gal"
-    back_text = f"Back: {mopeka2_gallons:.0f} gal"
+    front_text = f"Front: {mopeka1_gallons:.0f}"
+    back_text = f"Back: {mopeka2_gallons:.0f}"
     canvas.create_text(x - 220, y, text=front_text, font=font,
                       fill=_mopeka_quality_color(mopeka1_quality),
                       anchor="ne", tags="batchmix_tanks")
@@ -1709,7 +1709,8 @@ def _format_batch_mix_product_amount(ounces):
         oz_text = f"{remainder_ounces:.2f}"
 
     if whole_gallons and remainder_ounces:
-        return f"{whole_gallons} gal {oz_text} oz"
+        decimal_gallons = total_ounces / 128
+        return f"{whole_gallons} gal {oz_text} oz({decimal_gallons:.1f}g)"
     if whole_gallons:
         return f"{whole_gallons} gal"
     return f"{oz_text} oz"
@@ -1742,8 +1743,8 @@ def _format_batch_mix_product_rate(prod):
     if not isinstance(rate_unit, str):
         return ""
 
-    rate_unit = rate_unit.strip()
-    if rate_unit not in ("oz/ac", "lb/ac"):
+    rate_unit = rate_unit.strip().lower()
+    if rate_unit not in ("oz/ac", "pt/ac", "qt/ac", "gal/ac", "lb/ac"):
         return ""
 
     if rate == int(rate):
@@ -1969,7 +1970,7 @@ def refresh_batch_mix_products():
         amount_text = _format_batch_mix_product_display_amount(prod)
         max_amount_width = (products_x_end - products_x_start) // 2 - 20
         amount_font_size = 44
-        while amount_font_size >= 30:
+        while amount_font_size >= 22:
             test_id = canvas.create_text(0, 0, text=amount_text,
                                         font=("Helvetica", amount_font_size, "bold"),
                                         anchor="e", tags="temp_measure")
@@ -7575,13 +7576,13 @@ def update_mopeka_display():
     
     # Front tank - top right
     color1 = _mopeka_quality_color(mopeka1_quality)
-    label1 = f"Front: {mopeka1_gallons:.0f} gal"
+    label1 = f"Front: {mopeka1_gallons:.0f}"
     canvas.create_text(x, 40, text=label1, font=font,
                       fill=color1, anchor="ne", tags="mopeka_display")
     
     # Back tank - below front
     color2 = _mopeka_quality_color(mopeka2_quality)
-    label2 = f"Back: {mopeka2_gallons:.0f} gal"
+    label2 = f"Back: {mopeka2_gallons:.0f}"
     canvas.create_text(x, 110, text=label2, font=font,
                       fill=color2, anchor="ne", tags="mopeka_display")
 

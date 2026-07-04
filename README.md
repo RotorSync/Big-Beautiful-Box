@@ -113,7 +113,7 @@ Liquid product amounts are sent in ounces only. Each liquid product entry should
 include `amount_oz`; do not send jug count or jug-size fields for liquid
 products. Dry products use `amount_lb`. Product rate fields are optional, but
 when sent they must include both `rate_per_acre` and `rate_unit`. Liquid rates
-use `oz/ac`; dry rates use `lb/ac`.
+can use `oz/ac`, `pt/ac`, `qt/ac`, or `gal/ac`; dry rates use `lb/ac`.
 
 Product row colors are sent in the parallel `field_colors` list, using either
 solid `#RRGGBB` strings or two-color striped `#RRGGBB/#RRGGBB` strings. The
@@ -123,9 +123,10 @@ present, the badge shows `NO COLOR MIX` with white/gray striping.
 When this BatchMix screen is active, knob adjustments change `water_needed`.
 The box scales `total_acres`, product amounts, and `total_liquid` from that
 gallon change. If a product includes rate fields, its amount is recalculated
-from `rate_per_acre * total_acres`; otherwise the older proportional amount
-scaling is used. `gallons_per_acre` remains unchanged, and `water_needed`
-remains the pump target.
+from `rate_per_acre * total_acres` for dry products or
+`rate_per_acre * liquid-ounce-multiplier * total_acres` for liquid products;
+otherwise the older proportional amount scaling is used. `gallons_per_acre`
+remains unchanged, and `water_needed` remains the pump target.
 
 ```json
 {
