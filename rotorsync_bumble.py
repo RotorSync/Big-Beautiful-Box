@@ -9,10 +9,12 @@ Exposes requested/actual gallons from dashboard
 """
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import csv
 import ctypes
 import ctypes.util
+import functools
 import hashlib
 import hmac
 import io
@@ -429,6 +431,51 @@ class _Timex(ctypes.Structure):
     ]
 
 
+GATT_RELAXED_CONN_INTERVAL_MIN_MS = 30.0
+GATT_RELAXED_CONN_INTERVAL_MAX_MS = 45.0
+GATT_RELAXED_CONN_LATENCY = 0
+GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS = 5000.0
+GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 2.0
+
+
+async def relax_gatt_connection_parameters(connection, peer):
+    """Ask the central for relaxed connection parameters shortly after connect.
+
+    iOS defaults to a ~15ms connection interval and a 2s supervision timeout
+    per link. On the single-radio GATT dongle that leaves little airtime once
+    a second controller tries to join: new links die sub-second (connect/
+    disconnect churn) and existing links can co-drop (seen on TR2 while a
+    phone and an iPad competed). Longer intervals plus a 5s supervision
+    timeout give the radio room to run two links and keep advertising.
+    Best effort via L2CAP parameter update request: the central may reject,
+    and any failure is logged and ignored."""
+    await asyncio.sleep(GATT_RELAX_CONN_PARAMS_DELAY_SECONDS)
+    if peer not in active_gatt_connections:
+        return
+    update = getattr(connection, 'update_parameters', None)
+    if update is None:
+        return
+    try:
+        await update(
+            GATT_RELAXED_CONN_INTERVAL_MIN_MS,
+            GATT_RELAXED_CONN_INTERVAL_MAX_MS,
+            GATT_RELAXED_CONN_LATENCY,
+            GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS,
+            use_l2cap=True,
+        )
+        print(
+            f'Requested relaxed connection parameters for {peer} '
+            f'(30-45ms interval, 5s supervision timeout)',
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f'Connection parameter relax for {peer} failed: '
+            f'{type(e).__name__}: {e}',
+            flush=True,
+        )
+
+
 def _kernel_clock_is_synchronized():
     """True if the kernel considers the system clock NTP-synchronized.
 
@@ -580,8 +627,8 @@ def _record_client_hello(connection, command):
         f'pilot_connected={_is_pilot_connected()}',
         flush=True,
     )
-    query_dashboard_status()
-    push_pilot_status_to_dashboard()
+    submit_dashboard_io(query_dashboard_status)
+    submit_dashboard_io(push_pilot_status_to_dashboard)
 
 
 def _record_client_loc(connection, value):
@@ -610,7 +657,7 @@ def _record_client_loc(connection, value):
         parts = f"{lat},{lon}"
         if 'acc' in loc:
             parts += f",{loc['acc']}"
-        send_dashboard_command(f'PILOT_LOC:{parts}')
+        submit_dashboard_io(send_dashboard_command, f'PILOT_LOC:{parts}')
 
 
 _last_pushed_pilot_name = None
@@ -620,7 +667,7 @@ def _current_pilot_name():
     """Name of the connected client whose role is 'pilot' (most recent), or None."""
     best_name = None
     best_seen = -1.0
-    for connection_key in active_gatt_connections:
+    for connection_key in list(active_gatt_connections):
         metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
         if _normalize_client_role(metadata.get('role')) != 'pilot':
             continue
@@ -901,6 +948,35 @@ def _enqueue_cursor_command(connection, source, action, **payload):
     )
 
 
+# Dashboard socket I/O runs on this single worker thread so a slow or stuck
+# dashboard can never stall the Bumble event loop (a stalled loop freezes BLE
+# for every connected pilot: notifications, hellos, commands). One worker
+# thread keeps dashboard commands in their original order.
+_DASHBOARD_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix='dashboard-io'
+)
+
+
+def submit_dashboard_io(fn, *args):
+    """Run a dashboard-socket call on the I/O worker without waiting for it."""
+    def _run():
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f'Dashboard I/O worker error: {type(e).__name__}: {e}', flush=True)
+    try:
+        _DASHBOARD_IO_EXECUTOR.submit(_run)
+    except RuntimeError:
+        pass
+
+
+async def run_dashboard_io(fn, *args):
+    """Await a dashboard-socket call on the I/O worker from the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _DASHBOARD_IO_EXECUTOR, functools.partial(fn, *args)
+    )
+
+
 def send_dashboard_command(cmd):
     """Send command to dashboard via socket"""
     global dashboard_ready, last_dashboard_error_log, last_dashboard_error_message
@@ -927,7 +1003,7 @@ def send_dashboard_command(cmd):
 async def wait_for_dashboard_ready(timeout=STARTUP_DASHBOARD_WAIT_SECONDS):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if query_dashboard_status():
+        if await run_dashboard_io(query_dashboard_status):
             return True
         await asyncio.sleep(STARTUP_DASHBOARD_RETRY_INTERVAL)
     return False
@@ -1867,7 +1943,7 @@ def install_gatt_advertising_resume_hook(
             user_id=departed_metadata.get('user_id'),
             device=departed_metadata.get('device'),
         )
-        push_pilot_status_to_dashboard()
+        submit_dashboard_io(push_pilot_status_to_dashboard)
         if active_gatt_connections:
             print(
                 'GATT advertising left untouched; anchor controller remains',
@@ -1922,6 +1998,10 @@ def install_gatt_advertising_resume_hook(
             disconnect_unknown_gatt_client_if_no_hello(connection, peer, now)
         )
         hello_deadline_task.add_done_callback(_handle_background_task_done)
+        relax_params_task = asyncio.create_task(
+            relax_gatt_connection_parameters(connection, peer)
+        )
+        relax_params_task.add_done_callback(_handle_background_task_done)
         if hasattr(connection, 'on'):
             connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
         else:
@@ -2137,7 +2217,7 @@ async def control_command_worker():
     while True:
         item = await control_command_queue.get()
         try:
-            _run_control_command(item)
+            await run_dashboard_io(_run_control_command, item)
         except Exception as e:
             print(
                 f'Control command #{item.get("seq", "?")} error: '
@@ -3595,17 +3675,17 @@ def _send_validated_batchmix(compact_json):
     except json.JSONDecodeError as je:
         error_msg = f'Invalid JSON: {je}'
         print(f'BatchMix ERROR: {error_msg}', flush=True)
-        send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+        submit_dashboard_io(send_dashboard_command, f'BATCHMIX_ERROR:{error_msg}')
         return False
 
     error_msg = batchmix_validation_error(data)
     if error_msg:
         print(f'BatchMix ERROR: {error_msg}', flush=True)
-        send_dashboard_command(f'BATCHMIX_ERROR:{error_msg}')
+        submit_dashboard_io(send_dashboard_command, f'BATCHMIX_ERROR:{error_msg}')
         return False
 
     print(f'BatchMix validated: {len(data.get("products", []))} products', flush=True)
-    send_dashboard_command(f'BATCHMIX:{compact_json}')
+    submit_dashboard_io(send_dashboard_command, f'BATCHMIX:{compact_json}')
     return True
 
 def batchmix_write_handler(connection, value):
@@ -5689,7 +5769,7 @@ async def poll_dashboard_status(device, state_char):
     )
     while True:
         try:
-            updated = query_dashboard_status()
+            updated = await run_dashboard_io(query_dashboard_status)
             current_state_json = dashboard_status.get('state_json', '{}')
             current_state = dashboard_status.get('state') or {}
             suppress_live_fields = _state_notify_should_suppress_live_fields(
@@ -5709,7 +5789,7 @@ async def poll_dashboard_status(device, state_char):
             # Poll history less often than live state; it only changes after fills.
             poll_count += 1
             if poll_count >= STATUS_HISTORY_POLL_CYCLES:
-                query_fill_history()
+                await run_dashboard_io(query_fill_history)
                 poll_count = 0
         except Exception as e:
             print(f'Status poll error: {e}', flush=True)
@@ -5749,7 +5829,7 @@ async def poll_live_telemetry(device, live_char):
                 and (recent_client_read or _state_live_telemetry_active(cached_state))
             )
             if should_poll:
-                updated = query_live_telemetry()
+                updated = await run_dashboard_io(query_live_telemetry)
                 current_live_json = dashboard_status.get('live_json', '{}')
                 current_state = dashboard_status.get('state') or {}
                 flow_active = _state_live_telemetry_active(current_state)
@@ -5770,6 +5850,28 @@ async def poll_live_telemetry(device, live_char):
         except Exception as e:
             print(f'Live telemetry poll error: {e}', flush=True)
         await asyncio.sleep(LIVE_TELEMETRY_POLL_INTERVAL)
+
+def _sensor_cancellation_is_external():
+    """Distinguish a real cancellation of our task from a leaked bumble abort.
+
+    Bumble cancels in-flight GATT futures when a sensor link (BMS/Mopeka)
+    drops mid-operation (gatt_client.on_disconnection -> pending_response
+    .cancel()). That CancelledError is NOT a request to stop the sensor
+    task, but it escapes `except Exception` and, uncaught, ends the task as
+    cancelled -- which _handle_sensor_task_done treats as fatal (os._exit),
+    restarting the whole GATT server and kicking every connected pilot.
+    Returns True only when the task itself was asked to cancel (shutdown)."""
+    task = asyncio.current_task()
+    if task is None:
+        return True
+    cancelling = getattr(task, 'cancelling', None)
+    if cancelling is None:
+        return True
+    try:
+        return cancelling() > 0
+    except Exception:
+        return True
+
 
 async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data, sensor_loop_heartbeat
@@ -5803,7 +5905,7 @@ async def read_sensors(sensor_device, sensor_adapter):
                     'Mopeka remains offline after repeated scans; keeping GATT bridge up',
                     flush=True,
                 )
-                send_dashboard_command('MOPEKA_OFFLINE')
+                submit_dashboard_io(send_dashboard_command, 'MOPEKA_OFFLINE')
                 mopeka_failures = 0
                 last_adapter_reset = current_time
 
@@ -5839,14 +5941,23 @@ async def read_sensors(sensor_device, sensor_adapter):
                     m1_in = m1.get("level_in", 0)
                     m2_in = m2.get("level_in", 0)
                     maybe_log_mopeka_history(current_time, m1, m2)
-                    send_dashboard_command(f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
-                    send_dashboard_command(f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
+                    submit_dashboard_io(send_dashboard_command, f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
+                    submit_dashboard_io(send_dashboard_command, f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
                 else:
                     mopeka_failures += 1
                     if mopeka_failures > 1:
                         print(f'Mopeka not found ({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES})', flush=True)
-                        send_dashboard_command('MOPEKA_OFFLINE')
+                        submit_dashboard_io(send_dashboard_command, 'MOPEKA_OFFLINE')
 
+            except asyncio.CancelledError:
+                if _sensor_cancellation_is_external():
+                    raise
+                mopeka_failures += 1
+                print(
+                    f'Mopeka scan aborted by sensor-link disconnection '
+                    f'({mopeka_failures}/{MAX_CONSECUTIVE_FAILURES})',
+                    flush=True,
+                )
             except Exception as e:
                 mopeka_failures += 1
                 print(
@@ -5857,7 +5968,7 @@ async def read_sensors(sensor_device, sensor_adapter):
         else:
             mopeka_failures = 0
             if not mopeka_disabled_announced:
-                send_dashboard_command('MOPEKA_DISABLED')
+                submit_dashboard_io(send_dashboard_command, 'MOPEKA_DISABLED')
                 mopeka_disabled_announced = True
 
         sensor_loop_heartbeat = time.time()
@@ -5873,7 +5984,16 @@ async def read_sensors(sensor_device, sensor_adapter):
                     ):
                         bms_failures = 0
                         bms = sensor_data["bms"]
-                        send_dashboard_command(f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
+                        submit_dashboard_io(send_dashboard_command, f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
+                except asyncio.CancelledError:
+                    if _sensor_cancellation_is_external():
+                        raise
+                    bms_failures += 1
+                    print(
+                        f'BMS read aborted by sensor-link disconnection '
+                        f'({bms_failures}/{MAX_CONSECUTIVE_FAILURES})',
+                        flush=True,
+                    )
                 except Exception as e:
                     bms_failures += 1
                     print(
