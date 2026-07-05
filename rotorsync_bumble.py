@@ -45,6 +45,7 @@ from src.bluetooth_adapter_selection import list_bluetooth_adapters, select_adap
 from src.batchmix_payload import batchmix_validation_error
 from src import connection_registry
 from src.fill_history import item_from_line as _shared_fill_item_from_line
+from src import hello_time as _hello_time_shared
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -587,8 +588,8 @@ def _maybe_apply_hello_time(command, metadata):
             )
         return
 
-    if pi_time_set_from_hello:
-        return  # one-shot per boot
+    if pi_time_set_from_hello or _hello_time_shared.clock_already_set_this_boot():
+        return  # one-shot per boot, across BOTH servers (rotorlink may have set it)
 
     # Clock is not synchronized -> trust the app. Apply as close to receipt as
     # possible to keep it within ~a second.
@@ -605,6 +606,7 @@ def _maybe_apply_hello_time(command, metadata):
         return
 
     pi_time_set_from_hello = True
+    _hello_time_shared.mark_clock_set()
     new_local = time.strftime('%A %Y-%m-%d %H:%M:%S %Z', time.localtime(epoch))
     _log_time_sync(
         f'Clock set to {new_local} (corrected {delta:+.1f}s, source=client_hello) '

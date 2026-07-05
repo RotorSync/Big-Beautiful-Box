@@ -30,6 +30,7 @@ from .maintenance_handler import (
     log_maintenance_secret_status,
 )
 from src import connection_registry
+from src import hello_time
 
 logger = logging.getLogger("rotorlink.server")
 
@@ -291,6 +292,22 @@ class RotorLinkServer:
             pass
         return loc
 
+    async def _apply_hello_time(self, state: ClientState, message: dict) -> None:
+        """Set the box clock from the hello's wall-clock time when NTP never
+        synced (field trailer with no internet). BLE hellos have done this for
+        a while; crews are WiFi-first now, so the WiFi hello must too — see
+        src/hello_time.py for the rules (NTP-authoritative, once per boot
+        across BOTH servers via a /run marker, sane-range checks)."""
+        try:
+            who = f"{state.user or 'unknown'} ({state.device or '?'}) via {state.transport}"
+            action = await asyncio.get_running_loop().run_in_executor(
+                None, hello_time.maybe_apply_hello_time, message, who, logger.info
+            )
+            if action == 'applied':
+                logger.info("box clock set from %s client_hello", state.transport)
+        except Exception:
+            logger.exception("hello time handling failed")
+
     async def _apply_loc(self, state: ClientState, value) -> None:
         loc = self._parse_loc(value)
         if loc is None:
@@ -358,6 +375,7 @@ class RotorLinkServer:
                 name=state.user, user_id=state.user_id, device=state.device,
             )
             self._write_wifi_snapshot()
+            await self._apply_hello_time(state, message)
             await self._apply_loc(state, message.get("loc"))
             await self._push_pilot_status()
         elif mtype == "command":
@@ -398,6 +416,7 @@ class RotorLinkServer:
                     name=state.user, user_id=state.user_id, device=state.device,
                 )
                 self._write_wifi_snapshot()
+                await self._apply_hello_time(state, message)
                 await self._apply_loc(state, message.get("loc") or message)
                 await self._send(state, protocol.build_command_result(cmd_id, True, "hello"))
                 await self._push_pilot_status()
