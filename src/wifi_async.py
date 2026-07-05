@@ -166,12 +166,20 @@ class AsyncWifiControl:
         }
 
     def _run_connect(self, ssid, password, hidden):
+        started = time.monotonic()
         try:
             result = self._connect_fn(ssid, password, hidden)
             if not isinstance(result, dict):
                 result = {'ok': False, 'code': 'NMCLI_ERROR', 'message': 'no result'}
         except Exception as e:
             result = {'ok': False, 'code': 'NMCLI_ERROR', 'message': str(e)}
+        # The only journal trace of a field WiFi join outcome — the caller got
+        # ACCEPTED long ago and may never poll WIFI_STATUS. Never log secrets.
+        print(
+            f"WiFi connect finished: ssid={str(ssid or '')!r} ok={result.get('ok')} "
+            f"code={result.get('code', '')} in {time.monotonic() - started:.1f}s",
+            flush=True,
+        )
         with self._lock:
             self._last_connect_result = result
         # The radio state just changed. Refresh the cache on a detached

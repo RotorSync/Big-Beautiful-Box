@@ -88,7 +88,10 @@ GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
 GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS = 2.0
 GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS = 1.0
 GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 20.0
-GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS = 8.0
+# 15s (was 8): on a marginal cockpit link discovery+MTU+subscribe+hello can
+# exceed 8s, and the 2s-post-connect parameter-relax adds early traffic. Must
+# stay under GATT_INACTIVE_CONNECTION_PRUNE_SECONDS so kick precedes prune.
+GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS = 15.0
 # Time-sync from client hello: when the box boots with no network (no NTP since
 # boot), a connecting RotorSync app can hand us the current wall-clock time so
 # the box clock (and load timestamps) are right. An NTP-synced clock (chrony) is
@@ -390,9 +393,10 @@ async def disconnect_unknown_gatt_client_if_no_hello(
     if float(metadata.get('connected_at') or 0) != float(connected_at or 0):
         return False
 
+    last_seen_age = time.time() - float(metadata.get('last_seen') or connected_at or 0)
     print(
         f'Disconnecting unclassified GATT client {peer}: no client_hello '
-        f'within {grace_seconds:.0f}s',
+        f'within {grace_seconds:.0f}s (last activity {last_seen_age:.0f}s ago)',
         flush=True,
     )
     try:
@@ -456,6 +460,24 @@ async def relax_gatt_connection_parameters(device, connection, peer):
     update = getattr(connection, 'update_parameters', None)
     if update is None:
         return
+
+    def _log_applied_parameters(*_args, peer=peer, connection=connection):
+        # Ground truth that the central actually granted the relax: fires on
+        # the HCI connection-parameters-update event, after acceptance.
+        params = getattr(connection, 'parameters', None)
+        print(
+            f'Connection parameters updated for {peer}: '
+            f'interval={getattr(params, "connection_interval", "?")} '
+            f'latency={getattr(params, "peripheral_latency", getattr(params, "slave_latency", "?"))} '
+            f'supervision_timeout={getattr(params, "supervision_timeout", "?")}',
+            flush=True,
+        )
+
+    if hasattr(connection, 'on'):
+        try:
+            connection.on('connection_parameters_update', _log_applied_parameters)
+        except Exception:
+            pass
     try:
         await asyncio.wait_for(
             update(
@@ -469,7 +491,8 @@ async def relax_gatt_connection_parameters(device, connection, peer):
         )
         print(
             f'Requested relaxed connection parameters for {peer} '
-            f'(30-45ms interval, 5s supervision timeout)',
+            f'(30-45ms interval, 5s supervision timeout); central response '
+            f'pending — watch for "Connection parameters updated"',
             flush=True,
         )
     except Exception as e:
@@ -976,17 +999,34 @@ _DASHBOARD_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 
+_dashboard_io_last_backlog_warn = 0.0
+
+
 def submit_dashboard_io(fn, *args):
     """Run a dashboard-socket call on the I/O worker without waiting for it."""
+    global _dashboard_io_last_backlog_warn
+
     def _run():
+        started = time.monotonic()
         try:
             fn(*args)
         except Exception as e:
             print(f'Dashboard I/O worker error: {type(e).__name__}: {e}', flush=True)
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed > 1.5:
+                print(f'Dashboard I/O call ran {elapsed:.1f}s (dashboard slow?)', flush=True)
+    try:
+        backlog = _DASHBOARD_IO_EXECUTOR._work_queue.qsize()
+        if backlog > 10 and time.monotonic() - _dashboard_io_last_backlog_warn > 30:
+            _dashboard_io_last_backlog_warn = time.monotonic()
+            print(f'Dashboard I/O worker backlog: {backlog} queued calls', flush=True)
+    except Exception:
+        pass
     try:
         _DASHBOARD_IO_EXECUTOR.submit(_run)
     except RuntimeError:
-        pass
+        print('Dashboard I/O worker unavailable (shutting down); call dropped', flush=True)
 
 
 async def run_dashboard_io(fn, *args):

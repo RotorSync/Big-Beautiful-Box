@@ -376,6 +376,10 @@ pending_fill_trigger_threshold = 0.0  # Trigger threshold associated with the co
 pending_fill_temp_f = None  # Flow-meter temperature snapshot associated with the completed fill
 pending_fill_stop_to_thumb_start_at = 0.0  # Relay activation time for the completed fill
 pending_fill_flow_started_at = 0.0  # Epoch when flow first started for the completed fill (0 = unknown)
+_sub_threshold_flow_started_at = 0.0  # Sub-4GPM flow tracker (journal evidence of dribbles)
+_sub_threshold_flow_peak_lps = 0.0
+_sub_threshold_flow_start_gal = 0.0
+_sub_threshold_flow_last_log_at = 0.0
 pending_fill_flow_ended_at = 0.0  # Epoch when flow stopped for the completed fill (0 = unknown)
 last_flowing_rate_l_per_s = 0.0  # Most recent non-zero flow during the current fill
 last_trigger_flow_gpm = 0.0  # Flow when auto shutoff triggered
@@ -7953,6 +7957,33 @@ def update_dashboard():
     # Detect flow state
     is_flowing = last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
     now = time.time()
+
+    # Field evidence for sub-threshold flow: with the 4 GPM event threshold a
+    # post-shutoff dribble creates no edges and would otherwise leave no trace
+    # in the journal - one summary line when it decays back to zero confirms
+    # dribbles are real (the TR12 flow-window theory) without log spam. Ramps
+    # into a real fill (ends with is_flowing True) are normal and not logged.
+    global _sub_threshold_flow_started_at, _sub_threshold_flow_peak_lps
+    global _sub_threshold_flow_start_gal, _sub_threshold_flow_last_log_at
+    if not is_flowing and last_flow_rate > config.FLOW_METER_ZERO_THRESHOLD:
+        if _sub_threshold_flow_started_at == 0.0:
+            _sub_threshold_flow_started_at = now
+            _sub_threshold_flow_start_gal = actual
+            _sub_threshold_flow_peak_lps = 0.0
+        _sub_threshold_flow_peak_lps = max(_sub_threshold_flow_peak_lps, last_flow_rate)
+    elif _sub_threshold_flow_started_at > 0.0:
+        if not is_flowing and now - _sub_threshold_flow_last_log_at >= 30.0:
+            _sub_threshold_flow_last_log_at = now
+            print(
+                'Sub-threshold flow ended (no fill event): '
+                f'peak {_sub_threshold_flow_peak_lps * config.LITERS_PER_SEC_TO_GPM:.1f} GPM, '
+                f'+{actual - _sub_threshold_flow_start_gal:.3f} gal over '
+                f'{now - _sub_threshold_flow_started_at:.1f}s',
+                flush=True,
+            )
+        _sub_threshold_flow_started_at = 0.0
+        _sub_threshold_flow_peak_lps = 0.0
+        _sub_threshold_flow_start_gal = 0.0
     latest_fresh_age = now - last_fresh_flow_read_time if last_fresh_flow_read_time else float("inf")
     fresh_grace_seconds = config.NEW_FILL_CYCLE_FRESH_GRACE_SECONDS
     has_recent_fresh_flow = latest_fresh_age <= fresh_grace_seconds
@@ -8028,7 +8059,8 @@ def update_dashboard():
             print(
                 "Fill dribble folded into pending fill - "
                 f"Actual: {actual:.3f} (+{actual - pending_fill_gallons:.3f} gal, "
-                "flow window kept)"
+                f"{now - pending_fill_flow_ended_at:.1f}s after flow end, "
+                f"target {pending_fill_requested:.1f} gal, flow window kept)"
             )
             pending_fill_gallons = actual
             pending_fill_flow_ended_at = now

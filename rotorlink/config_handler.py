@@ -681,7 +681,7 @@ class ConfigHandler:
         if op == "GET_CONNECTIONS":
             return self._get_connections(request_id)
         if op == "GET_BOX_HEALTH":
-            return self._get_box_health(request_id)
+            return await self._get_box_health(request_id)
         if op == "GET_CONNECTION_LOG":
             return self._get_connection_log(cmd, request_id)
         if op == "PAGE":
@@ -971,12 +971,18 @@ class ConfigHandler:
             "connections": connection_registry.read_connections(),
         }
 
-    def _get_box_health(self, request_id):
+    async def _get_box_health(self, request_id):
+        # box_health() runs up to 3x systemctl subprocesses (5s timeout each);
+        # inline it froze every WiFi client for up to ~15s. Same executor
+        # pattern as hello_time in server.py.
+        health = await asyncio.get_running_loop().run_in_executor(
+            None, connection_registry.box_health
+        )
         return {
             "ok": True,
             "op": "GET_BOX_HEALTH",
             "request_id": request_id,
-            "health": connection_registry.box_health(),
+            "health": health,
         }
 
     def _get_connection_log(self, cmd, request_id):

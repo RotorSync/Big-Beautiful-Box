@@ -178,4 +178,19 @@ if [ "$RESTART_DASHBOARD" -eq 1 ] && [ "$changed" -eq 1 ]; then
     fi
 fi
 
+# Cap noisy BBB logs fleet-wide. This script is the only setup channel that
+# runs on updater-managed boxes (install.sh is first-install only), and
+# without it iol_dashboard.log grows unbounded (104MB seen on a fleet box).
+LOGROTATE_SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$LOGROTATE_SRC_DIR/bbb-logrotate.conf" ] && [ ! -f /etc/logrotate.d/bbb ]; then
+    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.conf" /etc/logrotate.d/bbb && changed=1
+fi
+if [ -f "$LOGROTATE_SRC_DIR/bbb-logrotate.timer" ] && ! systemctl is-enabled --quiet bbb-logrotate.timer 2>/dev/null; then
+    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.service" /etc/systemd/system/bbb-logrotate.service
+    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.timer" /etc/systemd/system/bbb-logrotate.timer
+    systemctl daemon-reload
+    systemctl enable --now bbb-logrotate.timer 2>/dev/null && changed=1 || echo "setup-cursor-control: could not enable bbb-logrotate.timer" >&2
+    systemctl start bbb-logrotate.service 2>/dev/null || true
+fi
+
 echo "setup-cursor-control: changed=$changed"

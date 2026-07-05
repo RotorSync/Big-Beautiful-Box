@@ -74,8 +74,14 @@ def mark_clock_set(marker_path=CLOCK_SET_MARKER_PATH):
     try:
         with open(marker_path, 'w') as f:
             f.write(str(time.time()))
-    except Exception:
-        pass  # /run unwritable is not worth failing the hello over
+    except Exception as e:
+        # Not worth failing the hello over, but a broken latch means both
+        # servers may step the clock repeatedly — make it visible.
+        print(
+            f'hello_time: could not write clock-set marker {marker_path} '
+            f'({type(e).__name__}: {e}); once-per-boot latch inactive',
+            flush=True,
+        )
 
 
 def maybe_apply_hello_time(
@@ -104,6 +110,7 @@ def maybe_apply_hello_time(
     if raw is None:
         raw = command.get('epoch')
     if raw is None:
+        log(f'client_hello from {who} carried no time field; clock unchanged')
         return 'no-time'
 
     try:
@@ -128,6 +135,7 @@ def maybe_apply_hello_time(
         return 'ntp-authoritative'
 
     if clock_already_set_this_boot(marker_path):
+        log(f'client_hello time from {who} ignored: clock already set this boot')
         return 'already-set'
 
     try:
