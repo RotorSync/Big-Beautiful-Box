@@ -1,0 +1,6 @@
+[Unit]
+Description=BBB last-resort disk guard (frees space before the SD card fills)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/src/disk_guard.py

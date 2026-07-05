@@ -185,7 +185,9 @@ LOGROTATE_SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 logrotate_units_changed=0
 for pair in "bbb-logrotate.conf:/etc/logrotate.d/bbb" \
             "bbb-logrotate.service:/etc/systemd/system/bbb-logrotate.service" \
-            "bbb-logrotate.timer:/etc/systemd/system/bbb-logrotate.timer"; do
+            "bbb-logrotate.timer:/etc/systemd/system/bbb-logrotate.timer" \
+            "bbb-disk-guard.service:/etc/systemd/system/bbb-disk-guard.service" \
+            "bbb-disk-guard.timer:/etc/systemd/system/bbb-disk-guard.timer"; do
     src_file="$LOGROTATE_SRC_DIR/${pair%%:*}"
     dst_file="${pair##*:}"
     # Content-sync, not presence-check: boxes that got an OLD copy (e.g. the
@@ -197,8 +199,21 @@ done
 if [ "$logrotate_units_changed" = "1" ]; then
     systemctl daemon-reload
 fi
-if [ -f /etc/systemd/system/bbb-logrotate.timer ] && ! systemctl is-enabled --quiet bbb-logrotate.timer 2>/dev/null; then
-    systemctl enable --now bbb-logrotate.timer 2>/dev/null && changed=1 || echo "setup-cursor-control: could not enable bbb-logrotate.timer" >&2
+for guard_timer in bbb-logrotate.timer bbb-disk-guard.timer; do
+    if [ -f "/etc/systemd/system/$guard_timer" ] && ! systemctl is-enabled --quiet "$guard_timer" 2>/dev/null; then
+        systemctl enable --now "$guard_timer" 2>/dev/null && changed=1 || echo "setup-cursor-control: could not enable $guard_timer" >&2
+    fi
+done
+
+# Cap journald fleet-wide (512M): previously only install.sh shipped this, so
+# pre-cap installs let the journal grow to the distro default (up to ~10% of
+# the SD card).
+JOURNALD_SRC="$LOGROTATE_SRC_DIR/journald-bbb.conf"
+if [ -f "$JOURNALD_SRC" ] && ! cmp -s "$JOURNALD_SRC" /etc/systemd/journald.conf.d/bbb.conf 2>/dev/null; then
+    mkdir -p /etc/systemd/journald.conf.d
+    cp "$JOURNALD_SRC" /etc/systemd/journald.conf.d/bbb.conf
+    systemctl restart systemd-journald 2>/dev/null || true
+    changed=1
 fi
 
 echo "setup-cursor-control: changed=$changed"
