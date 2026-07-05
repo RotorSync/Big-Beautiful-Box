@@ -3,4 +3,8 @@ Description=Rotate BBB application logs
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/logrotate -f /etc/logrotate.d/bbb
+# NO -f: force mode ignores every size/monthly condition, so the hourly timer
+# rotated tiny logs each hour (retention collapsed to ~8 hours; bug_reports'
+# "monthly rotate 24" became ~24 HOURS). Without -f each hourly run rotates
+# only what actually exceeded its condition.
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/bbb

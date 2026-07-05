@@ -182,15 +182,23 @@ fi
 # runs on updater-managed boxes (install.sh is first-install only), and
 # without it iol_dashboard.log grows unbounded (104MB seen on a fleet box).
 LOGROTATE_SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "$LOGROTATE_SRC_DIR/bbb-logrotate.conf" ] && [ ! -f /etc/logrotate.d/bbb ]; then
-    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.conf" /etc/logrotate.d/bbb && changed=1
-fi
-if [ -f "$LOGROTATE_SRC_DIR/bbb-logrotate.timer" ] && ! systemctl is-enabled --quiet bbb-logrotate.timer 2>/dev/null; then
-    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.service" /etc/systemd/system/bbb-logrotate.service
-    cp "$LOGROTATE_SRC_DIR/bbb-logrotate.timer" /etc/systemd/system/bbb-logrotate.timer
+logrotate_units_changed=0
+for pair in "bbb-logrotate.conf:/etc/logrotate.d/bbb" \
+            "bbb-logrotate.service:/etc/systemd/system/bbb-logrotate.service" \
+            "bbb-logrotate.timer:/etc/systemd/system/bbb-logrotate.timer"; do
+    src_file="$LOGROTATE_SRC_DIR/${pair%%:*}"
+    dst_file="${pair##*:}"
+    # Content-sync, not presence-check: boxes that got an OLD copy (e.g. the
+    # -f force-mode service that collapsed retention to hours) must be fixed.
+    if [ -f "$src_file" ] && ! cmp -s "$src_file" "$dst_file" 2>/dev/null; then
+        cp "$src_file" "$dst_file" && changed=1 && logrotate_units_changed=1
+    fi
+done
+if [ "$logrotate_units_changed" = "1" ]; then
     systemctl daemon-reload
+fi
+if [ -f /etc/systemd/system/bbb-logrotate.timer ] && ! systemctl is-enabled --quiet bbb-logrotate.timer 2>/dev/null; then
     systemctl enable --now bbb-logrotate.timer 2>/dev/null && changed=1 || echo "setup-cursor-control: could not enable bbb-logrotate.timer" >&2
-    systemctl start bbb-logrotate.service 2>/dev/null || true
 fi
 
 echo "setup-cursor-control: changed=$changed"
