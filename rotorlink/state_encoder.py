@@ -119,6 +119,34 @@ def encode_ble_state(state: dict, client_count: int = 1) -> dict:
     _put_bool_if_non_default(compact, "ff", flow_fault_active, False)
     _put_if_present(compact, "fc", flow_fault_code if flow_fault_active else None)
     _put_if_present(compact, "fmr", flow_fault_reason if flow_fault_active else None)
+    _put_if_present(compact, "cal", _compact_calibration_block(state))
+    return compact
+
+
+def _compact_calibration_block(state: dict):
+    """bumble: _compact_calibration_block — MUST stay in parity (test enforces)."""
+    cal = state.get("calibration")
+    if not isinstance(cal, dict):
+        return None
+    compact = {
+        "md": cal.get("mode"),
+        "ph": cal.get("phase"),
+        "tk": cal.get("tank"),
+        "si": cal.get("step_index"),
+        "tg": cal.get("target_gallons"),
+        "n": cal.get("points_recorded"),
+    }
+    if cal.get("points_total") is not None:
+        compact["pt"] = cal["points_total"]
+    if cal.get("settle_remaining") is not None:
+        compact["sr"] = cal["settle_remaining"]
+    reading = cal.get("reading")
+    if isinstance(reading, dict):
+        compact["rd"] = reading
+    if cal.get("offset_result"):
+        compact["or"] = cal["offset_result"]
+    if cal.get("error"):
+        compact["er"] = cal["error"]
     return compact
 
 

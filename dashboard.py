@@ -138,6 +138,11 @@ flow_curve_metadata = {"source": "factory", "reason": "startup"}
 # Set up rotating loggers
 from src.logger import get_main_logger, get_serial_logger, get_button_logger, get_relay_logger
 from src.wifi_async import AsyncWifiControl
+from src.tank_calibration import (
+    compute_point_targets,
+    expected_level_in,
+    offset_adjustment_inches,
+)
 main_logger = get_main_logger()
 serial_logger = get_serial_logger()
 button_logger = get_button_logger()
@@ -2978,6 +2983,19 @@ def _default_calibration_state():
         "return_phase": None,
         "profile_path": "",
         "profile_error": "",
+        # Remote wizard (app-driven) extensions. mode 'full' rebuilds the
+        # curve; 'offset' measures against the existing curve and averages the
+        # inch error into the sensor's Height Offset. point_targets (when set)
+        # replaces the fixed step_size/target_capacity stepping.
+        "mode": "full",
+        "remote": False,
+        "point_targets": None,
+        "target_index": 0,
+        "max_gallons": 0.0,
+        "curve_rows": None,
+        "offset_diffs": [],
+        "offset_points": [],
+        "offset_result": None,
     }
 
 
@@ -3116,20 +3134,60 @@ def _build_dashboard_state_snapshot():
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
         "current_curve": flow_curve_status_text(),
         "pending_curve": flow_curve_proposal_status_text(),
+        "calibration": _calibration_snapshot(),
+    }
+
+
+def _calibration_snapshot():
+    """Remote view of the calibration wizard (None when not running) — the
+    app's wizard UI renders this straight from STATE_JSON."""
+    if not calibration_mode or not calibration_state:
+        return None
+    st = calibration_state
+    targets = st.get("point_targets") or []
+    settle_remaining = None
+    if st.get("phase") == "settling" and st.get("settle_deadline"):
+        settle_remaining = max(0, int(st["settle_deadline"] - time.time()))
+    reading = st.get("reading")
+    return {
+        "mode": st.get("mode", "full"),
+        "phase": st.get("phase"),
+        "tank": st.get("tank"),
+        "step_index": int(st.get("target_index", 0)),
+        "points_total": len(targets) if targets else None,
+        "target_gallons": round(float(st.get("current_step") or 0), 1),
+        "settle_remaining": settle_remaining,
+        "points_recorded": (
+            len(st.get("offset_points") or []) if st.get("mode") == "offset"
+            else len(st.get("points") or [])
+        ),
+        "reading": None if not reading else {
+            "mm": round(float(reading.get("level_mm") or 0), 1),
+            "in": round(float(reading.get("level_in") or 0), 2),
+            "gal": round(float(reading.get("gallons") or 0), 1),
+            "q": int(reading.get("quality") or 0),
+        },
+        "offset_result": st.get("offset_result"),
+        "error": st.get("profile_error") or None,
     }
 
 
 def _save_calibration_run():
-    if not calibration_state or not calibration_state.get("points"):
+    if not calibration_state:
+        return
+    if not calibration_state.get("points") and not calibration_state.get("offset_points"):
         return
 
     run_record = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "tank": calibration_state["tank"],
+        "mode": calibration_state.get("mode", "full"),
+        "remote": bool(calibration_state.get("remote")),
         "total_capacity": calibration_state["total_capacity"],
         "target_capacity": calibration_state["target_capacity"],
         "step_size": calibration_state["step_size"],
         "points": calibration_state["points"],
+        "offset_points": calibration_state.get("offset_points") or [],
     }
 
     runs_path = _calibration_runs_path()
@@ -3178,6 +3236,48 @@ def _append_calibration_point(actual_gallons, step_target_gallons=None):
         "display_gallons": reading["gallons"],
         "quality": reading["quality"],
     })
+
+
+def _record_offset_point(actual_gallons):
+    """Offset mode: compare the settled reading to the EXISTING curve at the
+    same gallons and keep the inch difference. The measured level already
+    includes the current Height Offset, so the averaged difference is the
+    correction to ADD to it."""
+    reading = calibration_state.get("reading") or _selected_tank_reading()
+    expected_in = expected_level_in(calibration_state["curve_rows"], actual_gallons)
+    diff_in = expected_in - float(reading["level_in"])
+    calibration_state["offset_diffs"].append(diff_in)
+    calibration_state["offset_points"].append({
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "gallons": float(actual_gallons),
+        "measured_in": float(reading["level_in"]),
+        "expected_in": round(expected_in, 3),
+        "diff_in": round(diff_in, 3),
+        "level_mm": reading["level_mm"],
+        "quality": reading["quality"],
+    })
+
+
+def _apply_offset_calibration():
+    """Average the offset diffs and persist the new per-sensor Height Offset.
+    Returns a human summary string (shown where the full mode shows the
+    profile path)."""
+    tank = calibration_state["tank"]
+    sensor_id = _selected_tank_sensor_id(tank)
+    if not sensor_id:
+        raise ValueError(f"no {tank} sensor configured")
+    adjustment = offset_adjustment_inches(calibration_state["offset_diffs"])
+    current = _read_sensor_height_offset(sensor_id)
+    new_offset = round(current + adjustment, 2)
+    _write_sensor_height_offset(sensor_id, new_offset)
+    calibration_state["offset_result"] = {
+        "sensor_id": sensor_id,
+        "previous_offset_in": current,
+        "adjustment_in": adjustment,
+        "new_offset_in": new_offset,
+        "points": len(calibration_state["offset_diffs"]),
+    }
+    return f"offset {current:+.2f} -> {new_offset:+.2f} in ({sensor_id})"
 
 
 def _apply_tank_calibration_profile():
@@ -3346,7 +3446,7 @@ def _close_calibration_window(return_to_menu=True):
         show_menu()
 
 
-def show_tank_calibration():
+def show_tank_calibration(initial_state=None):
     global calibration_mode, calibration_window, calibration_state
     global calibration_title_label, calibration_body_label, calibration_footer_label, calibration_hint_label
 
@@ -3359,7 +3459,7 @@ def show_tank_calibration():
             pass
 
     calibration_mode = True
-    calibration_state = _default_calibration_state()
+    calibration_state = initial_state or _default_calibration_state()
     calibration_window = tk.Toplevel()
     calibration_window.title("Tank Calibration")
     calibration_window.attributes('-fullscreen', True)
@@ -3404,6 +3504,147 @@ def show_tank_calibration():
     _refresh_calibration_window()
 
 
+BASE_CALIBRATION_CSV = "/opt/mopeka/calibration-points-1070gal-tank.csv"
+SENSOR_DETAILS_CSV = "/opt/mopeka/mopeka-sensor-details.csv"
+
+
+def _load_calibration_curve_rows(tank):
+    """[(tank_level_in, gallons)] for the tank's ACTIVE curve — its per-tank
+    profile when one exists, else the shared base CSV (the converter's own
+    precedence)."""
+    path = _current_tank_calibration_profile_path(tank)
+    if not os.path.exists(path):
+        path = BASE_CALIBRATION_CSV
+    rows = []
+    with open(path, "r", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                rows.append((float(row["Tank Level (in)"]), float(row["Gallons"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return rows
+
+
+def _selected_tank_sensor_id(tank):
+    """Mopeka ID (last-3-octet MAC) of the front/back sensor from mopeka_config."""
+    try:
+        with open(_mopeka_config_path(), "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        return ""
+    key = "back_id" if tank == "back" else "front_id"
+    value = str(cfg.get(key) or "").strip()
+    return "" if value.startswith("-") else value
+
+
+def _read_sensor_height_offset(sensor_id):
+    """Current Height Offset (inches) for a sensor from the details CSV; 0.0
+    when missing/unset. The CSV has preamble rows before the real header."""
+    try:
+        with open(SENSOR_DETAILS_CSV, "r", newline="") as f:
+            raw = list(csv.reader(f))
+    except OSError:
+        return 0.0
+    header_idx = next((i for i, r in enumerate(raw) if "Mopeka ID" in r), None)
+    if header_idx is None:
+        return 0.0
+    header = raw[header_idx]
+    id_col = header.index("Mopeka ID")
+    off_col = header.index("Height Offset")
+    for row in raw[header_idx + 1:]:
+        if len(row) > max(id_col, off_col) and row[id_col].strip() == sensor_id:
+            try:
+                return float(row[off_col])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _write_sensor_height_offset(sensor_id, new_offset):
+    """Persist a sensor's Height Offset in the details CSV, preserving the
+    file's preamble rows and all other content. Atomic replace. Raises on a
+    missing sensor so the wizard surfaces the failure instead of silently
+    calibrating nothing."""
+    with open(SENSOR_DETAILS_CSV, "r", newline="") as f:
+        raw = list(csv.reader(f))
+    header_idx = next((i for i, r in enumerate(raw) if "Mopeka ID" in r), None)
+    if header_idx is None:
+        raise ValueError("sensor CSV header not found")
+    header = raw[header_idx]
+    id_col = header.index("Mopeka ID")
+    off_col = header.index("Height Offset")
+    updated = False
+    for row in raw[header_idx + 1:]:
+        if len(row) > max(id_col, off_col) and row[id_col].strip() == sensor_id:
+            row[off_col] = f"{new_offset:.2f}"
+            updated = True
+    if not updated:
+        raise ValueError(f"sensor {sensor_id!r} not found in sensor CSV")
+    tmp = SENSOR_DETAILS_CSV + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        csv.writer(f).writerows(raw)
+    os.replace(tmp, SENSOR_DETAILS_CSV)
+
+
+def start_tank_calibration_remote(params):
+    """Start the calibration wizard from a remote client (the iOS app).
+
+    Validates everything on the caller's thread, then hands the Tk window +
+    state swap to the main loop. Returns (ok, error). The remote run skips the
+    interactive choose_tank/set_total/set_target phases and lands directly on
+    confirm_empty with precomputed fill targets; from there the app drives the
+    SAME state machine the touchscreen uses (CAL_CONFIRM/CAL_ADJUST/CAL_CANCEL).
+    """
+    if calibration_mode:
+        return False, "calibration already running"
+    if last_flow_rate >= config.FLOW_STOPPED_THRESHOLD:
+        return False, "flow is active - stop the pump first"
+
+    mode = str(params.get("mode") or "full").strip().lower()
+    tank = "back" if str(params.get("tank") or "front").strip().lower() == "back" else "front"
+    try:
+        total_capacity = float(params.get("total_capacity") or 0)
+        points = int(params.get("points") or 0)
+        max_gallons = float(params.get("max_gallons") or 0)
+        targets = compute_point_targets(
+            mode, total_capacity=total_capacity, points=points, max_gallons=max_gallons
+        )
+    except (TypeError, ValueError) as exc:
+        return False, str(exc)
+
+    state = _default_calibration_state()
+    state.update({
+        "phase": "confirm_empty",
+        "tank": tank,
+        "mode": mode,
+        "remote": True,
+        "point_targets": targets,
+        "target_index": 0,
+        "max_gallons": max_gallons,
+        "total_capacity": total_capacity if mode == "full" else state["total_capacity"],
+        # Legacy fields kept coherent for the run archive.
+        "target_capacity": targets[-1] if targets else 0,
+        "step_size": targets[0] if targets else 0,
+    })
+
+    if mode == "offset":
+        if not _selected_tank_sensor_id(tank):
+            return False, f"no {tank} sensor configured on this box"
+        curve = _load_calibration_curve_rows(tank)
+        if len(curve) < 2:
+            return False, "no usable calibration curve to offset against"
+        state["curve_rows"] = curve
+
+    def _begin():
+        # A wizard fill must start from a zeroed totalizer: step targets are
+        # cumulative totals and a stale total would auto-stop step 1 instantly.
+        force_flow_reset("remote_calibration_start")
+        show_tank_calibration(initial_state=state)
+
+    root.after(0, _begin)
+    return True, ""
+
+
 def calibration_adjust_value(delta):
     if not calibration_state:
         return
@@ -3438,27 +3679,52 @@ def calibration_confirm():
         calibration_state["phase"] = "confirm_empty"
     elif phase == "confirm_empty":
         calibration_state["points"] = []
+        calibration_state["offset_diffs"] = []
+        calibration_state["offset_points"] = []
         calibration_state["reading"] = _selected_tank_reading()
-        _append_calibration_point(0.0, 0)
+        if calibration_state.get("mode") == "offset":
+            _record_offset_point(0.0)
+        else:
+            _append_calibration_point(0.0, 0)
         calibration_state["reading"] = None
-        calibration_state["current_step"] = calibration_state["step_size"]
+        targets = calibration_state.get("point_targets")
+        if targets:
+            calibration_state["target_index"] = 0
+            calibration_state["current_step"] = targets[0]
+        else:
+            calibration_state["current_step"] = calibration_state["step_size"]
         switch_mode("fill")
         _calibration_prepare_next_step()
     elif phase == "review":
-        _append_calibration_point(
-            calibration_state["last_step_actual"],
-            calibration_state["current_step"],
-        )
-        next_step = calibration_state["current_step"] + calibration_state["step_size"]
-        if next_step <= calibration_state["target_capacity"]:
-            calibration_state["current_step"] = next_step
-            _calibration_prepare_next_step()
-            return
+        if calibration_state.get("mode") == "offset":
+            _record_offset_point(calibration_state["last_step_actual"])
+        else:
+            _append_calibration_point(
+                calibration_state["last_step_actual"],
+                calibration_state["current_step"],
+            )
+        targets = calibration_state.get("point_targets")
+        if targets:
+            next_index = calibration_state.get("target_index", 0) + 1
+            if next_index < len(targets):
+                calibration_state["target_index"] = next_index
+                calibration_state["current_step"] = targets[next_index]
+                _calibration_prepare_next_step()
+                return
+        else:
+            next_step = calibration_state["current_step"] + calibration_state["step_size"]
+            if next_step <= calibration_state["target_capacity"]:
+                calibration_state["current_step"] = next_step
+                _calibration_prepare_next_step()
+                return
         _save_calibration_run()
         calibration_state["phase"] = "complete"
     elif phase == "complete":
         try:
-            calibration_state["profile_path"] = _apply_tank_calibration_profile()
+            if calibration_state.get("mode") == "offset":
+                calibration_state["profile_path"] = _apply_offset_calibration()
+            else:
+                calibration_state["profile_path"] = _apply_tank_calibration_profile()
             calibration_state["profile_error"] = ""
             calibration_state["phase"] = "applied"
         except Exception as exc:
@@ -3491,7 +3757,11 @@ def calibration_cancel():
     elif phase == "set_target":
         calibration_state["phase"] = "set_total"
     elif phase == "confirm_empty":
-        calibration_state["phase"] = "set_target"
+        if calibration_state.get("remote"):
+            calibration_state["return_phase"] = "confirm_empty"
+            calibration_state["phase"] = "abort_confirm"
+        else:
+            calibration_state["phase"] = "set_target"
     elif phase == "abort_confirm":
         calibration_state["phase"] = calibration_state.get("return_phase") or "choose_tank"
         calibration_state["return_phase"] = None
@@ -6284,6 +6554,45 @@ def socket_command_listener():
 
                             elif line == "RESET":
                                 root.after(0, lambda: force_flow_reset("socket_reset"))
+
+                            elif line.startswith("CAL_START:"):
+                                try:
+                                    cal_params = json.loads(line[len("CAL_START:"):])
+                                except Exception as ce:
+                                    client.send(f"CAL_ERR:invalid params: {ce}\n".encode())
+                                    continue
+                                ok, cal_err = start_tank_calibration_remote(cal_params)
+                                client.send((f"CAL_OK\n" if ok else f"CAL_ERR:{cal_err}\n").encode())
+                                continue
+
+                            elif line == "CAL_CONFIRM":
+                                if calibration_mode:
+                                    root.after(0, calibration_confirm)
+                                    client.send(b"CAL_OK\n")
+                                else:
+                                    client.send(b"CAL_ERR:not running\n")
+                                continue
+
+                            elif line == "CAL_CANCEL":
+                                if calibration_mode:
+                                    root.after(0, calibration_cancel)
+                                    client.send(b"CAL_OK\n")
+                                else:
+                                    client.send(b"CAL_ERR:not running\n")
+                                continue
+
+                            elif line.startswith("CAL_ADJUST:"):
+                                try:
+                                    cal_delta = int(line[len("CAL_ADJUST:"):])
+                                except ValueError:
+                                    client.send(b"CAL_ERR:invalid delta\n")
+                                    continue
+                                if calibration_mode:
+                                    root.after(0, lambda d=cal_delta: calibration_adjust_value(d))
+                                    client.send(b"CAL_OK\n")
+                                else:
+                                    client.send(b"CAL_ERR:not running\n")
+                                continue
 
                             elif line == "TU":
                                 root.after(0, lambda: handle_thumbs_up_press("socket TU"))

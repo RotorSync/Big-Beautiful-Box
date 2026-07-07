@@ -76,6 +76,23 @@ def translate(cmd: dict) -> Optional[str]:
         return "TU"
     if command in ("reset_flow", "flow_reset"):
         return "RESET"
+
+    # Remote tank-calibration wizard (mirrors bumble's command channel).
+    if command == "cal_start":
+        params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+        return "CAL_START:" + json.dumps(params, separators=(",", ":"))
+
+    if command == "cal_confirm":
+        return "CAL_CONFIRM"
+
+    if command == "cal_cancel":
+        return "CAL_CANCEL"
+
+    if command == "cal_adjust":
+        try:
+            return f"CAL_ADJUST:{int(cmd.get('delta'))}"
+        except (TypeError, ValueError):
+            return None
     if command in ("ov", "override_press", "switch_ov"):
         return "OV"
     if command in ("update_box", "run_update"):
