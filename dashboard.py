@@ -493,6 +493,10 @@ bms_soc = None
 bms_voltage = None
 
 # Tank calibration workflow state
+# Flow stops under this many gallons don't count as a calibration fill —
+# meter blips / post-shutoff dribble were starting the settle countdown
+# before the pump ever ran.
+CALIBRATION_MIN_FILL_GALLONS = 2.0
 calibration_mode = False
 calibration_window = None
 calibration_title_label = None
@@ -3154,7 +3158,11 @@ def _calibration_snapshot():
     settle_remaining = None
     if st.get("phase") == "settling" and st.get("settle_deadline"):
         settle_remaining = max(0, int(st["settle_deadline"] - time.time()))
+    # Frozen settled reading at review/complete; LIVE sensor reading during the
+    # other phases so the operator can watch the inches while filling/settling.
     reading = st.get("reading")
+    if not reading and st.get("phase") in ("confirm_empty", "wait_for_fill", "settling"):
+        reading = _selected_tank_reading()
     # Offset mode review: what the existing curve EXPECTS the level to be at
     # the gallons actually pumped, so the app can show original vs measured
     # before the point is accepted.
@@ -8386,7 +8394,18 @@ def update_dashboard():
 
     # Store fill data when flow stops (don't record yet - wait for thumbs up)
     if was_flowing and not is_flowing:
-        if calibration_waiting_for_fill:
+        if calibration_waiting_for_fill and (
+            actual - calibration_state.get("flow_start_actual", actual)
+        ) < CALIBRATION_MIN_FILL_GALLONS:
+            # Meter blip / post-shutoff dribble, not a fill (seen starting the
+            # settle countdown before the pump ever ran). Keep waiting.
+            calibration_state["flow_started"] = False
+            print(
+                f"Calibration: ignoring flow blip of "
+                f"{actual - calibration_state.get('flow_start_actual', actual):.2f} gal",
+                flush=True,
+            )
+        elif calibration_waiting_for_fill:
             calibration_state["last_step_actual"] = actual
             calibration_state["phase"] = "settling"
             calibration_state["settle_deadline"] = time.time() + 120
@@ -8472,6 +8491,17 @@ def update_dashboard():
         current_fill_flow_started_at = now
         if calibration_mode and calibration_state and calibration_state.get("phase") == "wait_for_fill":
             calibration_state["flow_started"] = True
+            calibration_state["flow_start_actual"] = actual
+            _refresh_calibration_window()
+        elif calibration_mode and calibration_state and calibration_state.get("phase") == "settling":
+            # Pump (re)started during the settle wait — the settle is void, this
+            # is the real fill. Fall back to waiting for it to finish so the
+            # 2-minute clock starts from the true pump stop.
+            calibration_state["phase"] = "wait_for_fill"
+            calibration_state["flow_started"] = True
+            calibration_state["flow_start_actual"] = actual
+            calibration_state["settle_deadline"] = None
+            print("Calibration: flow started during settle - back to wait_for_fill", flush=True)
             _refresh_calibration_window()
         if not control_active:
             flow_cycle_counter += 1
