@@ -3129,6 +3129,12 @@ def _build_dashboard_state_snapshot():
         "back_tank_gal": round(mopeka2_gallons, 1),
         "front_tank_quality": int(mopeka1_quality),
         "back_tank_quality": int(mopeka2_quality),
+        # Raw sensor level so WiFi clients can show inches like the BLE
+        # sensor characteristics do (level_in is offset-compensated).
+        "front_tank_mm": round(float(mopeka1_level_mm), 1),
+        "back_tank_mm": round(float(mopeka2_level_mm), 1),
+        "front_tank_in": round(float(mopeka1_level_in), 2),
+        "back_tank_in": round(float(mopeka2_level_in), 2),
         "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
@@ -3149,6 +3155,21 @@ def _calibration_snapshot():
     if st.get("phase") == "settling" and st.get("settle_deadline"):
         settle_remaining = max(0, int(st["settle_deadline"] - time.time()))
     reading = st.get("reading")
+    # Offset mode review: what the existing curve EXPECTS the level to be at
+    # the gallons actually pumped, so the app can show original vs measured
+    # before the point is accepted.
+    expected_in = None
+    if (
+        st.get("mode") == "offset"
+        and st.get("phase") == "review"
+        and reading
+        and st.get("curve_rows")
+        and st.get("last_step_actual") is not None
+    ):
+        try:
+            expected_in = round(expected_level_in(st["curve_rows"], float(st["last_step_actual"])), 2)
+        except Exception:
+            expected_in = None
     return {
         "mode": st.get("mode", "full"),
         "phase": st.get("phase"),
@@ -3162,6 +3183,10 @@ def _calibration_snapshot():
             if targets else (st.get("current_step") or 0)
         ), 1),
         "settle_remaining": settle_remaining,
+        "actual_gallons": (
+            None if st.get("last_step_actual") is None
+            else round(float(st["last_step_actual"]), 1)
+        ),
         "points_recorded": (
             len(st.get("offset_points") or []) if st.get("mode") == "offset"
             else len(st.get("points") or [])
@@ -3171,6 +3196,7 @@ def _calibration_snapshot():
             "in": round(float(reading.get("level_in") or 0), 2),
             "gal": round(float(reading.get("gallons") or 0), 1),
             "q": int(reading.get("quality") or 0),
+            **({"ex": expected_in} if expected_in is not None else {}),
         },
         "offset_result": st.get("offset_result"),
         "error": st.get("profile_error") or None,

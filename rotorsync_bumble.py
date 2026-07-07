@@ -797,6 +797,8 @@ def _compact_calibration_block(state):
         compact['pt'] = cal['points_total']
     if cal.get('settle_remaining') is not None:
         compact['sr'] = cal['settle_remaining']
+    if cal.get('actual_gallons') is not None:
+        compact['ac'] = cal['actual_gallons']
     reading = cal.get('reading')
     if isinstance(reading, dict):
         compact['rd'] = reading

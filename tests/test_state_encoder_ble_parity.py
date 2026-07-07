@@ -72,8 +72,8 @@ def _calibrating_state():
     state["calibration"] = {
         "mode": "offset", "phase": "review", "tank": "back", "step_index": 2,
         "points_total": 4, "target_gallons": 75.0, "settle_remaining": 42,
-        "points_recorded": 3,
-        "reading": {"mm": 1204.5, "in": 47.42, "gal": 118.3, "q": 3},
+        "points_recorded": 3, "actual_gallons": 50.2,
+        "reading": {"mm": 1204.5, "in": 47.42, "gal": 118.3, "q": 3, "ex": 46.9},
         "offset_result": None, "error": None,
     }
     return state
