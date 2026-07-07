@@ -302,6 +302,38 @@ def _is_clear_trailer_value(value):
     return text in ('', '0', 'none', 'null', 'unconfigured', 'unassigned', 'clear')
 
 
+def _schedule_bumble_identity_refresh(reason):
+    """Restart the rotorsync (bumble BLE) service so a WiFi-side trailer
+    assign/clear takes effect on the box's BLE identity.
+
+    bumble has NO watcher on mopeka_config.json (only the calibration files),
+    so a WiFi-side SELECT_TRAILER used to persist the change and then nothing
+    happened until the next reboot — the box kept advertising (and scanning
+    sensors for) the OLD trailer. Field report 2026-07-07: box cleared over
+    WiFi kept its TR11 BLE identity. Mirrors bumble's own
+    _schedule_identity_restart, delayed so the config response reaches the
+    app before the BLE side bounces. rotorlink runs as root; restarting
+    rotorsync does not touch this process.
+    """
+    async def _restart():
+        await asyncio.sleep(1.5)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "restart", "rotorsync",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            logger.info("rotorsync identity refresh requested: %s", reason)
+        except Exception as e:
+            logger.warning("rotorsync identity refresh failed (%s): %s", reason, e)
+
+    try:
+        asyncio.get_running_loop().create_task(_restart())
+    except RuntimeError:
+        logger.warning("no running loop; rotorsync identity refresh skipped: %s", reason)
+
+
 def _clear_trailer_assignment():
     """bumble: clear_trailer_assignment — persist the cleared assignment to
     mopeka_config.json (same file write; bumble re-reads it and refreshes its
@@ -739,6 +771,7 @@ class ConfigHandler:
         trailer_value = cmd.get("trailer")
         if _is_clear_trailer_value(trailer_value):
             result = _clear_trailer_assignment()
+            _schedule_bumble_identity_refresh("trailer cleared over WiFi")
             return {
                 "ok": True,
                 "op": "SELECT_TRAILER",
@@ -762,6 +795,7 @@ class ConfigHandler:
                 "request_id": request_id,
                 "error": f"Trailer {trailer_num} not found",
             }
+        _schedule_bumble_identity_refresh(f"trailer changed to {trailer_num} over WiFi")
         return {
             "ok": True,
             "op": "SELECT_TRAILER",
