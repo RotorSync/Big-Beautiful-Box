@@ -291,6 +291,36 @@ def _current_trailer_info():
     }
 
 
+def _is_clear_trailer_value(value):
+    """bumble: _is_clear_trailer_value — SELECT_TRAILER with 0/none/empty means
+    'clear the assignment', not 'look up trailer 0'. The WiFi handler lacked
+    this branch, so the app's Unassign Trailer failed with 'Trailer 0 not
+    found' over WiFi while working over BLE (field report 2026-07-07)."""
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in ('', '0', 'none', 'null', 'unconfigured', 'unassigned', 'clear')
+
+
+def _clear_trailer_assignment():
+    """bumble: clear_trailer_assignment — persist the cleared assignment to
+    mopeka_config.json (same file write; bumble re-reads it and refreshes its
+    BLE identity on its own cadence, exactly like _apply_trailer)."""
+    cfg = _load_config()
+    cfg.update(
+        {
+            "box_mode": _normalize_box_mode(cfg.get("box_mode")),
+            "assigned_trailer": None,
+            "trailer": None,
+            "display_name": "",
+            "front_id": "",
+            "back_id": "",
+        }
+    )
+    _save_config(cfg)
+    return None
+
+
 def _apply_trailer(trailer_num):
     """bumble: apply_trailer — persist trailer selection to mopeka_config.json.
 
@@ -706,8 +736,17 @@ class ConfigHandler:
                 "request_id": request_id,
                 "error": "Trailer selection disabled in customer mode",
             }
+        trailer_value = cmd.get("trailer")
+        if _is_clear_trailer_value(trailer_value):
+            result = _clear_trailer_assignment()
+            return {
+                "ok": True,
+                "op": "SELECT_TRAILER",
+                "request_id": request_id,
+                "current": result,
+            }
         try:
-            trailer_num = int(cmd.get("trailer"))
+            trailer_num = int(trailer_value)
         except Exception:
             return {
                 "ok": False,
