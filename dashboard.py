@@ -3263,26 +3263,32 @@ def _record_offset_point(actual_gallons):
     })
 
 
-def _apply_offset_calibration():
-    """Average the offset diffs and persist the new per-sensor Height Offset.
-    Returns a human summary string (shown where the full mode shows the
-    profile path)."""
+def _compute_offset_result():
+    """Average the offset diffs against the sensor's current Height Offset.
+    Pure read — used both for the pre-apply preview (complete phase) and the
+    actual apply, so the number the operator confirms is the number saved."""
     tank = calibration_state["tank"]
     sensor_id = _selected_tank_sensor_id(tank)
     if not sensor_id:
         raise ValueError(f"no {tank} sensor configured")
     adjustment = offset_adjustment_inches(calibration_state["offset_diffs"])
     current = _read_sensor_height_offset(sensor_id)
-    new_offset = round(current + adjustment, 2)
-    _write_sensor_height_offset(sensor_id, new_offset)
-    calibration_state["offset_result"] = {
+    return {
         "sensor_id": sensor_id,
         "previous_offset_in": current,
         "adjustment_in": adjustment,
-        "new_offset_in": new_offset,
+        "new_offset_in": round(current + adjustment, 2),
         "points": len(calibration_state["offset_diffs"]),
     }
-    return f"offset {current:+.2f} -> {new_offset:+.2f} in ({sensor_id})"
+
+
+def _apply_offset_calibration():
+    """Persist the averaged Height Offset. Returns a human summary string
+    (shown where the full mode shows the profile path)."""
+    result = _compute_offset_result()
+    _write_sensor_height_offset(result["sensor_id"], result["new_offset_in"])
+    calibration_state["offset_result"] = result
+    return "offset {previous_offset_in:+.2f} -> {new_offset_in:+.2f} in ({sensor_id})".format(**result)
 
 
 def _apply_tank_calibration_profile():
@@ -3378,15 +3384,26 @@ def _refresh_calibration_window():
         footer = "OV = SAVE/NEXT   +1 = REREAD   -1 = WAIT 2 MORE MIN   PS = ABORT"
         hint = "Confirm the Mopeka reading before continuing."
     elif phase == "complete":
-        profile_path = _current_tank_calibration_profile_path(calibration_state["tank"])
-        body = (
-            f"{tank_label} Tank Calibration Complete\n\n"
-            f"Saved {len(calibration_state['points'])} calibration points\n"
-            f"through {calibration_state['target_capacity']} gallons.\n\n"
-            "Apply this as the live tank curve?"
-        )
-        footer = "OV = APPLY PROFILE   PS = RETURN"
-        hint = profile_path
+        if calibration_state.get("mode") == "offset" and calibration_state.get("offset_result"):
+            r = calibration_state["offset_result"]
+            body = (
+                f"{tank_label} Tank Offset Measured\n\n"
+                f"{r['points']} points, avg correction {r['adjustment_in']:+.2f} in\n"
+                f"Height Offset {r['previous_offset_in']:+.2f} -> {r['new_offset_in']:+.2f} in\n\n"
+                "Save this offset to the sensor?"
+            )
+            footer = "OV = SAVE OFFSET   PS = RETURN"
+            hint = r["sensor_id"]
+        else:
+            profile_path = _current_tank_calibration_profile_path(calibration_state["tank"])
+            body = (
+                f"{tank_label} Tank Calibration Complete\n\n"
+                f"Saved {len(calibration_state['points'])} calibration points\n"
+                f"through {calibration_state['target_capacity']} gallons.\n\n"
+                "Apply this as the live tank curve?"
+            )
+            footer = "OV = APPLY PROFILE   PS = RETURN"
+            hint = profile_path
     elif phase == "applied":
         body = (
             f"{tank_label} Tank Calibration Applied\n\n"
@@ -3723,6 +3740,13 @@ def calibration_confirm():
                 _calibration_prepare_next_step()
                 return
         _save_calibration_run()
+        if calibration_state.get("mode") == "offset":
+            # Preview so the operator sees the proposed offset BEFORE
+            # confirming; nothing is written until the complete-phase confirm.
+            try:
+                calibration_state["offset_result"] = _compute_offset_result()
+            except Exception:
+                calibration_state["offset_result"] = None  # apply will surface the error
         calibration_state["phase"] = "complete"
     elif phase == "complete":
         try:
