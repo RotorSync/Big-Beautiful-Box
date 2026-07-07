@@ -3155,7 +3155,12 @@ def _calibration_snapshot():
         "tank": st.get("tank"),
         "step_index": int(st.get("target_index", 0)),
         "points_total": len(targets) if targets else None,
-        "target_gallons": round(float(st.get("current_step") or 0), 1),
+        # Before the first fill current_step still holds the legacy default;
+        # the target list is authoritative when present.
+        "target_gallons": round(float(
+            targets[min(int(st.get("target_index", 0)), len(targets) - 1)]
+            if targets else (st.get("current_step") or 0)
+        ), 1),
         "settle_remaining": settle_remaining,
         "points_recorded": (
             len(st.get("offset_points") or []) if st.get("mode") == "offset"
