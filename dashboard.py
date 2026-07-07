@@ -497,6 +497,10 @@ bms_voltage = None
 # meter blips / post-shutoff dribble were starting the settle countdown
 # before the pump ever ran.
 CALIBRATION_MIN_FILL_GALLONS = 2.0
+# An offset correction beyond this is never a real mounting offset — it means
+# the sensor wasn't reading during the run (a dead sensor measures 0.00 in at
+# every point, which averaged to a +49 in "correction" in the field).
+MAX_OFFSET_ADJUSTMENT_IN = 6.0
 calibration_mode = False
 calibration_window = None
 calibration_title_label = None
@@ -3320,6 +3324,12 @@ def _apply_offset_calibration():
     """Persist the averaged Height Offset. Returns a human summary string
     (shown where the full mode shows the profile path)."""
     result = _compute_offset_result()
+    if abs(result["adjustment_in"]) > MAX_OFFSET_ADJUSTMENT_IN:
+        raise ValueError(
+            f"Correction {result['adjustment_in']:+.1f} in is out of range "
+            f"(max ±{MAX_OFFSET_ADJUSTMENT_IN:.0f} in) — the sensor likely "
+            "wasn't reading during the run. Nothing was saved."
+        )
     _write_sensor_height_offset(result["sensor_id"], result["new_offset_in"])
     calibration_state["offset_result"] = result
     return "offset {previous_offset_in:+.2f} -> {new_offset_in:+.2f} in ({sensor_id})".format(**result)
@@ -3459,6 +3469,11 @@ def _refresh_calibration_window():
         )
         footer = "OV = YES, ABORT   PS = NO, GO BACK"
         hint = "Use OV to exit the calibration workflow."
+
+    # Guard refusals (dead sensor etc.) surface on the screen the operator is
+    # looking at instead of silently ignoring the button press.
+    if phase in ("confirm_empty", "review") and calibration_state.get("profile_error"):
+        body += f"\n\n! {calibration_state['profile_error']}"
 
     body_font_size = 54
     if phase in ("wait_for_fill", "settling", "review", "complete", "applied", "apply_error", "abort_confirm"):
@@ -3717,6 +3732,7 @@ def calibration_adjust_value(delta):
             max(10, calibration_state["target_capacity"] + delta),
         )
     elif phase == "review" and delta == -1:
+        calibration_state["profile_error"] = ""
         calibration_state["phase"] = "settling"
         calibration_state["settle_deadline"] = time.time() + 120
     _refresh_calibration_window()
@@ -3734,10 +3750,25 @@ def calibration_confirm():
     elif phase == "set_target":
         calibration_state["phase"] = "confirm_empty"
     elif phase == "confirm_empty":
+        reading = _selected_tank_reading()
+        # Offset mode compares readings to the curve, so a dead sensor (no
+        # advertisement since boot: 0 mm AND quality 0) poisons every point —
+        # refuse to start rather than "calibrate" against zeros.
+        if (
+            calibration_state.get("mode") == "offset"
+            and (reading.get("level_mm") or 0) <= 0
+            and (reading.get("quality") or 0) <= 0
+        ):
+            calibration_state["profile_error"] = (
+                "No signal from the tank sensor — check the Mopeka, then tap begin again."
+            )
+            _refresh_calibration_window()
+            return
+        calibration_state["profile_error"] = ""
         calibration_state["points"] = []
         calibration_state["offset_diffs"] = []
         calibration_state["offset_points"] = []
-        calibration_state["reading"] = _selected_tank_reading()
+        calibration_state["reading"] = reading
         if calibration_state.get("mode") == "offset":
             _record_offset_point(0.0)
         else:
@@ -3752,6 +3783,17 @@ def calibration_confirm():
         switch_mode("fill")
         _calibration_prepare_next_step()
     elif phase == "review":
+        # There are gallons in the tank at every fill point, so a 0 mm reading
+        # can only mean the sensor isn't reading — refuse to save the point.
+        reading = calibration_state.get("reading") or {}
+        if (reading.get("level_mm") or 0) <= 0:
+            calibration_state["profile_error"] = (
+                "Sensor reads 0 — no Mopeka signal. Fix the sensor, then use "
+                "'Wait 2 more minutes' to take a fresh reading."
+            )
+            _refresh_calibration_window()
+            return
+        calibration_state["profile_error"] = ""
         if calibration_state.get("mode") == "offset":
             _record_offset_point(calibration_state["last_step_actual"])
         else:
