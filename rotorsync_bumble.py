@@ -3154,7 +3154,12 @@ def _refresh_opt_runtime(repo_root):
         for file_path in mopeka_src.iterdir():
             if not file_path.is_file():
                 continue
-            if file_path.name == 'mopeka_config.json' and (mopeka_dst / file_path.name).exists():
+            # Never clobber per-box state: mopeka_config.json holds the trailer
+            # assignment, and the sensor CSV holds field-swapped sensor IDs and
+            # wizard-calibrated Height Offsets. The repo copies are seeds for
+            # fresh installs only.
+            if file_path.name in ('mopeka_config.json', 'mopeka-sensor-details.csv') \
+                    and (mopeka_dst / file_path.name).exists():
                 continue
             shutil.copy2(file_path, mopeka_dst / file_path.name)
         # The dashboard (user pi) writes here at runtime — calibration wizard
