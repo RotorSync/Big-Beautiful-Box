@@ -100,8 +100,11 @@ port=0
 # on STA, STAY until it falls below the lower STA_DROP (or disappears). The gap
 # between the two is hysteresis — it stops the box flapping AP<->STA at the edge
 # of hangar-WiFi range. Set STA_JOIN very high (e.g. 101) to effectively pin AP.
-STA_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_JOIN_SIGNAL", "55"))
-STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "40"))
+# Defaults retuned 2026-07-07 from fleet data: boxes hold Headings fine at
+# 42-54 (live: 42/48/54 across three trailers; old join>=55 stranded all of
+# them in AP after any blip). join 45 ~ -77dBm, drop 33 ~ -83dBm, stranded 40.
+STA_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_JOIN_SIGNAL", "45"))
+STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "33"))
 # STRANDED rescue: the JOIN/DROP hysteresis has a trap — a box whose spot sees
 # signal between DROP and JOIN (40..54) HOLDS a network fine but, once it falls
 # to AP (or boots there), never rejoins until a reboot catches a >=JOIN reading.
@@ -109,7 +112,7 @@ STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "40"))
 # clients for STRANDED_AFTER seconds, accept a known network at the lower
 # STRANDED_JOIN bar (kept above DROP so a bad join falls back and waits another
 # stranded period — flapping stays bounded to once per STRANDED_AFTER).
-STA_STRANDED_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_STRANDED_JOIN_SIGNAL", "45"))
+STA_STRANDED_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_STRANDED_JOIN_SIGNAL", "40"))
 STA_STRANDED_AFTER = int(os.environ.get("ROTORLINK_STA_STRANDED_AFTER", "600"))
 
 
