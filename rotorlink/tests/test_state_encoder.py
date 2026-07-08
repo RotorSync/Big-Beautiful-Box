@@ -91,5 +91,16 @@ eq("bc floor at 1", se.encode_ble_state(idle, client_count=0)["bc"], 1)
 eq("live telemetry", se.encode_live_telemetry(1.23456, 2.34567, 3.456, True),
    {"req": 1.235, "act": 2.346, "flow": 3.46, "rs": True})
 
+# mopeka payload carries the sensor level like the BLE characteristic does
+eq("mopeka with level", se.encode_mopeka({
+    "mopeka_enabled": True,
+    "front_tank_gal": 318.0, "front_tank_quality": 3,
+    "front_tank_mm": 610.5, "front_tank_in": 24.03,
+}, 1), {"gallons": 318.0, "quality": 3, "level_mm": 610.5, "level_in": 24.03})
+eq("mopeka level optional (old snapshot)", se.encode_mopeka({
+    "mopeka_enabled": True, "back_tank_gal": 100.0, "back_tank_quality": 2,
+}, 2), {"gallons": 100.0, "quality": 2})
+eq("mopeka disabled", se.encode_mopeka({"mopeka_enabled": False, "front_tank_gal": 5}, 1), None)
+
 print("\nSTATE ENCODER:", "ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
 sys.exit(1 if fails else 0)

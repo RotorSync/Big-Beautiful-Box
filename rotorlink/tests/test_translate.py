@@ -79,6 +79,15 @@ eq("set_batchmix invalid -> None",
    t.translate({"cmd": "set_batchmix", "data": {"a": 1}}), None)
 eq("set_batchmix no data -> None", t.translate({"cmd": "set_batchmix"}), None)
 
+# Calibration wizard verbs
+eq("cal_start", t.translate({"cmd": "cal_start", "params": {"mode": "full", "tank": "front", "total_capacity": 300, "points": 10}}),
+   'CAL_START:{"mode":"full","tank":"front","total_capacity":300,"points":10}')
+eq("cal_start no params", t.translate({"cmd": "cal_start"}), 'CAL_START:{}')
+eq("cal_confirm", t.translate({"cmd": "cal_confirm"}), "CAL_CONFIRM")
+eq("cal_cancel", t.translate({"cmd": "cal_cancel"}), "CAL_CANCEL")
+eq("cal_adjust", t.translate({"cmd": "cal_adjust", "delta": -1}), "CAL_ADJUST:-1")
+eq("cal_adjust invalid", t.translate({"cmd": "cal_adjust", "delta": "x"}), None)
+
 # Non-commands / junk
 eq("client_hello -> None", t.translate({"cmd": "client_hello"}), None)
 eq("unknown -> None", t.translate({"cmd": "frobnicate"}), None)

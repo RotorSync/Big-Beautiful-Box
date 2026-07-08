@@ -778,6 +778,37 @@ def _flow_fault_summary_from_state(state):
     return False, None, None
 
 
+
+def _compact_calibration_block(state):
+    """Compact wizard state for the BLE/WiFi state payload (None when idle).
+    MUST stay in parity with rotorlink.state_encoder (test enforces it)."""
+    cal = state.get('calibration')
+    if not isinstance(cal, dict):
+        return None
+    compact = {
+        'md': cal.get('mode'),
+        'ph': cal.get('phase'),
+        'tk': cal.get('tank'),
+        'si': cal.get('step_index'),
+        'tg': cal.get('target_gallons'),
+        'n': cal.get('points_recorded'),
+    }
+    if cal.get('points_total') is not None:
+        compact['pt'] = cal['points_total']
+    if cal.get('settle_remaining') is not None:
+        compact['sr'] = cal['settle_remaining']
+    if cal.get('actual_gallons') is not None:
+        compact['ac'] = cal['actual_gallons']
+    reading = cal.get('reading')
+    if isinstance(reading, dict):
+        compact['rd'] = reading
+    if cal.get('offset_result'):
+        compact['or'] = cal['offset_result']
+    if cal.get('error'):
+        compact['er'] = cal['error']
+    return compact
+
+
 def _encode_ble_state_payload(state):
     """Encode the dashboard snapshot into a compact BLE/iOS-friendly JSON payload."""
     def put_if_present(target, key, value):
@@ -845,6 +876,7 @@ def _encode_ble_state_payload(state):
     put_bool_if_non_default(compact, 'ff', flow_fault_active, False)
     put_if_present(compact, 'fc', flow_fault_code if flow_fault_active else None)
     put_if_present(compact, 'fmr', flow_fault_reason if flow_fault_active else None)
+    put_if_present(compact, 'cal', _compact_calibration_block(state))
     return json.dumps(compact, separators=(',', ':'))
 
 
@@ -3122,9 +3154,24 @@ def _refresh_opt_runtime(repo_root):
         for file_path in mopeka_src.iterdir():
             if not file_path.is_file():
                 continue
-            if file_path.name == 'mopeka_config.json' and (mopeka_dst / file_path.name).exists():
+            # Never clobber per-box state: mopeka_config.json holds the trailer
+            # assignment, and the sensor CSV holds field-swapped sensor IDs and
+            # wizard-calibrated Height Offsets. The repo copies are seeds for
+            # fresh installs only.
+            if file_path.name in ('mopeka_config.json', 'mopeka-sensor-details.csv') \
+                    and (mopeka_dst / file_path.name).exists():
                 continue
             shutil.copy2(file_path, mopeka_dst / file_path.name)
+        # The dashboard (user pi) writes here at runtime — calibration wizard
+        # Height Offset saves + profile CSVs. Root-owned copies made those fail
+        # with EACCES on the .tmp file, so hand the tree to the repo owner.
+        try:
+            repo_stat = os.stat(repo_root)
+            os.chown(mopeka_dst, repo_stat.st_uid, repo_stat.st_gid)
+            for file_path in mopeka_dst.iterdir():
+                os.chown(file_path, repo_stat.st_uid, repo_stat.st_gid)
+        except OSError as e:
+            print(f'/opt/mopeka ownership normalize failed: {e}', flush=True)
     for relative in ('deploy/bbb-logrotate.conf', 'deploy/bbb-logrotate.service', 'deploy/bbb-logrotate.timer'):
         src = repo_root / relative
         if not src.exists():
@@ -3586,6 +3633,32 @@ def command_write_handler(connection, value):
         _enqueue_control_actions(connection, 'command:reset_flow', 'RESET')
         return
 
+    # Remote tank-calibration wizard (app-driven; the dashboard owns the run).
+    if command == 'cal_start':
+        params = cmd.get('params') if isinstance(cmd.get('params'), dict) else {}
+        _enqueue_control_actions(
+            connection, 'command:cal_start',
+            'CAL_START:' + json.dumps(params, separators=(',', ':')),
+        )
+        return
+
+    if command == 'cal_confirm':
+        _enqueue_control_actions(connection, 'command:cal_confirm', 'CAL_CONFIRM')
+        return
+
+    if command == 'cal_cancel':
+        _enqueue_control_actions(connection, 'command:cal_cancel', 'CAL_CANCEL')
+        return
+
+    if command == 'cal_adjust':
+        try:
+            delta = int(cmd.get('delta'))
+        except (TypeError, ValueError):
+            print(f'cal_adjust ignored: invalid delta {cmd.get("delta")!r}', flush=True)
+            return
+        _enqueue_control_actions(connection, 'command:cal_adjust', f'CAL_ADJUST:{delta}')
+        return
+
     if command in ('ov', 'override_press', 'switch_ov'):
         _enqueue_control_actions(connection, 'command:ov', 'OV')
         return
@@ -3943,7 +4016,10 @@ def save_calibration_csv(points, path=CALIBRATION_CSV_PATH):
 
 
 def _calibration_file_mtimes():
-    paths = [CALIBRATION_CSV_PATH]
+    # SENSOR_CSV_PATH is watched too: the calibration wizard's OFFSET mode
+    # rewrites a sensor's Height Offset there (via the dashboard), and the
+    # converter must pick it up without a restart.
+    paths = [CALIBRATION_CSV_PATH, SENSOR_CSV_PATH]
     if os.path.isdir(CALIBRATION_PROFILE_DIR):
         for name in sorted(os.listdir(CALIBRATION_PROFILE_DIR)):
             if name.lower().endswith('.csv'):

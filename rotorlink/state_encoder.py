@@ -119,6 +119,36 @@ def encode_ble_state(state: dict, client_count: int = 1) -> dict:
     _put_bool_if_non_default(compact, "ff", flow_fault_active, False)
     _put_if_present(compact, "fc", flow_fault_code if flow_fault_active else None)
     _put_if_present(compact, "fmr", flow_fault_reason if flow_fault_active else None)
+    _put_if_present(compact, "cal", _compact_calibration_block(state))
+    return compact
+
+
+def _compact_calibration_block(state: dict):
+    """bumble: _compact_calibration_block — MUST stay in parity (test enforces)."""
+    cal = state.get("calibration")
+    if not isinstance(cal, dict):
+        return None
+    compact = {
+        "md": cal.get("mode"),
+        "ph": cal.get("phase"),
+        "tk": cal.get("tank"),
+        "si": cal.get("step_index"),
+        "tg": cal.get("target_gallons"),
+        "n": cal.get("points_recorded"),
+    }
+    if cal.get("points_total") is not None:
+        compact["pt"] = cal["points_total"]
+    if cal.get("settle_remaining") is not None:
+        compact["sr"] = cal["settle_remaining"]
+    if cal.get("actual_gallons") is not None:
+        compact["ac"] = cal["actual_gallons"]
+    reading = cal.get("reading")
+    if isinstance(reading, dict):
+        compact["rd"] = reading
+    if cal.get("offset_result"):
+        compact["or"] = cal["offset_result"]
+    if cal.get("error"):
+        compact["er"] = cal["error"]
     return compact
 
 
@@ -148,17 +178,22 @@ def encode_bms(state: dict):
 
 def encode_mopeka(state: dict, index: int):
     """Tank payload matching the BLE MOPEKA characteristic, from the dashboard's
-    per-tank gallons + quality. The mm/inch fields the BLE sensor path provides
-    aren't in the dashboard snapshot, so they're omitted (the app decodes them as
-    nil). index 1 = front tank, 2 = back tank. Returns None when mopeka is off."""
+    per-tank gallons/quality/level. level_in is the offset-compensated inches,
+    same value the BLE sensor path sends (the Monitor shows it under the
+    gallons). index 1 = front tank, 2 = back tank. Returns None when mopeka is
+    off."""
     if not state.get("mopeka_enabled"):
         return None
     if index == 1:
         gallons = state.get("front_tank_gal")
         quality = state.get("front_tank_quality")
+        level_mm = state.get("front_tank_mm")
+        level_in = state.get("front_tank_in")
     else:
         gallons = state.get("back_tank_gal")
         quality = state.get("back_tank_quality")
+        level_mm = state.get("back_tank_mm")
+        level_in = state.get("back_tank_in")
     if gallons is None and quality is None:
         return None
     out = {}
@@ -166,4 +201,8 @@ def encode_mopeka(state: dict, index: int):
         out["gallons"] = gallons
     if quality is not None:
         out["quality"] = quality
+    if level_mm is not None:
+        out["level_mm"] = level_mm
+    if level_in is not None:
+        out["level_in"] = level_in
     return out
