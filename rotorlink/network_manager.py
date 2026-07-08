@@ -23,6 +23,7 @@ import logging
 import os
 import socket
 import subprocess
+import time
 
 logger = logging.getLogger("rotorlink.network")
 
@@ -101,6 +102,24 @@ port=0
 # of hangar-WiFi range. Set STA_JOIN very high (e.g. 101) to effectively pin AP.
 STA_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_JOIN_SIGNAL", "55"))
 STA_DROP_SIGNAL = int(os.environ.get("ROTORLINK_STA_DROP_SIGNAL", "40"))
+# STRANDED rescue: the JOIN/DROP hysteresis has a trap — a box whose spot sees
+# signal between DROP and JOIN (40..54) HOLDS a network fine but, once it falls
+# to AP (or boots there), never rejoins until a reboot catches a >=JOIN reading.
+# Field-observed fleet-wide at the north hangar pad. After sitting in AP with no
+# clients for STRANDED_AFTER seconds, accept a known network at the lower
+# STRANDED_JOIN bar (kept above DROP so a bad join falls back and waits another
+# stranded period — flapping stays bounded to once per STRANDED_AFTER).
+STA_STRANDED_JOIN_SIGNAL = int(os.environ.get("ROTORLINK_STA_STRANDED_JOIN_SIGNAL", "45"))
+STA_STRANDED_AFTER = int(os.environ.get("ROTORLINK_STA_STRANDED_AFTER", "600"))
+
+
+def join_threshold(current_mode, ap_idle_seconds):
+    """Signal bar a known network must clear for us to want STA right now."""
+    if current_mode == "sta":
+        return STA_DROP_SIGNAL
+    if ap_idle_seconds is not None and ap_idle_seconds >= STA_STRANDED_AFTER:
+        return min(STA_JOIN_SIGNAL, max(STA_STRANDED_JOIN_SIGNAL, STA_DROP_SIGNAL + 2))
+    return STA_JOIN_SIGNAL
 # A mode switch must be WANTED for this many consecutive evals before we act, so a
 # single transient nmcli read (mid-transition state, a one-off stale scan) can't
 # flap a working link — e.g. tear a healthy hangar STA down to an AP on one blip.
@@ -131,6 +150,7 @@ class NetworkManager:
         self._mode = "unknown"   # "ap" | "sta" | "unknown"
         self._pending = None     # the mode we're accumulating debounce for
         self._pending_count = 0  # consecutive evals that wanted self._pending
+        self._ap_idle_since = None  # monotonic ts we've been AP with 0 clients (stranded rescue)
 
     # --- state queries ----------------------------------------------------
     def _saved_sta_conns(self) -> dict:
@@ -319,8 +339,10 @@ class NetworkManager:
     async def run(self) -> None:
         logger.info(
             "network manager: AP_ENABLED=%s iface=%s ap_ssid=%s sta_join>=%s sta_drop<%s "
+            "stranded_join>=%s after %ss idle "
             "(default=AP; join known WiFi only above the signal gate, idle-gated)",
             AP_ENABLED, AP_IFACE, AP_SSID, STA_JOIN_SIGNAL, STA_DROP_SIGNAL,
+            STA_STRANDED_JOIN_SIGNAL, STA_STRANDED_AFTER,
         )
         self.ensure_ap_profile()  # safe: autoconnect off
         loop = asyncio.get_running_loop()
@@ -334,7 +356,19 @@ class NetworkManager:
                 # STA-preferred, but signal-gated with hysteresis: leave the AP to
                 # join a known network only when its signal clears STA_JOIN; once on
                 # STA, stay until it drops below STA_DROP (or vanishes -> best=-1).
-                threshold = STA_DROP_SIGNAL if current == "sta" else STA_JOIN_SIGNAL
+                # After sitting in AP with no clients for STRANDED_AFTER, the join
+                # bar relaxes to STRANDED_JOIN (see join_threshold).
+                now = time.monotonic()
+                if current == "ap" and clients == 0:
+                    if self._ap_idle_since is None:
+                        self._ap_idle_since = now
+                else:
+                    self._ap_idle_since = None
+                ap_idle = None if self._ap_idle_since is None else now - self._ap_idle_since
+                threshold = join_threshold(current, ap_idle)
+                if current != "sta" and threshold < STA_JOIN_SIGNAL and best_sig >= threshold:
+                    logger.info("stranded in AP %ds with no clients — join bar relaxed to %s (best %s(%s))",
+                                int(ap_idle), threshold, best_sig, best_ssid)
                 desired = "sta" if best_sig >= threshold else "ap"
 
                 # a down/disconnected wlan0 reports current=="unknown"; we converge

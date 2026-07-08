@@ -65,5 +65,16 @@ check("arb on: explicit viewer never auto-promoted", s3._authorize(explicit_view
 check("arb on: explicit viewer still allowed read", s3._authorize(explicit_viewer, "STATE_JSON") is True)
 
 srv.ARBITRATION = False  # restore
+
+# --- network manager: stranded-in-AP join threshold ---
+from rotorlink import network_manager as nm
+check("sta holds down to DROP", nm.join_threshold("sta", None) == nm.STA_DROP_SIGNAL)
+check("ap normally needs JOIN", nm.join_threshold("ap", None) == nm.STA_JOIN_SIGNAL)
+check("ap idle but not stranded yet", nm.join_threshold("ap", nm.STA_STRANDED_AFTER - 1) == nm.STA_JOIN_SIGNAL)
+check("stranded ap relaxes to STRANDED_JOIN",
+      nm.join_threshold("ap", nm.STA_STRANDED_AFTER) == max(nm.STA_STRANDED_JOIN_SIGNAL, nm.STA_DROP_SIGNAL + 2))
+check("stranded bar stays above DROP", nm.join_threshold("ap", nm.STA_STRANDED_AFTER) > nm.STA_DROP_SIGNAL)
+check("unknown mode uses JOIN when not stranded", nm.join_threshold("unknown", None) == nm.STA_JOIN_SIGNAL)
+
 print("\nUNIT:", "ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
 sys.exit(1 if fails else 0)
