@@ -3157,6 +3157,16 @@ def _refresh_opt_runtime(repo_root):
             if file_path.name == 'mopeka_config.json' and (mopeka_dst / file_path.name).exists():
                 continue
             shutil.copy2(file_path, mopeka_dst / file_path.name)
+        # The dashboard (user pi) writes here at runtime — calibration wizard
+        # Height Offset saves + profile CSVs. Root-owned copies made those fail
+        # with EACCES on the .tmp file, so hand the tree to the repo owner.
+        try:
+            repo_stat = os.stat(repo_root)
+            os.chown(mopeka_dst, repo_stat.st_uid, repo_stat.st_gid)
+            for file_path in mopeka_dst.iterdir():
+                os.chown(file_path, repo_stat.st_uid, repo_stat.st_gid)
+        except OSError as e:
+            print(f'/opt/mopeka ownership normalize failed: {e}', flush=True)
     for relative in ('deploy/bbb-logrotate.conf', 'deploy/bbb-logrotate.service', 'deploy/bbb-logrotate.timer'):
         src = repo_root / relative
         if not src.exists():
