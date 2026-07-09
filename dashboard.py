@@ -322,6 +322,7 @@ last_reminder_date = None  # Track the last date reminders were shown (YYYY-MM-D
 reminders_mode = False  # Track if we're showing reminders
 reminders_window = None  # Reference to reminders window
 menu_mode = False  # Track if we're in menu mode
+last_operator_input_ts = 0.0  # last non-OK/non-OV serial command time (OV phantom diagnostics)
 menu_window = None  # Reference to menu window
 menu_selected_index = 0  # Currently selected menu item (0=logs, 1=self-test, 2=update, 3=shutdown, 4=reboot, 5=exit-desktop, 6=exit-menu)
 menu_buttons = []  # List of menu button widgets
@@ -7132,11 +7133,33 @@ def socket_command_listener():
             print(f"Socket listener error: {e}")
             time.sleep(1)
 
+def _log_ov_diag(source):
+    """One-line context snapshot on every OV, to catch what triggers a phantom OV.
+    Event-driven (OV is rare), reads existing globals only, wrapped so it can never
+    break the serial loop. idle_since_operator_input is the key signal: large => the
+    OV arrived with no recent knob/button activity (a true no-press phantom); small =>
+    bounce/mispress. Cross-reference the timestamp against the rotorsync journal
+    'GATT client connected' lines for BLE correlation."""
+    try:
+        idle = (time.time() - last_operator_input_ts) if last_operator_input_ts else -1.0
+        msg = (f"[OV-DIAG] {source} idle_since_operator_input={idle:.1f}s "
+               f"flow_gpm={flow_gpm:.2f} pump_latched={auto_shutoff_latched} "
+               f"slowdown_alarm={relay_slowdown_alarm_active} switch_box={switch_box_connected} "
+               f"override_before={override_mode} gallons={requested_gallons} menu={menu_mode}")
+        print(msg)
+        log_serial_debug(msg)
+    except Exception as e:
+        try:
+            log_serial_debug(f"[OV-DIAG] snapshot error: {e}")
+        except Exception:
+            pass
+
+
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
     global fill_requested_gallons, mix_requested_gallons, current_mode
-    global last_serial_ov_toggle_time
+    global last_serial_ov_toggle_time, last_operator_input_ts
 
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
@@ -7178,6 +7201,13 @@ def serial_listener():
                                 last_heartbeat_time = time.time()
                                 log_serial_debug("Heartbeat received (OK)")
                                 continue  # Don't process OK as a command
+
+                            # --- Phantom-OV diagnostics (event-driven; OV is rare) ---
+                            if line == 'OV':
+                                _log_ov_diag("Serial")
+                            elif line != 'BOOT':
+                                last_operator_input_ts = time.time()
+                            # ---------------------------------------------------------
 
                             if should_ignore_menu_ov_bounce(line, "Serial"):
                                 continue
