@@ -120,6 +120,12 @@ PROGRAM_STARTED_AT = time.time()
 
 # Import configuration
 import config
+# Module-level fallback: several helpers (should_ignore_menu_ov_bounce,
+# adjust_batch_mix_gallons, set_batch_mix_gallons, set_requested_gallons) write to
+# this outside serial_listener/socket scope, where it was undefined -> NameError
+# aborted the serial read loop (broke the menu OV-bounce guard). serial_listener
+# and socket_command_listener still assign their own identical local.
+debug_log = config.SERIAL_DEBUG_LOG
 
 if SIM_MODE:
     config.MAIN_LOG_FILE = _pi_path(config.MAIN_LOG_FILE)
