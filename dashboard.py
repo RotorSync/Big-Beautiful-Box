@@ -9365,7 +9365,7 @@ def daily_reminder_checker():
         try:
             current_time = time.localtime()
             current_hour = current_time.tm_hour
-            current_minute = current_time.tm_minute
+            current_minute = current_time.tm_min
             current_date = time.strftime('%Y-%m-%d')
 
             # Check if it's 2 AM and we haven't shown reminders today
