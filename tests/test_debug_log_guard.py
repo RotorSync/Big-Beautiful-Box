@@ -6,6 +6,11 @@ with bare open() inside the handlers, so an OSError mid-press could kill the
 thumbs-up/green path before record_pending_fill() ran (lost load record) and
 could silently break menu navigation from the physical switch box. All such
 writes now go through append_debug_log(), which swallows I/O errors.
+
+The serial debug log (config.SERIAL_DEBUG_LOG, aliased as debug_log) had the
+same bare-open() pattern throughout serial_listener/socket_command_listener
+and the batch-mix/OV-bounce helpers, so an OSError could abort a serial
+command mid-handling; those writes are held to the same guard here.
 """
 import ast
 import time
@@ -142,16 +147,16 @@ def test_menu_select_survives_unwritable_debug_log():
     assert opened == ["logs"]
 
 
-def test_no_bare_opens_of_button_or_menu_debug_logs():
-    """Every button/menu debug-log write must route through append_debug_log."""
+def _bare_debug_log_opens(allowed_funcs):
+    """Yield (lineno, first_arg) for every open() call in dashboard.py that is
+    outside the named top-level functions (the guarded writers)."""
     source = DASHBOARD_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(DASHBOARD_PATH))
-    helper = next(
-        node
+    allowed_ranges = [
+        (node.lineno, node.end_lineno)
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "append_debug_log"
-    )
-    offenders = []
+        if isinstance(node, ast.FunctionDef) and node.name in allowed_funcs
+    ]
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
@@ -159,22 +164,68 @@ def test_no_bare_opens_of_button_or_menu_debug_logs():
             and node.func.id == "open"
         ):
             continue
-        if helper.lineno <= node.lineno <= helper.end_lineno:
+        if any(lo <= node.lineno <= hi for lo, hi in allowed_ranges):
             continue
-        arg = node.args[0] if node.args else None
+        yield node.lineno, (node.args[0] if node.args else None)
+
+
+def test_no_bare_opens_of_button_or_menu_debug_logs():
+    """Every button/menu debug-log write must route through append_debug_log."""
+    offenders = []
+    for lineno, arg in _bare_debug_log_opens({"append_debug_log"}):
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             if "button_debug.log" in arg.value or "menu_debug.log" in arg.value:
-                offenders.append(node.lineno)
+                offenders.append(lineno)
         elif isinstance(arg, ast.Name) and arg.id == "button_log":
-            offenders.append(node.lineno)
+            offenders.append(lineno)
         elif (
             isinstance(arg, ast.Attribute)
             and arg.attr in ("BUTTON_DEBUG_LOG", "MENU_DEBUG_LOG")
             and isinstance(arg.value, ast.Name)
             and arg.value.id == "config"
         ):
-            offenders.append(node.lineno)
+            offenders.append(lineno)
     assert offenders == [], (
         f"bare open() of button/menu debug log at lines {offenders}; "
         "route it through append_debug_log so a full SD card cannot kill the handler"
     )
+
+
+def test_no_bare_opens_of_serial_debug_log():
+    """Every serial debug-log write outside log_serial_debug/append_debug_log
+    must route through append_debug_log — a bare open() can raise OSError on a
+    full SD card mid-serial-command and abort the listener's handler."""
+    offenders = []
+    for lineno, arg in _bare_debug_log_opens({"append_debug_log", "log_serial_debug"}):
+        if isinstance(arg, ast.Name) and arg.id == "debug_log":
+            offenders.append(lineno)
+        elif (
+            isinstance(arg, ast.Attribute)
+            and arg.attr == "SERIAL_DEBUG_LOG"
+            and isinstance(arg.value, ast.Name)
+            and arg.value.id == "config"
+        ):
+            offenders.append(lineno)
+    assert offenders == [], (
+        f"bare open() of the serial debug log at lines {offenders}; "
+        "route it through append_debug_log so a full SD card cannot abort "
+        "serial-command handling"
+    )
+
+
+def test_menu_ov_bounce_guard_survives_unwritable_debug_log():
+    disk_full_open = DiskFullOpen()
+    logged = []
+    ns = {
+        "time": time,
+        "open": disk_full_open,
+        "debug_log": "/home/pi/serial_debug.log",
+        "menu_ov_guard_until": time.time() + 60,
+        "log_serial_debug": lambda message: logged.append(message),
+    }
+    _exec_namespace({"append_debug_log", "should_ignore_menu_ov_bounce"}, ns)
+
+    assert ns["should_ignore_menu_ov_bounce"]("OV", "serial") is True
+
+    assert disk_full_open.attempts == 1, "guard was never exercised"
+    assert logged == ["serial: Ignored OV bounce after menu select"]

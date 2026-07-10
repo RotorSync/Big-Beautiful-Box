@@ -1721,8 +1721,7 @@ def adjust_batch_mix_gallons(delta, source):
         msg = f"{source}: BatchMix gallon adjust failed: {exc}"
         print(msg)
         try:
-            with open(debug_log, "a") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
         except Exception:
             pass
         return True
@@ -1738,8 +1737,7 @@ def adjust_batch_mix_gallons(delta, source):
     )
     print(msg)
     try:
-        with open(debug_log, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
     except Exception:
         pass
 
@@ -1764,8 +1762,7 @@ def set_batch_mix_gallons(value, source):
         msg = f"{source}: BatchMix gallon set failed: {exc}"
         print(msg)
         try:
-            with open(debug_log, "a") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
         except Exception:
             pass
         return False
@@ -1781,8 +1778,7 @@ def set_batch_mix_gallons(value, source):
     )
     print(msg)
     try:
-        with open(debug_log, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
     except Exception:
         pass
 
@@ -1827,8 +1823,7 @@ def set_requested_gallons(value, source):
     msg = f"{source}: Set requested gallons to {requested_gallons:.3f}"
     print(msg)
     try:
-        with open(debug_log, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
     except Exception:
         pass
 
@@ -5175,8 +5170,7 @@ def should_ignore_menu_ov_bounce(line, source):
     msg = f"{source}: Ignored OV bounce after menu select"
     print(msg)
     log_serial_debug(msg)
-    with open(debug_log, 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
     return True
 
 
@@ -6662,8 +6656,7 @@ def socket_command_listener():
     sock_server.settimeout(1.0)
 
     print(f"Socket listener started on port {DASHBOARD_PORT}")
-    with open(debug_log, "a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket listener started on port {DASHBOARD_PORT}\n")
+    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket listener started on port {DASHBOARD_PORT}\n")
 
     while True:
         try:
@@ -6703,8 +6696,7 @@ def socket_command_listener():
                                     safe_line = 'WIFI_SET:{...}'
 
                             if line != "STATE_JSON":
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{safe_line}'\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Socket received: '{safe_line}'\n")
 
                             if line == "STATUS":
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -6837,8 +6829,7 @@ def socket_command_listener():
                             elif line == "RUN_UPDATE":
                                 msg = "Socket: Software update command received"
                                 print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 if update_mode:
                                     client.send(b"UPDATE_ALREADY_RUNNING\n")
                                 else:
@@ -6852,15 +6843,13 @@ def socket_command_listener():
                             elif line == "REBOOT":
                                 msg = "Socket: Reboot command received"
                                 print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 root.after(0, reboot_system)
 
                             elif line == "SHUTDOWN":
                                 msg = "Socket: Shutdown command received"
                                 print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 root.after(0, shutdown_system)
 
                             elif line.startswith("WIFI_SET:"):
@@ -6874,8 +6863,7 @@ def socket_command_listener():
                                     # Log without secrets
                                     msg = f"Socket: WIFI_SET requested for SSID '{ssid}' (hidden={hidden})"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                                     validation_error = _wifi_request_validation_error(
                                         str(ssid or '').strip(), str(password or '')
@@ -6917,8 +6905,7 @@ def socket_command_listener():
                                 error_msg = line[15:]
                                 msg = f"Socket: BatchMix ERROR - {error_msg}"
                                 print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 # Display error on screen
                                 root.after(0, lambda e=error_msg: show_batchmix_error(e))
 
@@ -6928,8 +6915,7 @@ def socket_command_listener():
                                     batch_mix_data = json.loads(json_str)
                                     msg = f"Socket: BatchMix received - {len(batch_mix_data.get('products', []))} products"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                                     # Store the BatchMix target as the mix preset. If we are already in
                                     # mix mode, also update the live target used by auto-stop.
@@ -6953,8 +6939,7 @@ def socket_command_listener():
                                 except Exception as bme:
                                     msg = f"Socket: BatchMix parse error: {bme}"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
 
                             elif line == "MOPEKA_OFFLINE":
@@ -7056,18 +7041,15 @@ def socket_command_listener():
                                     if line == '+1':
                                         msg = "Socket: Menu navigate down"
                                         print(msg)
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                         menu_navigate_down()
                                     elif line == '-1':
                                         msg = "Socket: Menu navigate up"
                                         print(msg)
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                         menu_navigate_up()
                                     else:
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
                                 else:
                                     try:
                                         adjustment = int(line)
@@ -7084,8 +7066,7 @@ def socket_command_listener():
                                         save_mode_presets()
                                         msg = f"Socket: Adjusted by {adjustment}, requested gallons now {requested_gallons}"
                                         print(msg)
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     except ValueError:
                                         pass
 
@@ -7093,79 +7074,67 @@ def socket_command_listener():
                                 if exit_confirm_window:
                                     msg = "Socket: Exit confirmation cancel"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if exit_cancel_handler:
                                         root.after(0, exit_cancel_handler)
                                 elif reset_season_confirm_window:
                                     msg = "Socket: Reset season confirmation cancel"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_season_cancel_handler:
                                         root.after(0, reset_season_cancel_handler)
                                 elif reset_flow_curve_confirm_window:
                                     msg = "Socket: Flow curve reset confirmation cancel"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_flow_curve_cancel_handler:
                                         root.after(0, reset_flow_curve_cancel_handler)
                                 elif accept_flow_curve_confirm_window:
                                     msg = "Socket: Flow curve accept confirmation cancel"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if accept_flow_curve_cancel_handler:
                                         root.after(0, accept_flow_curve_cancel_handler)
                                 elif calibration_mode:
                                     msg = "Socket: Calibration cancel/back"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, calibration_cancel)
                                 elif log_viewer_mode:
                                     msg = "Socket: Log viewer exit"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_log_viewer)
                                 elif fill_history_mode:
                                     msg = "Socket: Fill history exit"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_fill_history)
                                 elif self_test_mode:
                                     msg = "Socket: Self-test exit"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_self_test)
                                 elif full_test_mode:
                                     msg = "Socket: Full-test PS command detected"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if full_test_window and hasattr(full_test_window, 'mark_tested'):
                                         root.after(0, lambda: full_test_window.mark_tested('PS'))
                                 elif update_mode:
                                     msg = "Socket: Update exit"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_update)
                                 elif menu_mode:
                                     msg = "Socket: Menu close"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_menu)
                                 else:
                                     msg = "Socket: Pump Stop command received"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                             elif line in ('OV:1', 'OV:0'):
@@ -7174,29 +7143,25 @@ def socket_command_listener():
                                     override_enabled_time = time.time()
                                 msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'} (explicit)"
                                 print(msg)
-                                with open(debug_log, "a") as f:
-                                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             elif line == 'OV':
                                 if menu_mode:
                                     msg = "Socket: Menu select"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     arm_menu_ov_guard()
                                     root.after(0, menu_select)
                                 elif requested_gallons == 0:
                                     if current_mode == 'mix' and batch_mix_data is not None:
                                         msg = "Socket: Batch mix screen exit triggered (gallons=0, OV pressed)"
                                         print(msg)
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                         root.after(0, lambda: clear_batch_mix_screen("socket OV at zero gallons"))
                                     else:
                                         msg = "Socket: Menu access triggered (gallons=0, OV pressed)"
                                         print(msg)
-                                        with open(debug_log, "a") as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                         arm_menu_ov_guard()
                                         root.after(0, show_menu)
                                 else:
@@ -7205,8 +7170,7 @@ def socket_command_listener():
                                         override_enabled_time = time.time()
                                     msg = f"Socket: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
                                     print(msg)
-                                    with open(debug_log, "a") as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
                             client.send(b"OK\n")
                 except sock_module.timeout:
@@ -7303,181 +7267,152 @@ def serial_listener():
                                 if line == 'OV':
                                     msg = "Serial: Exit confirmation (OV - Confirm)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if exit_confirm_handler:
                                         root.after(0, exit_confirm_handler)
                                 elif line == 'PS':
                                     msg = "Serial: Exit confirmation (PS - Cancel)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if exit_cancel_handler:
                                         root.after(0, exit_cancel_handler)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in exit confirmation: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in exit confirmation: '{line}'\n")
 
                             # Handle reset season confirmation dialog
                             elif reset_season_confirm_window:
                                 if line == 'OV':
                                     msg = "Serial: Reset season confirmation (OV - Confirm)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_season_confirm_handler:
                                         root.after(0, reset_season_confirm_handler)
                                 elif line == 'PS':
                                     msg = "Serial: Reset season confirmation (PS - Cancel)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_season_cancel_handler:
                                         root.after(0, reset_season_cancel_handler)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
 
                             # Handle flow curve reset confirmation dialog
                             elif reset_flow_curve_confirm_window:
                                 if line == 'OV':
                                     msg = "Serial: Flow curve reset confirmation (OV - Confirm)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_flow_curve_confirm_handler:
                                         root.after(0, reset_flow_curve_confirm_handler)
                                 elif line == 'PS':
                                     msg = "Serial: Flow curve reset confirmation (PS - Cancel)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if reset_flow_curve_cancel_handler:
                                         root.after(0, reset_flow_curve_cancel_handler)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
 
                             # Handle learned flow curve accept confirmation dialog
                             elif accept_flow_curve_confirm_window:
                                 if line == 'OV':
                                     msg = "Serial: Flow curve accept confirmation (OV - Confirm)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if accept_flow_curve_confirm_handler:
                                         root.after(0, accept_flow_curve_confirm_handler)
                                 elif line == 'PS':
                                     msg = "Serial: Flow curve accept confirmation (PS - Cancel)"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     if accept_flow_curve_cancel_handler:
                                         root.after(0, accept_flow_curve_cancel_handler)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
 
                             # Handle reminders mode - dismiss on OV
                             elif reminders_mode:
                                 if line == 'OV':
                                     msg = "Serial: Dismiss reminders"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, dismiss_reminders)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reminders mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reminders mode: '{line}'\n")
 
                             elif calibration_mode:
                                 if calibration_state and calibration_state.get("phase") == "review" and line == '+1':
                                     msg = "Serial: Calibration reread"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, calibration_reread_now)
                                 elif line in ('+1', '-1', '+10', '-10'):
                                     msg = f"Serial: Calibration command {line}"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, calibration_adjust_value, int(line))
                                 elif line == 'OV':
                                     msg = "Serial: Calibration confirm"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, calibration_confirm)
                                 elif line == 'PS':
                                     msg = "Serial: Calibration cancel/back"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, calibration_cancel)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in calibration mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in calibration mode: '{line}'\n")
 
                             # Handle log viewer navigation if in log viewer mode
                             elif log_viewer_mode:
                                 if line == '+1':
                                     msg = "Serial: Log viewer scroll down"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, log_viewer_scroll_down)
                                 elif line == '-1':
                                     msg = "Serial: Log viewer scroll up"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, log_viewer_scroll_up)
                                 elif line == 'OV':
                                     msg = "Serial: Log viewer exit"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_log_viewer)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in log viewer mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in log viewer mode: '{line}'\n")
 
                             # Handle fill history navigation if in fill history mode
                             elif fill_history_mode:
                                 if line == '+1':
                                     msg = "Serial: Fill history scroll down"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, fill_history_scroll_down)
                                 elif line == '-1':
                                     msg = "Serial: Fill history scroll up"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, fill_history_scroll_up)
                                 elif line == 'OV':
                                     msg = "Serial: Fill history exit"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_fill_history)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in fill history mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in fill history mode: '{line}'\n")
 
                             # Handle self-test mode
                             elif self_test_mode:
                                 if line == 'OV':
                                     msg = "Serial: Self-test exit"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_self_test)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in self-test mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in self-test mode: '{line}'\n")
 
                             # Handle full-test mode
                             elif full_test_mode:
@@ -7488,28 +7423,24 @@ def serial_listener():
                                             # First press: mark OV as tested
                                             msg = "Serial: Full-test OV command detected (marked as tested)"
                                             print(msg)
-                                            with open(debug_log, 'a') as f:
-                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             root.after(0, lambda: full_test_window.mark_tested('OV'))
                                         else:
                                             # Second press: exit full test
                                             msg = "Serial: Full-test exit (OV pressed second time)"
                                             print(msg)
-                                            with open(debug_log, 'a') as f:
-                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             root.after(0, close_full_test)
                                     else:
                                         # Fallback: just exit
                                         msg = "Serial: Full-test exit (OV pressed)"
                                         print(msg)
-                                        with open(debug_log, 'a') as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                         root.after(0, close_full_test)
                                 elif line in ['-1', '+1', '-10', '+10', 'PS']:
                                     msg = f"Serial: Full-test {line} command detected"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     # Mark the corresponding test as passed
                                     if full_test_window and hasattr(full_test_window, 'mark_tested'):
                                         if line == '-1':
@@ -7523,45 +7454,38 @@ def serial_listener():
                                         elif line == 'PS':
                                             root.after(0, lambda: full_test_window.mark_tested('PS'))
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in full-test mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in full-test mode: '{line}'\n")
 
                             # Handle update mode
                             elif update_mode:
                                 if line == 'OV':
                                     msg = "Serial: Update exit"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, close_update)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in update mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in update mode: '{line}'\n")
 
                             # Handle menu navigation if in menu mode
                             elif menu_mode:
                                 if line == '+1':
                                     msg = "Serial: Menu navigate down"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     menu_navigate_down()
                                 elif line == '-1':
                                     msg = "Serial: Menu navigate up"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     menu_navigate_up()
                                 elif line == 'OV':
                                     msg = "Serial: Menu select"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     arm_menu_ov_guard()
                                     root.after(0, menu_select)
                                 else:
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
 
                             # Normal dashboard mode
                             else:
@@ -7604,8 +7528,7 @@ def serial_listener():
                                 elif line == 'PS':
                                     msg = "Serial: Pump Stop command received - activating relay"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     start_pump_stop_thread(config.PUMP_STOP_DURATION)
 
                                 elif line == 'OV':
@@ -7615,14 +7538,12 @@ def serial_listener():
                                         if current_mode == 'mix' and batch_mix_data is not None:
                                             msg = "Serial: Batch mix screen exit triggered (gallons=0, OV pressed)"
                                             print(msg)
-                                            with open(debug_log, 'a') as f:
-                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             root.after(0, lambda: clear_batch_mix_screen("serial OV at zero gallons"))
                                         else:
                                             msg = "Serial: Menu access triggered (gallons=0, OV pressed)"
                                             print(msg)
-                                            with open(debug_log, 'a') as f:
-                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             # Show menu in main thread
                                             arm_menu_ov_guard()
                                             root.after(0, show_menu)
@@ -7632,8 +7553,7 @@ def serial_listener():
                                             msg = "Serial: Ignored OV debounce during override toggle"
                                             print(msg)
                                             log_serial_debug(msg)
-                                            with open(debug_log, 'a') as f:
-                                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                             continue
                                         last_serial_ov_toggle_time = now
                                         override_mode = not override_mode
@@ -7641,42 +7561,36 @@ def serial_listener():
                                             override_enabled_time = time.time()  # Record when enabled
                                         msg = f"Serial: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
                                         print(msg)
-                                        with open(debug_log, 'a') as f:
-                                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
 
                                 elif line == 'TU':
                                     msg = "Serial: Thumbs Up command received"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: handle_thumbs_up_press("serial TU"))
 
                                 elif line in ('RST', 'RESET'):
                                     msg = "Serial: Flow reset command received"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: force_flow_reset("serial reset"))
 
                                 elif line == 'MIX':
                                     msg = "Serial: Mix mode command received"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: switch_mode('mix'))
 
                                 elif line == 'FILL':
                                     msg = "Serial: Fill mode command received"
                                     print(msg)
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                     root.after(0, lambda: switch_mode('fill'))
 
                                 else:
                                     # Unknown command
-                                    with open(debug_log, 'a') as f:
-                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Unknown command: '{line}'\n")
+                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Unknown command: '{line}'\n")
                 else:
                     time.sleep(0.1)
             except Exception as e:
