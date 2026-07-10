@@ -119,6 +119,20 @@ close the gap (see the self-heal patterns below) or document exactly why not.
     (`asyncio.wait_for`) so one wedged iPad can't freeze state/history for the
     rest. Preserve both if you touch the server loop.
 
+13. **The display redraw chain must never die - and logging must never kill
+    it.** `update_dashboard()` is the screen's only redraw driver, a self-
+    rescheduling Tk after-chain; the process, BLE, and the :9999 listener all
+    survive a dead chain, so the field symptom is "screen frozen but the app
+    still shows flow." The guards (keep all of them): the tick body is wrapped
+    and the reschedule lives in `finally`; stdout/stderr go through
+    `_ResilientStream` so a dead/stalled log pipe can't make `print()` raise or
+    block the mainloop; `src/log_filter.py` must ALWAYS keep draining stdin
+    even when its log file is unwritable; the flow-control thread revives a
+    stale chain in place via `root.after` (heartbeat: `display_tick_age_s` in
+    STATE_JSON). Never add an unguarded file write or blocking call inside the
+    tick, and never "fix" a frozen display by restarting the service - that
+    blanks the screen and drops pending-fill state mid-fill.
+
 ## THE MAINTENANCE SHELL = your remote hands
 
 The admin app's maintenance terminal gives a remote root PTY on any box whose

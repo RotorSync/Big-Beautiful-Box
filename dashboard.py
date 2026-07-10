@@ -17,6 +17,8 @@ import fcntl
 import atexit
 import builtins
 import math
+import queue
+import traceback
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -91,6 +93,87 @@ if SIM_MODE:
         return _real_open(_pi_path(file), *args, **kwargs)
 
     builtins.open = _sim_open
+
+
+class _ResilientStream:
+    """Make stdout/stderr writes unable to raise or block the caller.
+
+    This process's stdout feeds start_iol_dashboard.sh's log-filter pipe. If
+    that filter dies, every print() raises BrokenPipeError (one inside the
+    display tick kills the redraw chain: screen frozen while BLE keeps
+    serving); if it stalls, a bare print() blocks the whole Tk mainloop.
+    Writes go into a bounded queue drained by a daemon thread; when the pipe
+    is unusable, lines are counted and dropped - the display must outlive its
+    logging.
+    """
+
+    def __init__(self, raw, max_queued=2000):
+        self._raw = raw
+        self._queue = queue.Queue(maxsize=max_queued)
+        self._dropped = 0
+        self._closing = False
+        self._thread = threading.Thread(
+            target=self._drain, name="resilient-stream", daemon=True
+        )
+        self._thread.start()
+
+    def _drain(self):
+        while True:
+            chunk = self._queue.get()
+            if chunk is None:
+                break
+            try:
+                self._raw.write(chunk)
+                self._raw.flush()
+            except Exception:
+                # Broken pipe: swallow and keep draining so writers never
+                # see the failure.
+                pass
+
+    def write(self, text):
+        if not self._closing:
+            try:
+                self._queue.put_nowait(text)
+            except queue.Full:
+                self._dropped += 1
+        return len(text)
+
+    def flush(self):
+        # The drain thread flushes; waiting here would reintroduce the
+        # mainloop-blocking failure this class exists to prevent.
+        return
+
+    def close_and_drain(self, timeout=2.0):
+        """Give queued lines a brief chance to reach the pipe at exit."""
+        self._closing = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Full queue (stalled pipe): sacrifice one queued line so the
+            # sentinel fits and the drain still gets its exit signal.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(None)
+            except Exception:
+                return
+        self._thread.join(timeout)
+
+    def fileno(self):
+        return self._raw.fileno()
+
+    def isatty(self):
+        return False
+
+    @property
+    def dropped(self):
+        return self._dropped
+
+
+if os.environ.get("BBB_DISABLE_RESILIENT_STDOUT") != "1":
+    sys.stdout = _ResilientStream(sys.stdout)
+    sys.stderr = _ResilientStream(sys.stderr)
+    atexit.register(sys.stdout.close_and_drain)
+    atexit.register(sys.stderr.close_and_drain)
 
 
 def _read_local_version():
@@ -3106,6 +3189,10 @@ def _build_dashboard_state_snapshot():
 
     return {
         "version": VERSION,
+        # Age of the last display redraw tick. Lets remote clients (app /
+        # maintenance shell) see a frozen box screen that the box itself
+        # cannot report any other way.
+        "display_tick_age_s": round(max(0.0, time.time() - last_dashboard_tick_at), 1),
         "requested_gal": round(requested_gallons, 3),
         "actual_gal": round(actual_gallons, 3),
         "flow_gpm": round(flow_gpm, 2),
@@ -6061,6 +6148,8 @@ def flow_control_loop():
                 flow_control_last_error_log_time = now
                 log_flow_control(f"thread_error | {exc}")
 
+        _maybe_revive_display_chain()
+
         next_tick += interval
         sleep_for = next_tick - time.monotonic()
         if sleep_for < 0:
@@ -8351,7 +8440,130 @@ def animate_thumbs_up():
 # Load the GIF on startup
 load_thumbs_up_gif()
 
+# ---------------------------------------------------------------------------
+# Display-chain self-healing.
+#
+# update_dashboard() is the box display's only redraw driver: a self-
+# rescheduling Tk `after` chain. Before this guard, one exception anywhere in
+# the ~500-line tick (field case: an unguarded log write on a full/read-only
+# SD card) silently killed the chain forever - screen frozen while the flow-
+# control thread and the :9999 listener kept serving live data to BLE/WiFi
+# clients ("display dead but the app still shows flow"). Restarting the
+# service is NOT an acceptable fix: it blanks the screen and drops pending-
+# fill state mid-fill. Instead the chain heals in place:
+#   1. Every tick is wrapped; the reschedule lives in `finally`, so a bad
+#      tick costs one frame, not the display.
+#   2. The tick stamps a heartbeat; the (fully guarded, always-alive) flow-
+#      control thread re-kicks the chain via the Tk event queue if the
+#      heartbeat ever goes stale - no restart, crews see at most a blip.
+#   3. The heartbeat age is exported in STATE_JSON (display_tick_age_s) so a
+#      wedged mainloop (the one case in-process code can't heal) is at least
+#      visible remotely.
+# ---------------------------------------------------------------------------
+DISPLAY_TICK_STALE_SECONDS = 5.0
+DISPLAY_REVIVE_MIN_SPACING_SECONDS = 10.0
+TICK_ERROR_LOG = "/home/pi/dashboard_tick_errors.log"
+
+last_dashboard_tick_at = time.time()
+_dashboard_chain_started = False
+_dashboard_after_id = None
+_dashboard_tick_failures = 0
+_dashboard_tick_last_error_at = 0.0
+_dashboard_revives = 0
+_display_revive_last_kick_at = 0.0
+
+
+def _log_tick_error(text):
+    """Best-effort tick-failure record; must never raise (the failing tick
+    may itself be a disk problem) and never block."""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {text}\n"
+    try:
+        print(line.rstrip("\n"), flush=True)
+    except Exception:
+        pass
+    try:
+        # 5MB cap so a permanent fault can't grow this file unbounded even
+        # if logrotate isn't running.
+        if not (os.path.exists(TICK_ERROR_LOG) and os.path.getsize(TICK_ERROR_LOG) > 5_000_000):
+            with open(TICK_ERROR_LOG, "a") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
 def update_dashboard():
+    """Run one guarded display tick; the redraw chain must never die."""
+    global _dashboard_after_id, _dashboard_tick_failures, _dashboard_tick_last_error_at
+    global last_dashboard_tick_at, _dashboard_chain_started
+
+    _dashboard_chain_started = True
+    try:
+        _update_dashboard_tick()
+        _dashboard_tick_failures = 0
+    except Exception:
+        _dashboard_tick_failures += 1
+        now = time.time()
+        if now - _dashboard_tick_last_error_at > 30.0:
+            _dashboard_tick_last_error_at = now
+            _log_tick_error(
+                f"dashboard tick failed ({_dashboard_tick_failures} consecutive)\n"
+                + traceback.format_exc()
+            )
+    finally:
+        last_dashboard_tick_at = time.time()
+        try:
+            _dashboard_after_id = root.after(config.UPDATE_INTERVAL, update_dashboard)
+        except Exception:
+            # Tk is tearing down (app exit); nothing left to keep alive.
+            _dashboard_after_id = None
+
+
+def _revive_dashboard_chain():
+    """Runs ON the Tk thread. Restart a truly dead redraw chain in place.
+
+    Freshness is re-checked here (not just in the flow-control thread) so a
+    queued revive can never double-schedule a chain that is actually alive;
+    any pending zombie tick is cancelled before the fresh one starts.
+    """
+    global _dashboard_revives
+
+    if time.time() - last_dashboard_tick_at <= DISPLAY_TICK_STALE_SECONDS:
+        return
+    try:
+        if _dashboard_after_id is not None:
+            root.after_cancel(_dashboard_after_id)
+    except Exception:
+        pass
+    _dashboard_revives += 1
+    _log_tick_error(f"display chain revived in place (revive #{_dashboard_revives})")
+    update_dashboard()
+
+
+def _maybe_revive_display_chain():
+    """Called from the flow-control thread each loop: queue an in-place
+    revive when the display heartbeat goes stale. root.after is the same
+    cross-thread mechanism the serial/socket listeners already use. Must
+    never raise (it runs inside the safety-critical control loop)."""
+    global _display_revive_last_kick_at
+
+    try:
+        if not _dashboard_chain_started:
+            return
+        now = time.time()
+        if now - last_dashboard_tick_at <= DISPLAY_TICK_STALE_SECONDS:
+            return
+        if now - _display_revive_last_kick_at <= DISPLAY_REVIVE_MIN_SPACING_SECONDS:
+            return
+        _display_revive_last_kick_at = now
+        log_flow_control(
+            f"display_chain_stale | age={now - last_dashboard_tick_at:.1f}s | revive_kick"
+        )
+        root.after(0, _revive_dashboard_chain)
+    except Exception:
+        pass
+
+
+def _update_dashboard_tick():
     """Update the dashboard with current flow meter readings"""
     global last_alert_triggered, auto_shutoff_latched, override_mode, was_flowing, colors_are_green, heartbeat_disconnected, override_enabled_time
     global new_fill_flow_started_at, new_fill_last_fresh_at, new_fill_cycle_cleared
@@ -8375,12 +8587,6 @@ def update_dashboard():
     color = target_display_color(actual)
     if thumbs_up_visible:
         set_thumbs_up_color(color)
-
-    # Debug log color being used
-    button_log = "/home/pi/button_debug.log"
-    if colors_are_green:
-        with open(button_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [UPDATE_DASHBOARD] colors_are_green={colors_are_green}, using color={color}\n")
 
     draw_actual_number(f"{actual:.1f}", color)
 
@@ -8842,8 +9048,6 @@ def update_dashboard():
         or positive_drift_fault_active
     ) and negative_totalizer_alarm_visible:
         canvas.tag_raise("negative_totalizer_alarm")
-
-    root.after(config.UPDATE_INTERVAL, update_dashboard)
 
 
 def _sim_send_command(line):

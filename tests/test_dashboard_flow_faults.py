@@ -109,6 +109,7 @@ def _dashboard_fault_namespace():
         "flow_meter_reconnect_status_ok": False,
         "flow_meter_reconnect_fault_reason": "",
         "iol_power_cycle_in_progress": False,
+        "last_dashboard_tick_at": fake_time.now - 1.5,
         "last_totalizer_liters": 0.0,
         "last_flow_rate": 0.0,
         "requested_gallons": 45.0,
@@ -279,6 +280,7 @@ def test_state_snapshot_reports_flow_fault_fields():
     assert snapshot["flow_fault_active"] is True
     assert snapshot["flow_fault_code"] == "negative_flow"
     assert snapshot["flow_meter_fault_reason"] == ns["negative_flow_fault_reason"]
+    assert snapshot["display_tick_age_s"] == 1.5
 
 
 def test_negative_flow_footer_draws_signed_red_text():
