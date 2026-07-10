@@ -9,19 +9,34 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+    strategy:
+      fail-fast: false
+      matrix:
+        # The fleet runs BOTH websockets impls (AGENTS.md pitfall #5): boxes
+        # historically pin the 10.4 legacy asyncio impl, newer boxes run
+        # 15/16. rotorlink/server.py imports websockets at module top, so
+        # without it installed pytest dies at collection with zero tests run.
+        websockets-version: ["10.4", "latest"]
+
+    name: test (websockets ${{ matrix.websockets-version }})
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pytest pyserial pillow
+        if [ "${{ matrix.websockets-version }}" = "latest" ]; then
+          pip install websockets
+        else
+          pip install "websockets==${{ matrix.websockets-version }}"
+        fi
     
     - name: Create mock RPi.GPIO
       run: |
