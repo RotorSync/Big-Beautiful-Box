@@ -246,6 +246,15 @@ def log_serial_debug(message):
     except Exception:
         pass
 
+def append_debug_log(path, text):
+    """Append pre-formatted text to a debug log; I/O errors are swallowed
+    so a full/read-only SD card can never abort the calling handler."""
+    try:
+        with open(path, 'a') as f:
+            f.write(text)
+    except Exception:
+        pass
+
 # Add paths for libraries
 sys.path.insert(0, config.RPI_GPIO_PATH)
 sys.path.insert(0, config.IOL_HAT_PATH)
@@ -2649,8 +2658,7 @@ def handle_thumbs_up_press(source):
         )
         print(msg)
         log_serial_debug(msg)
-        with open(button_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] {msg}\n")
+        append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] {msg}\n")
         return
 
     change_colors_to_green(from_button=True)
@@ -2754,12 +2762,10 @@ def change_colors_to_green(from_button=False):
     global serial_command_received, last_totalizer_liters, requested_gallons, colors_are_green
 
     button_log = "/home/pi/button_debug.log"
-    with open(button_log, 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] change_colors_to_green() called with from_button={from_button}\n")
+    append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] change_colors_to_green() called with from_button={from_button}\n")
 
     if batch_mix_layout_active:
-        with open(button_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Ignoring thumbs-up/green transition while batch mix screen is active\n")
+        append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Ignoring thumbs-up/green transition while batch mix screen is active\n")
         if thumbs_up_animation_id:
             root.after_cancel(thumbs_up_animation_id)
         if thumbs_up_label:
@@ -2769,19 +2775,16 @@ def change_colors_to_green(from_button=False):
 
     # Calculate current actual gallons
     actual_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
-    with open(button_log, 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Actual: {actual_gallons:.1f}, Requested: {requested_gallons:.0f}, Diff: {abs(actual_gallons - requested_gallons):.1f}\n")
+    append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Actual: {actual_gallons:.1f}, Requested: {requested_gallons:.0f}, Diff: {abs(actual_gallons - requested_gallons):.1f}\n")
 
     # Check if within 2 gallons of target
     within_threshold = abs(actual_gallons - requested_gallons) <= 2.0
 
     if within_threshold:
-        with open(button_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Within 2 gallon threshold! serial_command_received={serial_command_received}\n")
+        append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Within 2 gallon threshold! serial_command_received={serial_command_received}\n")
         # Button press always works, auto-alert only works once
         if from_button or not serial_command_received:
-            with open(button_log, 'a') as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Proceeding with color change to GREEN...\n")
+            append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Proceeding with color change to GREEN...\n")
             if not from_button:
                 serial_command_received = True
 
@@ -2800,29 +2803,26 @@ def change_colors_to_green(from_button=False):
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
             source = "button press" if from_button else "auto-alert"
-            with open(button_log, 'a') as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Display colors changed to green ({source}, within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})\n")
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] colors_are_green flag set to True\n")
+            append_debug_log(
+                button_log,
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} Display colors changed to green ({source}, within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})\n"
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] colors_are_green flag set to True\n")
         else:
-            with open(button_log, 'a') as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Color change already triggered by auto-alert ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
+            append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} Color change already triggered by auto-alert ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
     else:
         # NOT within threshold
-        with open(button_log, 'a') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] NOT within 2 gallon threshold ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
+        append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] NOT within 2 gallon threshold ({actual_gallons:.1f}/{requested_gallons:.0f})\n")
 
         # If button was pressed, still show thumbs up but keep screen RED
         if from_button:
-            with open(button_log, 'a') as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
+            append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} [DEBUG] Button pressed but not within threshold - showing thumbs up, keeping RED\n")
             # Show thumbs up but DO NOT change colors to green, except on the batch product screen.
             if thumbs_up_label and not batch_mix_layout_active:
                 show_thumbs_up(actual_gallons)
                 schedule_flow_reset()
                 if thumbs_up_frames:  # Only animate if we have GIF frames
                     animate_thumbs_up()
-            with open(button_log, 'a') as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Thumbs up shown but screen stays RED (not within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})\n")
+            append_debug_log(button_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} Thumbs up shown but screen stays RED (not within 2 gallons: {actual_gallons:.1f}/{requested_gallons:.0f})\n")
 
 def green_button_monitor():
     """Monitor GPIO pin for green button press (active low with pull-up)"""
@@ -2843,9 +2843,10 @@ def green_button_monitor():
         GPIO.setup(config.GREEN_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         msg = f"Green button monitor started on GPIO {config.GREEN_BUTTON_PIN}"
         print(msg)
-        with open(button_log, 'a') as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+        append_debug_log(
+            button_log,
+            f"\n{'='*60}\n"
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
         last_button_state = GPIO.HIGH
 
@@ -2855,8 +2856,7 @@ def green_button_monitor():
 
             # Detect button press (transition from HIGH to LOW)
             if last_button_state == GPIO.HIGH and current_state == GPIO.LOW:
-                with open(button_log, 'a') as f:
-                    f.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} *** GREEN BUTTON PRESSED! ***\n")
+                append_debug_log(button_log, f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} *** GREEN BUTTON PRESSED! ***\n")
                 print("Green button pressed!")
                 # If in reminders mode, dismiss reminders
                 if reminders_mode:
@@ -5185,8 +5185,7 @@ def menu_navigate_up():
     global menu_selected_index
     old_index = menu_selected_index
     menu_selected_index = (menu_selected_index - 1) % len(MENU_ITEMS)
-    with open('/home/pi/menu_debug.log', 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_up: {old_index} -> {menu_selected_index}\n")
+    append_debug_log('/home/pi/menu_debug.log', f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_up: {old_index} -> {menu_selected_index}\n")
     schedule_menu_highlight_update()
 
 def menu_navigate_down():
@@ -5194,8 +5193,7 @@ def menu_navigate_down():
     global menu_selected_index
     old_index = menu_selected_index
     menu_selected_index = (menu_selected_index + 1) % len(MENU_ITEMS)
-    with open('/home/pi/menu_debug.log', 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_down: {old_index} -> {menu_selected_index}\n")
+    append_debug_log('/home/pi/menu_debug.log', f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_navigate_down: {old_index} -> {menu_selected_index}\n")
     schedule_menu_highlight_update()
 
 def menu_select():
@@ -5203,8 +5201,7 @@ def menu_select():
     global menu_selected_index
 
     # Debug logging to track selection
-    with open('/home/pi/menu_debug.log', 'a') as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_select() called with index={menu_selected_index}, item={MENU_ITEMS[menu_selected_index] if menu_selected_index < len(MENU_ITEMS) else 'UNKNOWN'}\n")
+    append_debug_log('/home/pi/menu_debug.log', f"{time.strftime('%Y-%m-%d %H:%M:%S')} - menu_select() called with index={menu_selected_index}, item={MENU_ITEMS[menu_selected_index] if menu_selected_index < len(MENU_ITEMS) else 'UNKNOWN'}\n")
 
     if menu_selected_index == 0:
         show_log_viewer()
