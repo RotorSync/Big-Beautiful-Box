@@ -63,6 +63,17 @@ def _float_if_finite(value, digits):
     return round(number, digits)
 
 
+def _observation_epoch(value):
+    """Return a finite positive source-observation epoch, never a receipt time."""
+    try:
+        observed_at = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    return observed_at
+
+
 def _flow_fault_summary_from_state(state):
     reason = _compact_fault_reason(state.get("flow_meter_fault_reason"))
     if state.get("negative_totalizer_fault"):
@@ -162,10 +173,16 @@ def encode_live_telemetry(requested, actual, flow, relay_slowdown_alarm=False) -
 
 
 def encode_bms(state: dict):
-    """Battery payload matching the BLE BMS characteristic ({voltage, soc}), from
-    the dashboard's bms_voltage/bms_soc. Returns None when no BMS is reporting."""
+    """Battery payload matching BLE, including its source observation time."""
+    has_reading = state.get("bms_has_reading")
     voltage = state.get("bms_voltage")
     soc = state.get("bms_soc")
+    if has_reading is False:
+        return None
+    if has_reading is None:
+        has_reading = voltage is not None or soc is not None
+    if not has_reading:
+        return None
     if voltage is None and soc is None:
         return None
     out = {}
@@ -173,6 +190,8 @@ def encode_bms(state: dict):
         out["voltage"] = voltage
     if soc is not None:
         out["soc"] = soc
+    observed_at = state.get("bms_last_update", state.get("bms_observed_at"))
+    _put_if_present(out, "last_update", _observation_epoch(observed_at))
     return out
 
 
@@ -180,8 +199,8 @@ def encode_mopeka(state: dict, index: int):
     """Tank payload matching the BLE MOPEKA characteristic, from the dashboard's
     per-tank gallons/quality/level. level_in is the offset-compensated inches,
     same value the BLE sensor path sends (the Monitor shows it under the
-    gallons). index 1 = front tank, 2 = back tank. Returns None when mopeka is
-    off."""
+    gallons). index 1 = front tank, 2 = back tank. Returns None before that
+    particular tank has produced a successful reading."""
     if not state.get("mopeka_enabled"):
         return None
     if index == 1:
@@ -189,12 +208,28 @@ def encode_mopeka(state: dict, index: int):
         quality = state.get("front_tank_quality")
         level_mm = state.get("front_tank_mm")
         level_in = state.get("front_tank_in")
+        has_reading = state.get("front_tank_has_reading")
+        observed_at = state.get(
+            "front_tank_last_update",
+            state.get("front_tank_observed_at"),
+        )
     else:
         gallons = state.get("back_tank_gal")
         quality = state.get("back_tank_quality")
         level_mm = state.get("back_tank_mm")
         level_in = state.get("back_tank_in")
-    if gallons is None and quality is None:
+        has_reading = state.get("back_tank_has_reading")
+        observed_at = state.get(
+            "back_tank_last_update",
+            state.get("back_tank_observed_at"),
+        )
+    if has_reading is None:
+        # Compatibility with older dashboards: connected only became true
+        # after their combined Mopeka command was accepted.
+        has_reading = bool(state.get("mopeka_connected"))
+    if not has_reading:
+        return None
+    if gallons is None and quality is None and level_mm is None and level_in is None:
         return None
     out = {}
     if gallons is not None:
@@ -205,4 +240,5 @@ def encode_mopeka(state: dict, index: int):
         out["level_mm"] = level_mm
     if level_in is not None:
         out["level_in"] = level_in
+    _put_if_present(out, "last_update", _observation_epoch(observed_at))
     return out

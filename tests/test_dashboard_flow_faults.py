@@ -1,6 +1,9 @@
 import ast
+import math
 import threading
 from pathlib import Path
+
+from src.mopeka_history import normalize_history_identity_token
 
 import config
 from src.flow_safety import (
@@ -32,6 +35,29 @@ class FakeCanvas:
         self.calls.append(("create_text", args, kwargs))
 
 
+class FakeTkQueue:
+    def __init__(self):
+        self._callbacks = []
+        self._condition = threading.Condition()
+
+    def after(self, _delay_ms, callback, *args):
+        with self._condition:
+            self._callbacks.append((callback, args))
+            self._condition.notify_all()
+
+    def wait_for_callbacks(self, count, timeout=1.0):
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: len(self._callbacks) >= count,
+                timeout=timeout,
+            )
+
+    def run_next(self):
+        with self._condition:
+            callback, args = self._callbacks.pop(0)
+        callback(*args)
+
+
 def _dashboard_fault_namespace():
     """Load only dashboard fault functions without starting the Tk app."""
     source = DASHBOARD_PATH.read_text(encoding="utf-8")
@@ -49,6 +75,18 @@ def _dashboard_fault_namespace():
         "_flow_meter_fault_summary",
         "_build_dashboard_state_snapshot",
         "_calibration_snapshot",
+        "_run_on_tk_queue_and_wait",
+        "_reset_trailer_sensor_telemetry_and_refresh",
+        "_run_trailer_sensor_identity_command",
+        "_source_observation_epoch",
+        "_parse_mopeka_sensor_command",
+        "_accept_trailer_sensor_identity",
+        "_reset_trailer_sensor_telemetry",
+        "_mark_trailer_sensor_identity_changed",
+        "_apply_mopeka",
+        "_apply_mopeka_sensor",
+        "_apply_bms",
+        "_mopeka_offline",
         "update_flow_rate_display",
         "_format_batch_mix_product_amount",
         "_format_batch_mix_product_rate",
@@ -75,6 +113,7 @@ def _dashboard_fault_namespace():
 
     ns = {
         "config": config,
+        "math": math,
         "time": fake_time,
         "threading": threading,
         "negative_flow_status": negative_flow_status,
@@ -127,6 +166,10 @@ def _dashboard_fault_namespace():
         "heartbeat_disconnected": False,
         "bms_soc": None,
         "bms_voltage": None,
+        "bms_has_reading": False,
+        "bms_observed_at": None,
+        "trailer_sensor_identity_generation": 0,
+        "trailer_sensor_identity": None,
         "daily_total": 0.0,
         "mopeka1_gallons": 0.0,
         "calibration_mode": False,
@@ -134,6 +177,10 @@ def _dashboard_fault_namespace():
         "mopeka2_gallons": 0.0,
         "mopeka1_quality": 0,
         "mopeka2_quality": 0,
+        "mopeka1_has_reading": False,
+        "mopeka2_has_reading": False,
+        "mopeka1_observed_at": None,
+        "mopeka2_observed_at": None,
         "mopeka1_level_mm": 0.0,
         "mopeka2_level_mm": 0.0,
         "mopeka1_level_in": 0.0,
@@ -154,6 +201,10 @@ def _dashboard_fault_namespace():
         "_read_iol_status_ok": lambda: (True, None),
         "flow_curve_status_text": lambda: "factory",
         "flow_curve_proposal_status_text": lambda: "none",
+        "update_mopeka_display": lambda: None,
+        "update_bms_display": lambda: None,
+        "_read_trailer_sensor_identity_token": lambda: '["2","FRONT","BACK"]',
+        "normalize_history_identity_token": normalize_history_identity_token,
     }
     exec(compile(module, str(DASHBOARD_PATH), "exec"), ns)
     ns["_fake_time"] = fake_time
@@ -281,6 +332,254 @@ def test_state_snapshot_reports_flow_fault_fields():
     assert snapshot["flow_fault_code"] == "negative_flow"
     assert snapshot["flow_meter_fault_reason"] == ns["negative_flow_fault_reason"]
     assert snapshot["display_tick_age_s"] == 1.5
+
+
+def test_state_snapshot_suppresses_unobserved_sensor_zeroes():
+    ns = _dashboard_fault_namespace()
+    ns["mopeka_enabled"] = True
+
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["bms_soc"] is None
+    assert snapshot["bms_voltage"] is None
+    assert snapshot["bms_last_update"] is None
+    assert snapshot["front_tank_gal"] is None
+    assert snapshot["back_tank_gal"] is None
+    assert snapshot["front_tank_last_update"] is None
+    assert snapshot["back_tank_last_update"] is None
+
+
+def test_state_snapshot_preserves_partial_zero_gallon_observation():
+    ns = _dashboard_fault_namespace()
+
+    ns["_apply_mopeka_sensor"](1, 0.0, 3, 1720000000.25, 42.0, 1.65)
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["front_tank_gal"] == 0.0
+    assert snapshot["front_tank_quality"] == 3
+    assert snapshot["front_tank_has_reading"] is True
+    assert snapshot["front_tank_last_update"] == 1720000000.25
+    assert snapshot["back_tank_gal"] is None
+    assert snapshot["back_tank_has_reading"] is False
+    assert snapshot["back_tank_last_update"] is None
+
+
+def test_exact_mopeka_sensor_wire_command_preserves_index_and_zero_value():
+    ns = _dashboard_fault_namespace()
+
+    parsed = ns["_parse_mopeka_sensor_command"](
+        "MOPEKA_SENSOR:1|0.000|3|1720000000.250000|41.200|1.6200"
+    )
+
+    assert parsed == (1, 0.0, 3, "1720000000.250000", 41.2, 1.62, None)
+
+
+def test_sensor_wire_identity_owns_the_dashboard_cache():
+    ns = _dashboard_fault_namespace()
+    parsed = ns["_parse_mopeka_sensor_command"](
+        'MOPEKA_SENSOR:1|12.500|3|1720000000.250000|41.200|1.6200|'
+        '["2","FRONT-2","BACK-2"]'
+    )
+
+    ns["_apply_mopeka_sensor"](*parsed)
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["front_tank_gal"] == 12.5
+    assert snapshot["trailer_sensor_identity"] == '["2","FRONT-2","BACK-2"]'
+
+
+def test_malformed_sensor_identity_cannot_replace_cached_readings():
+    ns = _dashboard_fault_namespace()
+
+    ns["_apply_mopeka_sensor"](
+        1,
+        12.5,
+        3,
+        1720000000.25,
+        identity_token="not-json",
+    )
+
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+    assert snapshot["front_tank_gal"] is None
+    assert snapshot["trailer_sensor_identity"] is None
+
+
+def test_new_sensor_owner_clears_all_untouched_prior_trailer_fields():
+    ns = _dashboard_fault_namespace()
+    trailer_a = '["1","FRONT-1","BACK-1"]'
+    trailer_b = '["2","FRONT-2","BACK-2"]'
+    ns["_apply_mopeka"](
+        10.0,
+        20.0,
+        3,
+        3,
+        100.0,
+        101.0,
+        trailer_a,
+    )
+    ns["_apply_bms"](86.0, 13.4, 102.0, trailer_a)
+
+    ns["_apply_mopeka_sensor"](
+        1,
+        30.0,
+        3,
+        200.0,
+        identity_token=trailer_b,
+    )
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["trailer_sensor_identity"] == trailer_b
+    assert snapshot["front_tank_gal"] == 30.0
+    assert snapshot["back_tank_gal"] is None
+    assert snapshot["bms_soc"] is None
+
+
+def test_identity_reset_clears_values_without_fabricating_replacements():
+    ns = _dashboard_fault_namespace()
+    ns["_apply_mopeka_sensor"](1, 0.0, 3, 1720000000.25, 42.0, 1.65)
+    ns["_apply_bms"](86.0, 13.4, 1720000001.0)
+
+    ns["_reset_trailer_sensor_telemetry"]()
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["front_tank_gal"] is None
+    assert snapshot["front_tank_last_update"] is None
+    assert snapshot["bms_soc"] is None
+    assert snapshot["bms_last_update"] is None
+
+
+def test_ordinary_sensor_disconnect_retains_last_known_reading():
+    ns = _dashboard_fault_namespace()
+    ns["_apply_mopeka_sensor"](1, 25.0, 3, 1720000000.25)
+
+    ns["_mopeka_offline"]()
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["front_tank_gal"] == 25.0
+    assert snapshot["front_tank_last_update"] == 1720000000.25
+    assert snapshot["mopeka_connected"] is False
+
+
+def test_identity_generation_advances_only_after_explicit_confirmation():
+    ns = _dashboard_fault_namespace()
+
+    ns["_reset_trailer_sensor_telemetry"]()
+    assert ns["_build_dashboard_state_snapshot"]()[
+        "trailer_sensor_identity_generation"
+    ] == 0
+
+    ns["_mark_trailer_sensor_identity_changed"]()
+    assert ns["_build_dashboard_state_snapshot"]()[
+        "trailer_sensor_identity_generation"
+    ] == 1
+
+
+def test_trailer_reset_ack_waits_behind_older_queued_sensor_apply():
+    ns = _dashboard_fault_namespace()
+    root = FakeTkQueue()
+    ns["root"] = root
+
+    # This old-trailer reading was accepted before the reset command but has
+    # not yet been applied by Tk.
+    root.after(
+        0,
+        ns["_apply_mopeka_sensor"],
+        1,
+        31.5,
+        3,
+        1720000000.25,
+    )
+
+    ack_ready = []
+    worker = threading.Thread(
+        target=lambda: ack_ready.append(
+            ns["_run_trailer_sensor_identity_command"](
+                "RESET_TRAILER_SENSOR_TELEMETRY",
+                timeout_seconds=0.5,
+            )
+        )
+    )
+    worker.start()
+
+    assert root.wait_for_callbacks(2)
+    assert worker.is_alive()
+
+    root.run_next()
+    assert ns["_build_dashboard_state_snapshot"]()["front_tank_gal"] == 31.5
+    assert worker.is_alive()
+
+    root.run_next()
+    worker.join(timeout=0.5)
+
+    assert ack_ready == [True]
+    assert ns["_build_dashboard_state_snapshot"]()["front_tank_gal"] is None
+
+
+def test_identity_changed_ack_waits_behind_older_queued_sensor_apply():
+    ns = _dashboard_fault_namespace()
+    root = FakeTkQueue()
+    ns["root"] = root
+    root.after(
+        0,
+        ns["_apply_mopeka_sensor"],
+        2,
+        18.0,
+        3,
+        1720000001.0,
+    )
+
+    ack_ready = []
+    worker = threading.Thread(
+        target=lambda: ack_ready.append(
+            ns["_run_trailer_sensor_identity_command"](
+                "TRAILER_SENSOR_IDENTITY_CHANGED",
+                timeout_seconds=0.5,
+            )
+        )
+    )
+    worker.start()
+
+    assert root.wait_for_callbacks(2)
+    root.run_next()
+    assert ns["trailer_sensor_identity_generation"] == 0
+    assert ns["_build_dashboard_state_snapshot"]()["back_tank_gal"] == 18.0
+    assert worker.is_alive()
+
+    root.run_next()
+    worker.join(timeout=0.5)
+
+    assert ack_ready == [True]
+    assert ns["trailer_sensor_identity_generation"] == 1
+    assert ns["_build_dashboard_state_snapshot"]()["back_tank_gal"] is None
+
+
+def test_tk_barrier_timeout_does_not_apply_late_reset_during_shutdown():
+    ns = _dashboard_fault_namespace()
+    root = FakeTkQueue()
+    ns["root"] = root
+    ns["_apply_mopeka_sensor"](1, 22.0, 3, 1720000000.25)
+
+    assert ns["_run_trailer_sensor_identity_command"](
+        "RESET_TRAILER_SENSOR_TELEMETRY",
+        timeout_seconds=0.01,
+    ) is False
+
+    # A stopped Tk loop may never run this callback.  If it does resume, the
+    # canceled command must still not mutate state after the failure response.
+    root.run_next()
+    assert ns["_build_dashboard_state_snapshot"]()["front_tank_gal"] == 22.0
+
+
+def test_state_snapshot_does_not_fabricate_bms_timestamp():
+    ns = _dashboard_fault_namespace()
+
+    ns["_apply_bms"](86.0, 13.4)
+    snapshot = ns["_build_dashboard_state_snapshot"]()
+
+    assert snapshot["bms_soc"] == 86
+    assert snapshot["bms_voltage"] == 13.4
+    assert snapshot["bms_has_reading"] is True
+    assert snapshot["bms_last_update"] is None
 
 
 def test_negative_flow_footer_draws_signed_red_text():

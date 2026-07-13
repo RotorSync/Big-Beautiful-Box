@@ -31,6 +31,11 @@ from src.flow_safety import (
     negative_totalizer_status,
     positive_drift_status,
 )
+from src.mopeka_history import (
+    history_identity_from_config,
+    history_identity_token,
+    normalize_history_identity_token,
+)
 
 # Version
 VERSION_FILE = Path(__file__).with_name("VERSION")
@@ -588,8 +593,16 @@ mopeka1_level_mm = 0.0
 mopeka2_level_mm = 0.0
 mopeka1_level_in = 0.0
 mopeka2_level_in = 0.0
+mopeka1_has_reading = False
+mopeka2_has_reading = False
+mopeka1_observed_at = None
+mopeka2_observed_at = None
 bms_soc = None
 bms_voltage = None
+bms_has_reading = False
+bms_observed_at = None
+trailer_sensor_identity_generation = 0
+trailer_sensor_identity = None
 
 # Tank calibration workflow state
 # Flow stops under this many gallons don't count as a calibration fill —
@@ -3123,6 +3136,16 @@ def _mopeka_config_path():
     return "/opt/mopeka/mopeka_config.json"
 
 
+def _read_trailer_sensor_identity_token():
+    """Read the durable identity that owns dashboard-cached sensor values."""
+    try:
+        with open(_mopeka_config_path(), "r") as source:
+            cfg = json.load(source)
+    except Exception:
+        return None
+    return history_identity_token(history_identity_from_config(cfg))
+
+
 def _mopeka_calibration_dir():
     return "/opt/mopeka/calibrations"
 
@@ -3219,19 +3242,27 @@ def _build_dashboard_state_snapshot():
         "flow_fault_code": flow_fault_code,
         "flow_meter_fault_reason": flow_fault_reason,
         "switch_box_connected": bool(switch_box_connected),
-        "bms_soc": None if bms_soc is None else int(round(bms_soc)),
-        "bms_voltage": None if bms_voltage is None else round(bms_voltage, 2),
+        "bms_soc": None if not bms_has_reading or bms_soc is None else int(round(bms_soc)),
+        "bms_voltage": None if not bms_has_reading or bms_voltage is None else round(bms_voltage, 2),
+        "bms_has_reading": bool(bms_has_reading),
+        "bms_last_update": bms_observed_at if bms_has_reading else None,
         "daily_total_gal": round(daily_total, 3),
-        "front_tank_gal": round(mopeka1_gallons, 1),
-        "back_tank_gal": round(mopeka2_gallons, 1),
-        "front_tank_quality": int(mopeka1_quality),
-        "back_tank_quality": int(mopeka2_quality),
+        "front_tank_gal": round(mopeka1_gallons, 1) if mopeka1_has_reading else None,
+        "back_tank_gal": round(mopeka2_gallons, 1) if mopeka2_has_reading else None,
+        "front_tank_quality": int(mopeka1_quality) if mopeka1_has_reading else None,
+        "back_tank_quality": int(mopeka2_quality) if mopeka2_has_reading else None,
         # Raw sensor level so WiFi clients can show inches like the BLE
         # sensor characteristics do (level_in is offset-compensated).
         "front_tank_mm": round(float(mopeka1_level_mm), 1),
         "back_tank_mm": round(float(mopeka2_level_mm), 1),
         "front_tank_in": round(float(mopeka1_level_in), 2),
         "back_tank_in": round(float(mopeka2_level_in), 2),
+        "front_tank_has_reading": bool(mopeka1_has_reading),
+        "back_tank_has_reading": bool(mopeka2_has_reading),
+        "front_tank_last_update": mopeka1_observed_at if mopeka1_has_reading else None,
+        "back_tank_last_update": mopeka2_observed_at if mopeka2_has_reading else None,
+        "trailer_sensor_identity_generation": trailer_sensor_identity_generation,
+        "trailer_sensor_identity": trailer_sensor_identity,
         "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
@@ -6639,6 +6670,70 @@ def handle_mouse_command(payload):
     return False, f"unsupported action: {action}"
 
 
+def _run_on_tk_queue_and_wait(callback, timeout_seconds=1.5):
+    """Run a short state mutation on Tk's queue before acknowledging it.
+
+    Sensor updates are queued through ``root.after``.  Trailer identity
+    commands must use that same queue so an older sensor callback cannot run
+    after a reset has already been acknowledged.  The bounded wait also keeps
+    the socket listener from hanging when the Tk loop is shutting down.
+    """
+    completed = threading.Event()
+    state_lock = threading.Lock()
+    state = {"cancelled": False, "error": None}
+
+    def queued_callback():
+        with state_lock:
+            if state["cancelled"]:
+                completed.set()
+                return
+            try:
+                callback()
+            except Exception as exc:
+                state["error"] = exc
+            finally:
+                completed.set()
+
+    try:
+        root.after(0, queued_callback)
+    except Exception as exc:
+        print(f"Tk command barrier could not be queued: {exc}", flush=True)
+        return False
+
+    if not completed.wait(max(0.0, float(timeout_seconds))):
+        # If the callback has not started, cancel it while holding the same
+        # lock it must acquire.  This prevents a timed-out reset from mutating
+        # state later after RotorLink has treated the command as failed.
+        with state_lock:
+            if not completed.is_set():
+                state["cancelled"] = True
+                print("Tk command barrier timed out", flush=True)
+                return False
+
+    if state["error"] is not None:
+        print(f"Tk command barrier failed: {state['error']}", flush=True)
+        return False
+    return True
+
+
+def _reset_trailer_sensor_telemetry_and_refresh():
+    """Reset trailer telemetry and redraw it on the Tk thread."""
+    _reset_trailer_sensor_telemetry()
+    update_mopeka_display()
+    update_bms_display()
+
+
+def _run_trailer_sensor_identity_command(line, timeout_seconds=1.5):
+    """Serialize a recognized trailer identity command; return None otherwise."""
+    if line == "RESET_TRAILER_SENSOR_TELEMETRY":
+        callback = _reset_trailer_sensor_telemetry_and_refresh
+    elif line == "TRAILER_SENSOR_IDENTITY_CHANGED":
+        callback = _mark_trailer_sensor_identity_changed
+    else:
+        return None
+    return _run_on_tk_queue_and_wait(callback, timeout_seconds=timeout_seconds)
+
+
 def socket_command_listener():
     """Listen for commands from rotorsync BLE server via localhost socket"""
     global requested_gallons, override_mode, override_enabled_time, colors_are_green
@@ -6729,6 +6824,17 @@ def socket_command_listener():
                                 client.send(
                                     f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
                                 )
+                                continue
+
+                            if line in (
+                                "RESET_TRAILER_SENSOR_TELEMETRY",
+                                "TRAILER_SENSOR_IDENTITY_CHANGED",
+                            ):
+                                # Both mutations share the ordered Tk queue
+                                # with sensor applies.  OK means the command has
+                                # run; ERROR makes RotorLink abort/roll back.
+                                command_applied = _run_trailer_sensor_identity_command(line)
+                                client.send(b"OK\n" if command_applied else b"ERROR\n")
                                 continue
 
                             elif line == "ACCEPT_PENDING_CURVE":
@@ -6948,6 +7054,18 @@ def socket_command_listener():
                             elif line == "MOPEKA_DISABLED":
                                 root.after(0, _mopeka_disabled)
 
+                            elif line.startswith("MOPEKA_SENSOR:"):
+                                try:
+                                    parsed = _parse_mopeka_sensor_command(line)
+                                    if parsed is not None:
+                                        root.after(
+                                            0,
+                                            _apply_mopeka_sensor,
+                                            *parsed,
+                                        )
+                                except Exception as me:
+                                    print(f"Mopeka sensor parse error: {me}", flush=True)
+
                             elif line.startswith("MOPEKA:"):
                                 try:
                                     parts = line[7:].split("|")
@@ -6956,7 +7074,20 @@ def socket_command_listener():
                                         _m2g = float(parts[1])
                                         _m1q = int(parts[2])
                                         _m2q = int(parts[3])
-                                        root.after(0, _apply_mopeka, _m1g, _m2g, _m1q, _m2q)
+                                        _m1ts = parts[4] if len(parts) > 4 else None
+                                        _m2ts = parts[5] if len(parts) > 5 else None
+                                        _identity = parts[6] if len(parts) > 6 else None
+                                        root.after(
+                                            0,
+                                            _apply_mopeka,
+                                            _m1g,
+                                            _m2g,
+                                            _m1q,
+                                            _m2q,
+                                            _m1ts,
+                                            _m2ts,
+                                            _identity,
+                                        )
                                 except Exception as me:
                                     print(f"Mopeka parse error: {me}", flush=True)
 
@@ -6979,7 +7110,16 @@ def socket_command_listener():
                                 try:
                                     parts = line[4:].split("|")
                                     if len(parts) >= 2:
-                                        root.after(0, _apply_bms, float(parts[0]), float(parts[1]))
+                                        observed_at = parts[2] if len(parts) > 2 else None
+                                        identity_token = parts[3] if len(parts) > 3 else None
+                                        root.after(
+                                            0,
+                                            _apply_bms,
+                                            float(parts[0]),
+                                            float(parts[1]),
+                                            observed_at,
+                                            identity_token,
+                                        )
                                 except Exception as be:
                                     print(f"BMS parse error: {be}", flush=True)
 
@@ -8020,16 +8160,187 @@ if not SIM_MODE:
 # draw_fullscreen_stripes()  # Disabled - using solid black background
 
 
-def _apply_mopeka(m1g, m2g, m1q, m2q):
+def _source_observation_epoch(value):
+    """Normalize a box-supplied sensor timestamp without inventing one."""
+    try:
+        observed_at = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    return observed_at
+
+
+def _parse_mopeka_sensor_command(line):
+    """Parse one additive tank command using the exact wire prefix length."""
+    prefix = "MOPEKA_SENSOR:"
+    if not line.startswith(prefix):
+        return None
+    parts = line[len(prefix):].split("|")
+    if len(parts) < 3:
+        raise ValueError("Mopeka sensor command is missing required fields")
+
+    index = int(parts[0])
+    if index not in (1, 2):
+        raise ValueError(f"Invalid Mopeka sensor index: {index}")
+    gallons = float(parts[1])
+    if not math.isfinite(gallons):
+        raise ValueError("Invalid Mopeka gallons")
+    quality = int(parts[2])
+    observed_at = parts[3] if len(parts) > 3 and parts[3] else None
+    identity_token = parts[6] if len(parts) > 6 and parts[6] else None
+
+    optional_values = []
+    for position in (4, 5):
+        value = None
+        if len(parts) > position and parts[position]:
+            value = float(parts[position])
+            if not math.isfinite(value):
+                raise ValueError("Invalid Mopeka level")
+        optional_values.append(value)
+
+    return (
+        index,
+        gallons,
+        quality,
+        observed_at,
+        optional_values[0],
+        optional_values[1],
+        identity_token,
+    )
+
+
+def _accept_trailer_sensor_identity(identity_token):
+    """Bind an observed reading to its scanner process identity."""
+    global trailer_sensor_identity
+    if identity_token is None:
+        # Timestamp-less/identity-less senders remain readable locally, but do
+        # not gain a cache owner that RotorLink could associate cross-device.
+        return True
+    normalized = normalize_history_identity_token(identity_token)
+    if normalized is None:
+        return False
+    if trailer_sensor_identity != normalized:
+        # The dashboard cache is aggregate, so a single new-owner reading must
+        # not relabel untouched fields from the prior trailer. Clear every
+        # sensor group first, then let the caller apply only this observation.
+        _reset_trailer_sensor_telemetry()
+    trailer_sensor_identity = normalized
+    return True
+
+
+def _reset_trailer_sensor_telemetry():
+    """Clear sensor caches only for a confirmed trailer identity change."""
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality
+    global mopeka1_level_mm, mopeka2_level_mm, mopeka1_level_in, mopeka2_level_in
+    global mopeka1_has_reading, mopeka2_has_reading
+    global mopeka1_observed_at, mopeka2_observed_at, mopeka_connected
+    global bms_soc, bms_voltage, bms_has_reading, bms_observed_at
+
+    mopeka1_gallons = 0.0
+    mopeka2_gallons = 0.0
+    mopeka1_quality = 0
+    mopeka2_quality = 0
+    mopeka1_level_mm = 0.0
+    mopeka2_level_mm = 0.0
+    mopeka1_level_in = 0.0
+    mopeka2_level_in = 0.0
+    mopeka1_has_reading = False
+    mopeka2_has_reading = False
+    mopeka1_observed_at = None
+    mopeka2_observed_at = None
+    mopeka_connected = False
+
+    bms_soc = None
+    bms_voltage = None
+    bms_has_reading = False
+    bms_observed_at = None
+
+
+def _mark_trailer_sensor_identity_changed():
+    global trailer_sensor_identity_generation
+    global trailer_sensor_identity
+    durable_identity = _read_trailer_sensor_identity_token()
+    if trailer_sensor_identity != durable_identity:
+        _reset_trailer_sensor_telemetry()
+    trailer_sensor_identity = durable_identity
+    trailer_sensor_identity_generation += 1
+
+
+def _apply_mopeka(
+    m1g,
+    m2g,
+    m1q,
+    m2q,
+    m1_observed_at=None,
+    m2_observed_at=None,
+    identity_token=None,
+):
     """Apply mopeka values and update display (called from main thread via root.after)"""
-    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality, mopeka_connected, mopeka_enabled
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality
+    global mopeka_connected, mopeka_enabled
+    global mopeka1_has_reading, mopeka2_has_reading
+    global mopeka1_observed_at, mopeka2_observed_at
+    if not _accept_trailer_sensor_identity(identity_token):
+        return
     mopeka1_gallons = m1g
     mopeka2_gallons = m2g
     mopeka1_quality = m1q
     mopeka2_quality = m2q
+    mopeka1_has_reading = True
+    mopeka2_has_reading = True
+    mopeka1_observed_at = _source_observation_epoch(m1_observed_at)
+    mopeka2_observed_at = _source_observation_epoch(m2_observed_at)
     mopeka_enabled = True
     mopeka_connected = True
     print(f"Mopeka applied: front={m1g:.0f} back={m2g:.0f} q={m1q}/{m2q}", flush=True)
+    update_mopeka_display()
+
+
+def _apply_mopeka_sensor(
+    index,
+    gallons,
+    quality,
+    observed_at=None,
+    level_mm=None,
+    level_in=None,
+    identity_token=None,
+):
+    """Apply one independently observed tank without filling the other with zero."""
+    global mopeka1_gallons, mopeka2_gallons, mopeka1_quality, mopeka2_quality
+    global mopeka1_level_mm, mopeka2_level_mm, mopeka1_level_in, mopeka2_level_in
+    global mopeka1_has_reading, mopeka2_has_reading
+    global mopeka1_observed_at, mopeka2_observed_at
+    global mopeka_connected, mopeka_enabled
+    if not _accept_trailer_sensor_identity(identity_token):
+        return
+    normalized_observed_at = _source_observation_epoch(observed_at)
+    if index == 1:
+        mopeka1_gallons = gallons
+        mopeka1_quality = quality
+        mopeka1_has_reading = True
+        mopeka1_observed_at = normalized_observed_at
+        if level_mm is not None:
+            mopeka1_level_mm = level_mm
+        if level_in is not None:
+            mopeka1_level_in = level_in
+    elif index == 2:
+        mopeka2_gallons = gallons
+        mopeka2_quality = quality
+        mopeka2_has_reading = True
+        mopeka2_observed_at = normalized_observed_at
+        if level_mm is not None:
+            mopeka2_level_mm = level_mm
+        if level_in is not None:
+            mopeka2_level_in = level_in
+    else:
+        return
+    mopeka_enabled = True
+    mopeka_connected = True
+    print(
+        f"Mopeka sensor {index} applied: gallons={gallons:.1f} q={quality}",
+        flush=True,
+    )
     update_mopeka_display()
 
 
@@ -8041,10 +8352,14 @@ def _apply_mopeka_raw(m1mm, m2mm, m1in, m2in):
     mopeka2_level_in = m2in
 
 
-def _apply_bms(soc, voltage):
-    global bms_soc, bms_voltage
+def _apply_bms(soc, voltage, observed_at=None, identity_token=None):
+    global bms_soc, bms_voltage, bms_has_reading, bms_observed_at
+    if not _accept_trailer_sensor_identity(identity_token):
+        return
     bms_soc = soc
     bms_voltage = voltage
+    bms_has_reading = True
+    bms_observed_at = _source_observation_epoch(observed_at)
     update_bms_display()
 
 

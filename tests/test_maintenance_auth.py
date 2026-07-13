@@ -202,6 +202,12 @@ def write_runtime_tree(root, marker):
     (root / 'src').mkdir(exist_ok=True)
     (root / 'src' / '__init__.py').write_text('', encoding='utf-8')
     (root / 'src' / 'marker.py').write_text(f'MARKER = "{marker}"\n', encoding='utf-8')
+    (root / 'rotorlink').mkdir(exist_ok=True)
+    (root / 'rotorlink' / '__init__.py').write_text('', encoding='utf-8')
+    (root / 'rotorlink' / 'server.py').write_text(
+        f'MARKER = "{marker}"\n',
+        encoding='utf-8',
+    )
 
 
 def write_update_tar(path, marker='new'):
@@ -236,6 +242,7 @@ def test_apply_tar_update_rolls_back_runtime_after_copy_failure(bumble_module, m
     assert (repo / 'dashboard.py').read_text(encoding='utf-8') == 'print("old dashboard")\n'
     assert (repo / 'rotorsync_bumble.py').read_text(encoding='utf-8') == 'print("old bumble")\n'
     assert (repo / 'src' / 'marker.py').read_text(encoding='utf-8') == 'MARKER = "old"\n'
+    assert (repo / 'rotorlink' / 'server.py').read_text(encoding='utf-8') == 'MARKER = "old"\n'
     assert not (repo / 'install.sh').exists()
 
 
@@ -255,7 +262,51 @@ def test_restore_repo_runtime_ownership_chowns_runtime_paths(bumble_module, monk
     assert (str(repo / 'rotorsync_bumble.py'), uid, gid) in calls
     assert (str(repo / 'src'), uid, gid) in calls
     assert (str(repo / 'src' / 'marker.py'), uid, gid) in calls
+    assert (str(repo / 'rotorlink'), uid, gid) in calls
+    assert (str(repo / 'rotorlink' / 'server.py'), uid, gid) in calls
     assert (str(repo / 'deploy' / 'bbb-logrotate.conf'), uid, gid) in calls
+
+
+def test_apply_tar_update_installs_and_compile_gates_rotorlink(
+    bumble_module,
+    monkeypatch,
+    tmp_path,
+):
+    repo = tmp_path / 'repo'
+    artifact = tmp_path / 'update.tar.gz'
+    write_runtime_tree(repo, 'old')
+    write_update_tar(artifact, 'new')
+
+    monkeypatch.setattr(bumble_module, 'MAINTENANCE_REPO_DIR', str(repo))
+    monkeypatch.setattr(
+        bumble_module,
+        'MAINTENANCE_UPDATE_DIR',
+        str(tmp_path / 'updates'),
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'MAINTENANCE_TMP_DIR',
+        str(tmp_path / 'scratch'),
+    )
+    monkeypatch.setattr(bumble_module, '_refresh_opt_runtime', lambda _repo: None)
+
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(bumble_module.subprocess, 'run', fake_run)
+
+    bumble_module._apply_tar_update('update-1', artifact)
+
+    assert 'rotorlink' in bumble_module.MAINTENANCE_RUNTIME_PATHS
+    assert (
+        repo / 'rotorlink' / 'server.py'
+    ).read_text(encoding='utf-8') == 'MARKER = "new"\n'
+    compile_calls = [call for call in calls if 'compileall' in call]
+    assert compile_calls
+    assert any(part.endswith('/rotorlink') for part in compile_calls[0])
 
 
 def test_apply_failure_marks_update_failed_and_reports_status(bumble_module, monkeypatch, tmp_path):
@@ -352,7 +403,7 @@ def test_apply_allows_latest_verified_bbb_master_update(bumble_module, monkeypat
     assert bumble_module._read_update_meta(newer_id)['status'] == 'applied'
 
 
-def test_service_restart_uses_transient_unit_and_restarts_rotorsync_last(
+def test_service_restart_uses_transient_unit_and_starts_watchdog_last(
     bumble_module,
     monkeypatch,
 ):
@@ -371,12 +422,18 @@ def test_service_restart_uses_transient_unit_and_restarts_rotorsync_last(
     assert kind == 'run'
     assert cmd[:2] == ['systemd-run', '--unit=bbb-post-update-restart']
     restart_cmd = cmd[-1]
-    assert 'systemctl restart iol_dashboard.service rotorsync_watchdog.service' in restart_cmd
-    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorsync.service')
+    assert 'systemctl stop rotorsync_watchdog.service' in restart_cmd
+    assert 'systemctl restart iol_dashboard.service' in restart_cmd
+    assert 'systemctl restart rotorlink.service' in restart_cmd
+    assert 'systemctl restart rotorsync.service' in restart_cmd
+    assert 'systemctl start rotorsync_watchdog.service' in restart_cmd
+    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorlink.service')
+    assert restart_cmd.index('rotorlink.service') < restart_cmd.index('rotorsync.service')
+    assert restart_cmd.rindex('rotorsync.service') < restart_cmd.rindex('rotorsync_watchdog.service')
     assert kwargs['check'] is True
 
 
-def test_service_restart_fallback_still_restarts_rotorsync_last(
+def test_service_restart_fallback_still_starts_watchdog_last(
     bumble_module,
     monkeypatch,
 ):
@@ -395,8 +452,10 @@ def test_service_restart_fallback_still_restarts_rotorsync_last(
 
     assert popen_calls
     restart_cmd = popen_calls[0][-1]
-    assert 'systemctl restart iol_dashboard.service rotorsync_watchdog.service' in restart_cmd
-    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorsync.service')
+    assert 'systemctl restart rotorlink.service' in restart_cmd
+    assert restart_cmd.index('iol_dashboard.service') < restart_cmd.index('rotorlink.service')
+    assert restart_cmd.index('rotorlink.service') < restart_cmd.index('rotorsync.service')
+    assert restart_cmd.rindex('rotorsync.service') < restart_cmd.rindex('rotorsync_watchdog.service')
 
 
 class CapturingBleDevice:

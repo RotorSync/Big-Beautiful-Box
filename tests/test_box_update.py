@@ -26,6 +26,8 @@ def _make_bbb_tarball(version="V9.99", root="RotorSync-Big-Beautiful-Box-abc123"
         add("rotorsync_bumble.py", b"# bumble\n")
         add("src/__init__.py", b"")
         add("src/thing.py", b"x = 1\n")
+        add("rotorlink/__init__.py", b"")
+        add("rotorlink/server.py", b"RELEASE = 'new'\n")
         add("VERSION", (version + "\n").encode())
     return buf.getvalue()
 
@@ -48,9 +50,11 @@ def _receiver(tmp_path, **overrides):
 def _seed_repo(tmp_path, version="V1.00"):
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
+    (repo / "rotorlink").mkdir(parents=True)
     (repo / "dashboard.py").write_text("# old dashboard\n")
     (repo / "rotorsync_bumble.py").write_text("# old bumble\n")
     (repo / "src" / "old.py").write_text("old = True\n")
+    (repo / "rotorlink" / "server.py").write_text("RELEASE = 'old'\n")
     (repo / "VERSION").write_text(version + "\n")
     return repo
 
@@ -102,6 +106,11 @@ def test_streamed_update_applies_in_place(tmp_path, _mock_subprocess):
     repo = tmp_path / "repo"
     assert (repo / "VERSION").read_text().strip() == "V9.99"    # new code in place
     assert "print('hi')" in (repo / "dashboard.py").read_text()
+    assert "RELEASE = 'new'" in (repo / "rotorlink" / "server.py").read_text()
+    compile_calls = [call for call in _mock_subprocess if "compileall" in call]
+    assert compile_calls
+    assert any(str(repo.parent / "tmp" / "upd-1") in part for part in compile_calls[0])
+    assert any(part.endswith("/rotorlink") for part in compile_calls[0])
     # a restart was scheduled (systemd-run) including rotorlink
     assert any("systemd-run" in c[0] for c in _mock_subprocess)
     assert any("update_applied" == f.get("type") for kind, f in events if kind == "status")
@@ -122,6 +131,7 @@ def test_symlink_outside_runtime_paths_is_ignored(tmp_path, _mock_subprocess):
         add("dashboard.py", b"print('v')\n")
         add("rotorsync_bumble.py", b"# b\n")
         add("src/__init__.py", b"")
+        add("rotorlink/__init__.py", b"")
         add("VERSION", b"V9.99\n")
         # a symlink in a non-runtime asset dir
         link = tarfile.TarInfo(f"{root}/web-sim/thumbs_up.png")
@@ -202,3 +212,54 @@ def test_apply_rolls_back_when_copy_fails(tmp_path, monkeypatch, _mock_subproces
     # Rollback restored the old VERSION (repo not left half-written).
     monkeypatch.setattr(box_update, "_copy_path", real_copy)
     assert (tmp_path / "repo" / "VERSION").read_text().strip() == "V1.00"
+    assert (
+        tmp_path / "repo" / "rotorlink" / "server.py"
+    ).read_text() == "RELEASE = 'old'\n"
+
+
+def test_update_without_rotorlink_runtime_is_rejected(tmp_path):
+    _seed_repo(tmp_path)
+    root = "RotorSync-Big-Beautiful-Box-abc123"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in (
+            ("dashboard.py", b"print('new')\n"),
+            ("rotorsync_bumble.py", b"# bumble\n"),
+            ("src/__init__.py", b""),
+        ):
+            info = tarfile.TarInfo(f"{root}/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    rx, _ = _receiver(tmp_path)
+    with pytest.raises(ValueError, match="BBB repo snapshot"):
+        _stream(rx, buf.getvalue())
+
+
+def test_apply_rolls_back_rotorlink_after_post_copy_failure(
+    tmp_path,
+    monkeypatch,
+    _mock_subprocess,
+):
+    repo = _seed_repo(tmp_path, "V1.00")
+    rx, _ = _receiver(tmp_path)
+    _stream(rx, _make_bbb_tarball(version="V9.99"))
+
+    ownership_calls = 0
+
+    def fail_first_ownership_restore(_repo):
+        nonlocal ownership_calls
+        ownership_calls += 1
+        if ownership_calls == 1:
+            raise OSError("ownership failed")
+
+    monkeypatch.setattr(
+        rx,
+        "_restore_repo_runtime_ownership",
+        fail_first_ownership_restore,
+    )
+    with pytest.raises(RuntimeError, match="restored previous runtime"):
+        rx.handle_apply({"update_id": "upd-1"})
+
+    assert (repo / "VERSION").read_text().strip() == "V1.00"
+    assert (repo / "rotorlink" / "server.py").read_text() == "RELEASE = 'old'\n"

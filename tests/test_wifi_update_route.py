@@ -36,6 +36,8 @@ def _bbb_tarball():
             ("root/dashboard.py", b"print('new')\n"),
             ("root/rotorsync_bumble.py", b"# b\n"),
             ("root/src/__init__.py", b""),
+            ("root/rotorlink/__init__.py", b""),
+            ("root/rotorlink/server.py", b"RELEASE = 'new'\n"),
             ("root/VERSION", b"V9.99\n"),
         ):
             info = tarfile.TarInfo(name)
@@ -71,8 +73,10 @@ def test_signed_update_stream_applies_over_wifi(tmp_path, monkeypatch):
     # Seed an existing repo so apply overwrites it.
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
+    (repo / "rotorlink").mkdir(parents=True)
     (repo / "dashboard.py").write_text("# old\n")
     (repo / "rotorsync_bumble.py").write_text("# old\n")
+    (repo / "rotorlink" / "server.py").write_text("RELEASE = 'old'\n")
     (repo / "VERSION").write_text("V1.00\n")
 
     tarball = _bbb_tarball()
@@ -98,12 +102,16 @@ def test_signed_update_stream_applies_over_wifi(tmp_path, monkeypatch):
 
     # Applied: new code in the repo, restart scheduled including rotorlink.
     assert (repo / "VERSION").read_text().strip() == "V9.99"
+    assert (repo / "rotorlink" / "server.py").read_text() == "RELEASE = 'new'\n"
     types = [f.get("type") for f in emitted]
     assert "update_verified" in types
     assert "update_applied" in types
     assert any("systemd-run" in c[0] for c in calls)
     restart_cmd = " ".join(c for call in calls if "systemd-run" in call[0] for c in call)
     assert "rotorlink.service" in restart_cmd
+    compile_calls = [call for call in calls if "compileall" in call]
+    assert compile_calls
+    assert any(part.endswith("/rotorlink") for part in compile_calls[0])
 
 
 def test_unsigned_update_frame_rejected(tmp_path, monkeypatch):

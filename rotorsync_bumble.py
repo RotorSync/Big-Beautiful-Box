@@ -46,6 +46,13 @@ from src.batchmix_payload import batchmix_validation_error
 from src import connection_registry
 from src.fill_history import item_from_line as _shared_fill_item_from_line
 from src import hello_time as _hello_time_shared
+from src.mopeka_history import (
+    ensure_active_history_schema,
+    filter_rows_for_current_identity,
+    history_identity_from_config,
+    history_identity_token,
+    history_identity_values,
+)
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -190,6 +197,7 @@ MAINTENANCE_RUNTIME_PATHS = (
     'requirements.txt',
     'install.sh',
     'src',
+    'rotorlink',
     'deploy',
 )
 MAINTENANCE_SECRET_PATHS = (
@@ -205,12 +213,18 @@ MAINTENANCE_FRAME_SECRET_FIELDS = (
 )
 CURSOR_CONTROL_SETUP_SCRIPT = '/home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh'
 
-# Sensor data with timestamps
-sensor_data = {
-    'bms': {'voltage': 0, 'soc': 0, 'last_update': 0},
-    'mopeka1': {'level_mm': 0, 'quality': 0, 'last_update': 0},
-    'mopeka2': {'level_mm': 0, 'quality': 0, 'last_update': 0}
-}
+def _new_sensor_data_cache():
+    """Return an empty per-identity cache without fabricated sensor values."""
+    return {
+        'bms': {},
+        'mopeka1': {},
+        'mopeka2': {},
+    }
+
+
+# Sensor data with source-observation timestamps. Empty means the sensor has
+# never produced a successful reading; do not turn that state into a real zero.
+sensor_data = _new_sensor_data_cache()
 
 # Dashboard status
 dashboard_status = {
@@ -244,6 +258,7 @@ live_telemetry_notify_task = None
 last_live_telemetry_client_read_at = 0.0
 last_mopeka_history_log_at = 0.0
 last_mopeka_history_snapshot = None
+last_mopeka_history_identity = None
 last_history_prune_at = 0.0
 
 
@@ -1059,6 +1074,17 @@ def submit_dashboard_io(fn, *args):
         _DASHBOARD_IO_EXECUTOR.submit(_run)
     except RuntimeError:
         print('Dashboard I/O worker unavailable (shutting down); call dropped', flush=True)
+
+
+def _ordered_dashboard_command(command):
+    """Run a rare identity command after all queued sensor writes.
+
+    Trailer selection handlers are synchronous, so wait on the same one-worker
+    executor used by sensor delivery. This creates an ordering barrier without
+    adding steady-state polling or a second dashboard writer.
+    """
+    future = _DASHBOARD_IO_EXECUTOR.submit(send_dashboard_command, command)
+    return future.result(timeout=10)
 
 
 async def run_dashboard_io(fn, *args):
@@ -2216,12 +2242,157 @@ async def monitor_gatt_adapter(expected_adapter, expected_device_path):
             )
             os._exit(1)
 
+def _valid_sensor_observation_epoch(value):
+    """Return a finite positive source timestamp, or None when unavailable."""
+    try:
+        observed_at = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    return observed_at
+
+
+def _observed_sensor_payload(data_key):
+    """Copy a sensor reading only after its first successful observation."""
+    reading = sensor_data.get(data_key)
+    if not isinstance(reading, dict):
+        return {}
+    observed_at = _valid_sensor_observation_epoch(reading.get('last_update'))
+    if observed_at is None:
+        return {}
+    if data_key == 'bms' and not any(key in reading for key in ('voltage', 'soc')):
+        return {}
+    if data_key.startswith('mopeka') and 'gallons' not in reading:
+        return {}
+    payload = reading.copy()
+    payload['last_update'] = observed_at
+    return payload
+
+
+def _reset_trailer_sensor_telemetry_for_identity_change():
+    """Clear source and dashboard caches before changing trailer identity.
+
+    The dashboard acknowledgement is required: changing identity while its
+    prior readings remain available would let RotorLink relabel those readings
+    as belonging to the new trailer.
+    """
+    global sensor_data
+    response = _ordered_dashboard_command('RESET_TRAILER_SENSOR_TELEMETRY')
+    if response != 'OK':
+        raise RuntimeError('Dashboard did not acknowledge trailer sensor reset')
+    sensor_data = _new_sensor_data_cache()
+
+
+def _notify_trailer_sensor_identity_changed():
+    """Tell RotorLink the new identity is durable before sensors resume."""
+    response = _ordered_dashboard_command('TRAILER_SENSOR_IDENTITY_CHANGED')
+    if response != 'OK':
+        raise RuntimeError('Dashboard did not acknowledge trailer identity change')
+
+
+def _mopeka_dashboard_commands(identity=None):
+    """Build partial-sensor or legacy-compatible combined commands.
+
+    A single observed tank is sent only through MOPEKA_SENSOR; the legacy
+    MOPEKA/MOPEKA_RAW pair is safe to send once both tanks have real readings.
+    Older dashboards ignore the additive command but never receive fake zeroes.
+    When both tanks exist, avoid duplicate per-sensor socket traffic because
+    MOPEKA already carries both independent timestamps.
+    """
+    observed = {}
+    sensor_commands = []
+    identity_token = history_identity_token(identity)
+    for index, data_key in ((1, 'mopeka1'), (2, 'mopeka2')):
+        reading = _observed_sensor_payload(data_key)
+        if not reading or 'quality' not in reading:
+            continue
+        try:
+            gallons = float(reading['gallons'])
+            quality = int(reading['quality'])
+            observed_at = float(reading['last_update'])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (gallons, observed_at)):
+            continue
+        observed[index] = reading
+        parts = [
+            str(index),
+            f'{gallons:.3f}',
+            str(quality),
+            f'{observed_at:.6f}',
+        ]
+        for key, digits in (('level_mm', 3), ('level_in', 4)):
+            value = reading.get(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                parts.append('')
+                continue
+            parts.append(f'{number:.{digits}f}' if math.isfinite(number) else '')
+        if identity_token is not None:
+            parts.append(identity_token)
+        sensor_commands.append('MOPEKA_SENSOR:' + '|'.join(parts))
+
+    if len(observed) == 2:
+        commands = []
+        front = observed[1]
+        back = observed[2]
+        combined_command = (
+            'MOPEKA:'
+            f'{float(front["gallons"]):.3f}|{float(back["gallons"]):.3f}|'
+            f'{int(front["quality"])}|{int(back["quality"])}|'
+            f'{float(front["last_update"]):.6f}|{float(back["last_update"]):.6f}'
+        )
+        if identity_token is not None:
+            combined_command += f'|{identity_token}'
+        commands.append(combined_command)
+        raw_values = (
+            front.get('level_mm'),
+            back.get('level_mm'),
+            front.get('level_in'),
+            back.get('level_in'),
+        )
+        try:
+            raw_numbers = tuple(float(value) for value in raw_values)
+        except (TypeError, ValueError):
+            raw_numbers = ()
+        if raw_numbers and all(math.isfinite(value) for value in raw_numbers):
+            commands.append(
+                'MOPEKA_RAW:'
+                f'{raw_numbers[0]:.3f}|{raw_numbers[1]:.3f}|'
+                f'{raw_numbers[2]:.4f}|{raw_numbers[3]:.4f}'
+            )
+        return commands
+    return sensor_commands
+
+
+def _bms_dashboard_command(identity=None):
+    reading = _observed_sensor_payload('bms')
+    if not reading or 'soc' not in reading or 'voltage' not in reading:
+        return None
+    try:
+        soc = float(reading['soc'])
+        voltage = float(reading['voltage'])
+        observed_at = float(reading['last_update'])
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (soc, voltage, observed_at)):
+        return None
+    command = f'BMS:{soc:g}|{voltage:.3f}|{observed_at:.6f}'
+    identity_token = history_identity_token(identity)
+    if identity_token is not None:
+        command += f'|{identity_token}'
+    return command
+
+
 def make_read_handler(data_key):
     def read_value(connection):
         mark_gatt_client_seen(connection)
-        data = sensor_data[data_key].copy()
-        data.pop('last_update', None)
-        value = json.dumps(data)
+        data = _observed_sensor_payload(data_key)
+        # JSON null makes older clients' optional-sensor decode fail closed;
+        # an empty object was decoded as a real all-zero reading by those apps.
+        value = json.dumps(data if data else None)
         print(f'ReadValue {data_key}: {value}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
@@ -3193,7 +3364,7 @@ def _apply_tar_update(update_id, artifact_path):
         archive.extractall(extract_dir)
 
     update_root = _find_extracted_update_root(extract_dir)
-    for required in ('dashboard.py', 'rotorsync_bumble.py', 'src'):
+    for required in ('dashboard.py', 'rotorsync_bumble.py', 'src', 'rotorlink'):
         if not (update_root / required).exists():
             raise ValueError(f'update is missing {required}')
 
@@ -3205,7 +3376,14 @@ def _apply_tar_update(update_id, artifact_path):
         timeout=20,
     )
     subprocess.run(
-        ['python3', '-m', 'compileall', '-q', str(update_root / 'src')],
+        [
+            'python3',
+            '-m',
+            'compileall',
+            '-q',
+            str(update_root / 'src'),
+            str(update_root / 'rotorlink'),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -3242,8 +3420,11 @@ def _apply_tar_update(update_id, artifact_path):
 def _schedule_service_restart():
     restart_cmd = (
         'sleep 1; '
-        'systemctl restart iol_dashboard.service rotorsync_watchdog.service; '
-        'systemctl restart rotorsync.service'
+        'systemctl stop rotorsync_watchdog.service; '
+        'systemctl restart iol_dashboard.service; '
+        'systemctl restart rotorlink.service; '
+        'systemctl restart rotorsync.service; '
+        'systemctl start rotorsync_watchdog.service'
     )
     try:
         subprocess.run(
@@ -4214,10 +4395,23 @@ def enforce_bumble_only_stack():
 # Trailer Selection Logic
 # =============================================================================
 
-def clear_trailer_assignment():
+def _trailer_sensor_identity(cfg):
+    trailer = _get_assigned_trailer(cfg)
+    trailer_key = None if trailer is None else str(trailer).strip()
+    front_id = str(cfg.get('front_id') or '').strip().upper()
+    back_id = str(cfg.get('back_id') or '').strip().upper()
+    return trailer_key, front_id, back_id
+
+
+def clear_trailer_assignment(*, reset_sensor_cache=False):
     """Clear fleet trailer assignment without overwriting adapter settings."""
     global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX, BMS_NAME
     cfg = load_config()
+    previous_cfg = dict(cfg)
+    target_identity = (None, '', '')
+    identity_changed = _trailer_sensor_identity(cfg) != target_identity
+    if reset_sensor_cache and identity_changed:
+        _reset_trailer_sensor_telemetry_for_identity_change()
     cfg.update({
         'box_mode': _normalize_box_mode(cfg.get('box_mode')),
         'assigned_trailer': None,
@@ -4226,7 +4420,19 @@ def clear_trailer_assignment():
         'front_id': '',
         'back_id': '',
     })
-    save_config(cfg)
+    try:
+        save_config(cfg)
+        if reset_sensor_cache and identity_changed:
+            _notify_trailer_sensor_identity_changed()
+    except Exception:
+        if reset_sensor_cache and identity_changed:
+            try:
+                save_config(previous_cfg)
+            except Exception as rollback_error:
+                print(f'Trailer clear rollback failed: {rollback_error}', flush=True)
+        raise
+    if identity_changed:
+        _reset_mopeka_history_baseline()
     MOPEKA1_MAC_SUFFIX = ''
     MOPEKA2_MAC_SUFFIX = ''
     BMS_NAME = _compute_bms_name(cfg)
@@ -4245,7 +4451,7 @@ def _is_clear_trailer_value(value):
     return text in ('', '0', 'none', 'null', 'unconfigured', 'unassigned', 'clear')
 
 
-def apply_trailer(trailer_num):
+def apply_trailer(trailer_num, *, reset_sensor_cache=False):
     """Look up trailer in sensor CSV, set MOPEKA1/2_MAC_SUFFIX globals,
     save config, reload mopeka_converter, return trailer info dict."""
     global MOPEKA1_MAC_SUFFIX, MOPEKA2_MAC_SUFFIX, BMS_NAME
@@ -4274,14 +4480,18 @@ def apply_trailer(trailer_num):
     front_offset = parse_offset(front)
     back_offset = parse_offset(back)
 
-    # Update globals for the scanner
-    if front_id != '---------------':
-        MOPEKA1_MAC_SUFFIX = front_id
-    if back_id != '---------------':
-        MOPEKA2_MAC_SUFFIX = back_id
+    cfg = load_config()
+    previous_cfg = dict(cfg)
+    target_identity = (
+        str(trailer_num).strip(),
+        str(front_id or '').strip().upper(),
+        str(back_id or '').strip().upper(),
+    )
+    identity_changed = _trailer_sensor_identity(cfg) != target_identity
+    if reset_sensor_cache and identity_changed:
+        _reset_trailer_sensor_telemetry_for_identity_change()
 
     # Persist to config
-    cfg = load_config()
     cfg.update({
         'box_mode': _normalize_box_mode(cfg.get('box_mode')),
         'assigned_trailer': trailer_num,
@@ -4290,7 +4500,24 @@ def apply_trailer(trailer_num):
         'back_id': back_id,
         'display_name': f'TrailerSync-TR{trailer_num}',
     })
-    save_config(cfg)
+    try:
+        save_config(cfg)
+        if reset_sensor_cache and identity_changed:
+            _notify_trailer_sensor_identity_changed()
+    except Exception:
+        if reset_sensor_cache and identity_changed:
+            try:
+                save_config(previous_cfg)
+            except Exception as rollback_error:
+                print(f'Trailer selection rollback failed: {rollback_error}', flush=True)
+        raise
+    if identity_changed:
+        _reset_mopeka_history_baseline()
+
+    # Update globals for the scanner only after the old identity's readings
+    # have been made unavailable and RotorLink can see the new identity.
+    MOPEKA1_MAC_SUFFIX = '' if front_id == '---------------' else front_id
+    MOPEKA2_MAC_SUFFIX = '' if back_id == '---------------' else back_id
     BMS_NAME = _compute_bms_name(cfg)
 
     # Reload mopeka_converter so offsets match new sensors
@@ -4790,7 +5017,7 @@ def _cmd_select_trailer(cmd, *, request_id=None):
 
     trailer_value = cmd.get('trailer')
     if _is_clear_trailer_value(trailer_value):
-        result = clear_trailer_assignment()
+        result = clear_trailer_assignment(reset_sensor_cache=True)
         config_response_pages = []
         _set_config_response_obj({
             'ok': True,
@@ -4809,7 +5036,7 @@ def _cmd_select_trailer(cmd, *, request_id=None):
         _set_config_response_obj({'ok': False, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'error': 'Invalid trailer'})
         return
 
-    result = apply_trailer(trailer_num)
+    result = apply_trailer(trailer_num, reset_sensor_cache=True)
     config_response_pages = []
     if result is None:
         _set_config_response_obj({'ok': False, 'op': 'SELECT_TRAILER', 'request_id': request_id, 'error': f'Trailer {trailer_num} not found'})
@@ -5168,7 +5395,7 @@ def trailer_write_handler(connection, value):
     trailer_str = value.decode('utf-8').strip()
     print(f'Trailer write: {trailer_str}', flush=True)
     if _is_clear_trailer_value(trailer_str):
-        clear_trailer_assignment()
+        clear_trailer_assignment(reset_sensor_cache=True)
         _schedule_identity_restart('Trailer write cleared assignment; restarting to refresh BLE identity')
         return
 
@@ -5178,7 +5405,7 @@ def trailer_write_handler(connection, value):
         print(f'Invalid trailer number: {trailer_str}', flush=True)
         return
 
-    result = apply_trailer(trailer_num)
+    result = apply_trailer(trailer_num, reset_sensor_cache=True)
     if result is None:
         print(f'Trailer {trailer_num} not found in sensor CSV', flush=True)
         return
@@ -5267,8 +5494,8 @@ def _int_or_empty(value):
         return ''
 
 
-def _mopeka_history_snapshot(current_time, m1, m2):
-    return {
+def _mopeka_history_snapshot(current_time, m1, m2, identity):
+    snapshot = {
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time)),
         'front_gal': m1.get('gallons'),
         'back_gal': m2.get('gallons'),
@@ -5279,6 +5506,8 @@ def _mopeka_history_snapshot(current_time, m1, m2):
         'front_quality': m1.get('quality'),
         'back_quality': m2.get('quality'),
     }
+    snapshot.update(history_identity_values(identity))
+    return snapshot
 
 
 def _mopeka_history_change_reason(snapshot, previous_snapshot):
@@ -5294,18 +5523,6 @@ def _mopeka_history_change_reason(snapshot, previous_snapshot):
 
 
 def _append_mopeka_history_row(snapshot, reason):
-    fieldnames = [
-        'timestamp',
-        'reason',
-        'front_gal',
-        'back_gal',
-        'front_mm',
-        'back_mm',
-        'front_in',
-        'back_in',
-        'front_quality',
-        'back_quality',
-    ]
     row = {
         'timestamp': snapshot['timestamp'],
         'reason': reason,
@@ -5317,8 +5534,13 @@ def _append_mopeka_history_row(snapshot, reason):
         'back_in': _float_or_empty(snapshot.get('back_in'), 2),
         'front_quality': _int_or_empty(snapshot.get('front_quality')),
         'back_quality': _int_or_empty(snapshot.get('back_quality')),
+        **{
+            field: snapshot.get(field, '')
+            for field in ('trailer_id', 'front_sensor_id', 'back_sensor_id')
+        },
     }
     needs_header = not os.path.exists(MOPEKA_HISTORY_LOG_PATH) or os.path.getsize(MOPEKA_HISTORY_LOG_PATH) == 0
+    fieldnames = ensure_active_history_schema(MOPEKA_HISTORY_LOG_PATH)
     with open(MOPEKA_HISTORY_LOG_PATH, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if needs_header:
@@ -5326,11 +5548,44 @@ def _append_mopeka_history_row(snapshot, reason):
         writer.writerow(row)
 
 
-def maybe_log_mopeka_history(current_time, m1, m2):
-    global last_mopeka_history_log_at, last_mopeka_history_snapshot
+def _reset_mopeka_history_baseline():
+    global last_mopeka_history_log_at
+    global last_mopeka_history_snapshot
+    global last_mopeka_history_identity
 
-    snapshot = _mopeka_history_snapshot(current_time, m1, m2)
-    reason = _mopeka_history_change_reason(snapshot, last_mopeka_history_snapshot)
+    last_mopeka_history_log_at = 0.0
+    last_mopeka_history_snapshot = None
+    last_mopeka_history_identity = None
+
+
+_HISTORY_IDENTITY_UNSET = object()
+
+
+def maybe_log_mopeka_history(
+    current_time,
+    m1,
+    m2,
+    identity=_HISTORY_IDENTITY_UNSET,
+):
+    global last_mopeka_history_log_at
+    global last_mopeka_history_snapshot
+    global last_mopeka_history_identity
+
+    if identity is _HISTORY_IDENTITY_UNSET:
+        identity = history_identity_from_config(load_config())
+    if identity is None:
+        # Never stamp readings with whichever trailer happens to be selected
+        # later. A future confirmed assignment must establish a new baseline.
+        _reset_mopeka_history_baseline()
+        return False
+
+    snapshot = _mopeka_history_snapshot(current_time, m1, m2, identity)
+    previous_snapshot = (
+        last_mopeka_history_snapshot
+        if identity == last_mopeka_history_identity
+        else None
+    )
+    reason = _mopeka_history_change_reason(snapshot, previous_snapshot)
     if not reason and current_time - last_mopeka_history_log_at >= MOPEKA_HISTORY_BASELINE_INTERVAL:
         reason = 'periodic'
     if not reason:
@@ -5340,6 +5595,7 @@ def maybe_log_mopeka_history(current_time, m1, m2):
         _append_mopeka_history_row(snapshot, reason)
         last_mopeka_history_log_at = current_time
         last_mopeka_history_snapshot = snapshot
+        last_mopeka_history_identity = identity
         return True
     except Exception as e:
         print(f'Mopeka history log error: {e}', flush=True)
@@ -5545,34 +5801,39 @@ def _load_mopeka_history_items(cmd):
     since, until = _clamped_history_window(cmd)
     items = []
     seen = set()
+    rows = []
     for path in _mopeka_history_paths():
-        for row in _read_mopeka_history_rows(path):
-            timestamp = _history_timestamp_epoch(row.get('timestamp'))
-            if timestamp is None or timestamp < since or timestamp > until:
-                continue
-            item = {
-                't': timestamp,
-                'r': row.get('reason') or '',
-                'fg': _history_float(row.get('front_gal')),
-                'bg': _history_float(row.get('back_gal')),
-                'fmm': _history_float(row.get('front_mm')),
-                'bmm': _history_float(row.get('back_mm')),
-                'fin': _history_float(row.get('front_in')),
-                'bin': _history_float(row.get('back_in')),
-                'fq': _history_int(row.get('front_quality')),
-                'bq': _history_int(row.get('back_quality')),
-            }
-            key = (
-                item['t'],
-                item['fg'],
-                item['bg'],
-                item['fmm'],
-                item['bmm'],
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(item)
+        rows.extend(_read_mopeka_history_rows(path))
+
+    current_identity = history_identity_from_config(load_config())
+    rows = filter_rows_for_current_identity(rows, current_identity)
+    for row in rows:
+        timestamp = _history_timestamp_epoch(row.get('timestamp'))
+        if timestamp is None or timestamp < since or timestamp > until:
+            continue
+        item = {
+            't': timestamp,
+            'r': row.get('reason') or '',
+            'fg': _history_float(row.get('front_gal')),
+            'bg': _history_float(row.get('back_gal')),
+            'fmm': _history_float(row.get('front_mm')),
+            'bmm': _history_float(row.get('back_mm')),
+            'fin': _history_float(row.get('front_in')),
+            'bin': _history_float(row.get('back_in')),
+            'fq': _history_int(row.get('front_quality')),
+            'bq': _history_int(row.get('back_quality')),
+        }
+        key = (
+            item['t'],
+            item['fg'],
+            item['bg'],
+            item['fmm'],
+            item['bmm'],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
     return sorted(items, key=lambda item: item['t'], reverse=_history_newest_first_requested(cmd))
 
 
@@ -5694,7 +5955,7 @@ async def scan_mopeka(sensor_device, current_time):
                     continue
 
                 decoded = decode_mopeka(data)
-                decoded['last_update'] = current_time
+                decoded['last_update'] = time.time()
 
                 if MOPEKA1_MAC_SUFFIX and MOPEKA1_MAC_SUFFIX in addr:
                     conversion = mm_to_gallons(decoded["level_mm"], MOPEKA1_MAC_SUFFIX)
@@ -5799,7 +6060,7 @@ async def find_sensor_peer_by_name(sensor_device, name, timeout):
                 )
 
 
-async def read_bms(sensor_device, current_time):
+async def read_bms(sensor_device, _current_time):
     response_buffer = bytearray()
     notification_received = asyncio.Event()
     connection = None
@@ -5876,7 +6137,7 @@ async def read_bms(sensor_device, current_time):
         sensor_data['bms'] = {
             'voltage': round(int.from_bytes(d[0:2], 'big') * 0.01, 2),
             'soc': d[19],
-            'last_update': current_time
+            'last_update': time.time(),
         }
         print(f'BMS: {sensor_data["bms"]}', flush=True)
         return True
@@ -6016,6 +6277,10 @@ async def read_sensors(sensor_device, sensor_adapter):
 
     cfg = load_config()
     mopeka_enabled = _mopeka_enabled(cfg)
+    # Trailer selection restarts this service, so this durable identity remains
+    # valid for the process lifetime. Reuse it instead of reading the config
+    # file after every sensor scan.
+    mopeka_history_identity = history_identity_from_config(cfg)
 
     print(f"Sensor reader started on {sensor_adapter}", flush=True)
     if BMS_ENABLED:
@@ -6070,17 +6335,16 @@ async def read_sensors(sensor_device, sensor_adapter):
                     mopeka_failures = 0
                     m1 = sensor_data["mopeka1"]
                     m2 = sensor_data["mopeka2"]
-                    m1_gal = m1.get("gallons", 0)
-                    m2_gal = m2.get("gallons", 0)
-                    m1_q = m1.get("quality", 0)
-                    m2_q = m2.get("quality", 0)
-                    m1_mm = m1.get("level_mm", 0)
-                    m2_mm = m2.get("level_mm", 0)
-                    m1_in = m1.get("level_in", 0)
-                    m2_in = m2.get("level_in", 0)
-                    maybe_log_mopeka_history(current_time, m1, m2)
-                    submit_dashboard_io(send_dashboard_command, f"MOPEKA:{m1_gal:.0f}|{m2_gal:.0f}|{m1_q}|{m2_q}")
-                    submit_dashboard_io(send_dashboard_command, f"MOPEKA_RAW:{m1_mm:.1f}|{m2_mm:.1f}|{m1_in:.2f}|{m2_in:.2f}")
+                    maybe_log_mopeka_history(
+                        current_time,
+                        m1,
+                        m2,
+                        identity=mopeka_history_identity,
+                    )
+                    for command in _mopeka_dashboard_commands(
+                        identity=mopeka_history_identity,
+                    ):
+                        submit_dashboard_io(send_dashboard_command, command)
                 else:
                     mopeka_failures += 1
                     if mopeka_failures > 1:
@@ -6121,8 +6385,11 @@ async def read_sensors(sensor_device, sensor_adapter):
                         timeout=BMS_READ_OPERATION_TIMEOUT,
                     ):
                         bms_failures = 0
-                        bms = sensor_data["bms"]
-                        submit_dashboard_io(send_dashboard_command, f"BMS:{bms.get('soc', 0)}|{bms.get('voltage', 0):.2f}")
+                        command = _bms_dashboard_command(
+                            identity=mopeka_history_identity,
+                        )
+                        if command:
+                            submit_dashboard_io(send_dashboard_command, command)
                 except asyncio.CancelledError:
                     if _sensor_cancellation_is_external():
                         raise

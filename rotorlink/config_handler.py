@@ -18,11 +18,13 @@ JSON shape the app's parseConfigData / parseConfigResponseData already decodes.
 The op + request_id are echoed so the app can correlate.
 
 Safety:
-  * bumble is the source of truth; we never modify it. We replicate its logic.
+  * bumble is the source of truth; we replicate its file formats and restart it
+    around a confirmed trailer-identity change so it cannot keep scanning the
+    previous trailer under the new identity.
   * WRITE ops (ADD/UPDATE/DELETE sensor + calibration, SET_BMS_MAC, SELECT_TRAILER,
     WIFI_SET) modify shared Pi config files. File reads/writes match bumble's
-    exact format. We do NOT trigger bumble's BLE-identity restart (that is a
-    BLE-server concern); persisting the file is what keeps the two consistent.
+    exact format. SELECT_TRAILER resets cached sensors and restarts bumble only
+    when the stable trailer/sensor identity actually changes.
   * Unknown ops return the same `{"ok": false, "error": "Unknown op: ..."}` bumble
     returns; one bad command never raises out of `handle`.
 """
@@ -40,6 +42,11 @@ from pathlib import Path
 from . import config
 from src import connection_registry
 from src.fill_history import item_from_line as _shared_fill_item_from_line
+from src.mopeka_history import (
+    filter_rows_for_current_identity,
+    history_identity_from_config,
+    history_identity_token,
+)
 
 logger = logging.getLogger("rotorlink.config")
 
@@ -72,11 +79,19 @@ _PLACEHOLDER_ID = "---------------"
 # ===========================================================================
 # File access helpers — byte-for-byte compatible with bumble's reader/writer
 # ===========================================================================
+def _load_config_strict():
+    """Read a complete config or raise; cache ownership must never guess."""
+    with open(config.MOPEKA_CONFIG_PATH, "r") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError("mopeka config root must be an object")
+    return cfg
+
+
 def _load_config():
     """Load mopeka_config.json (bumble: load_config)."""
     try:
-        with open(config.MOPEKA_CONFIG_PATH, "r") as f:
-            return json.load(f)
+        return _load_config_strict()
     except (FileNotFoundError, json.JSONDecodeError):
         return {"box_mode": "fleet", "assigned_trailer": None, "trailer": None}
 
@@ -251,9 +266,10 @@ def _compute_bms_name(cfg=None):
     return _DEFAULT_BMS_NAME
 
 
-def _current_trailer_info():
+def _current_trailer_info(cfg=None):
     """bumble: _current_trailer_info — the TRAILER characteristic payload."""
-    cfg = _load_config()
+    if cfg is None:
+        cfg = _load_config()
     mode = _normalize_box_mode(cfg.get("box_mode"))
     trailer_num = _get_assigned_trailer(cfg)
     if mode != "fleet":
@@ -291,6 +307,20 @@ def _current_trailer_info():
     }
 
 
+def _current_trailer_snapshot():
+    """Return public trailer metadata and its durable sensor-cache identity.
+
+    The public payload intentionally hides manual customer sensor IDs, while
+    cache ownership must still use those confirmed IDs.  Read the config once
+    so both views describe the same durable generation.
+    """
+    cfg = _load_config_strict()
+    return (
+        _current_trailer_info(cfg),
+        history_identity_token(history_identity_from_config(cfg)),
+    )
+
+
 def _is_clear_trailer_value(value):
     """bumble: _is_clear_trailer_value — SELECT_TRAILER with 0/none/empty means
     'clear the assignment', not 'look up trailer 0'. The WiFi handler lacked
@@ -302,42 +332,10 @@ def _is_clear_trailer_value(value):
     return text in ('', '0', 'none', 'null', 'unconfigured', 'unassigned', 'clear')
 
 
-def _schedule_bumble_identity_refresh(reason):
-    """Restart the rotorsync (bumble BLE) service so a WiFi-side trailer
-    assign/clear takes effect on the box's BLE identity.
-
-    bumble has NO watcher on mopeka_config.json (only the calibration files),
-    so a WiFi-side SELECT_TRAILER used to persist the change and then nothing
-    happened until the next reboot — the box kept advertising (and scanning
-    sensors for) the OLD trailer. Field report 2026-07-07: box cleared over
-    WiFi kept its TR11 BLE identity. Mirrors bumble's own
-    _schedule_identity_restart, delayed so the config response reaches the
-    app before the BLE side bounces. rotorlink runs as root; restarting
-    rotorsync does not touch this process.
-    """
-    async def _restart():
-        await asyncio.sleep(1.5)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "systemctl", "restart", "rotorsync",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            logger.info("rotorsync identity refresh requested: %s", reason)
-        except Exception as e:
-            logger.warning("rotorsync identity refresh failed (%s): %s", reason, e)
-
-    try:
-        asyncio.get_running_loop().create_task(_restart())
-    except RuntimeError:
-        logger.warning("no running loop; rotorsync identity refresh skipped: %s", reason)
-
-
 def _clear_trailer_assignment():
     """bumble: clear_trailer_assignment — persist the cleared assignment to
-    mopeka_config.json (same file write; bumble re-reads it and refreshes its
-    BLE identity on its own cadence, exactly like _apply_trailer)."""
+    mopeka_config.json. The caller owns the same stop/reset/start transaction
+    used by _apply_trailer whenever this changes the confirmed identity."""
     cfg = _load_config()
     cfg.update(
         {
@@ -357,9 +355,7 @@ def _apply_trailer(trailer_num):
     """bumble: apply_trailer — persist trailer selection to mopeka_config.json.
 
     Replicates the FILE write bumble does (assigned_trailer/trailer/front_id/
-    back_id/display_name). We do NOT touch bumble's scanner globals or trigger a
-    BLE-identity restart — bumble re-reads the file and self-restarts on its own
-    cadence; what matters for consistency is the persisted file.
+    back_id/display_name). The caller owns the stop/reset/start transaction.
     """
     sensors = _load_sensor_csv()
     trailer_sensors = [s for s in sensors if str(s.get("Trailer")) == str(trailer_num)]
@@ -403,6 +399,125 @@ def _apply_trailer(trailer_num):
         "front": {"id": front_id, "offset": front_offset},
         "back": {"id": back_id, "offset": back_offset},
     }
+
+
+def _trailer_sensor_identity(cfg):
+    trailer = _get_assigned_trailer(cfg)
+    trailer_key = None if trailer is None else str(trailer).strip()
+    front_id = str(cfg.get("front_id") or "").strip().upper()
+    back_id = str(cfg.get("back_id") or "").strip().upper()
+    return trailer_key, front_id, back_id
+
+
+def _candidate_trailer_sensor_identity(trailer_num):
+    sensors = _load_sensor_csv()
+    trailer_sensors = [s for s in sensors if str(s.get("Trailer")) == str(trailer_num)]
+    if not trailer_sensors:
+        return None
+    front = next((s for s in trailer_sensors if s.get("Tank") == "Front"), None)
+    back = next((s for s in trailer_sensors if s.get("Tank") == "Back"), None)
+    front_id = front["Mopeka ID"] if front else _PLACEHOLDER_ID
+    back_id = back["Mopeka ID"] if back else _PLACEHOLDER_ID
+    return (
+        str(trailer_num).strip(),
+        str(front_id or "").strip().upper(),
+        str(back_id or "").strip().upper(),
+    )
+
+
+_SENSOR_SERVICE_START_ORDER = (
+    "rotorsync.service",
+    "rotorsync_watchdog.service",
+)
+_SENSOR_SERVICE_STOP_ORDER = tuple(reversed(_SENSOR_SERVICE_START_ORDER))
+_SENSOR_SERVICE_TRANSACTION_MARKER = Path(
+    "/run/rotorsync/trailer-selection-in-progress"
+)
+
+
+def _mark_sensor_service_transaction():
+    """Atomically record intent before explicitly stopping sensor services."""
+    marker = _SENSOR_SERVICE_TRANSACTION_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w") as destination:
+            destination.write(f"pid={os.getpid()} started={time.time():.6f}\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, marker)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _clear_sensor_service_transaction():
+    try:
+        _SENSOR_SERVICE_TRANSACTION_MARKER.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def sensor_service_transaction_pending():
+    return _SENSOR_SERVICE_TRANSACTION_MARKER.exists()
+
+
+def _set_sensor_service_state(action, service):
+    """Change one sensor-service state, raising with actionable detail."""
+    result = subprocess.run(
+        ["systemctl", action, service],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown systemctl error").strip()
+        raise RuntimeError(f"Could not {action} {service}: {detail}")
+
+
+def _stop_sensor_services():
+    """Stop the watchdog before its required scanner service."""
+    for service in _SENSOR_SERVICE_STOP_ORDER:
+        _set_sensor_service_state("stop", service)
+
+
+def _start_sensor_services():
+    """Start the scanner before the watchdog that requires it."""
+    for service in _SENSOR_SERVICE_START_ORDER:
+        _set_sensor_service_state("start", service)
+
+
+def _recover_sensor_services():
+    """Force both services through a clean lifecycle after any partial failure.
+
+    Each command is attempted even if another command fails. This matters when
+    the original start reached rotorsync.service but failed on the watchdog:
+    merely starting an already-active scanner after restoring the old config
+    would leave it scanning the new trailer identity in memory.
+    """
+    errors = []
+    for action, services in (
+        ("stop", _SENSOR_SERVICE_STOP_ORDER),
+        ("start", _SENSOR_SERVICE_START_ORDER),
+    ):
+        for service in services:
+            try:
+                _set_sensor_service_state(action, service)
+            except Exception as exc:
+                errors.append(str(exc))
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+def recover_interrupted_sensor_service_transaction():
+    """Restore both services after a RotorLink crash during trailer selection."""
+    if not sensor_service_transaction_pending():
+        return False
+    _recover_sensor_services()
+    _clear_sensor_service_transaction()
+    return True
 
 
 # ===========================================================================
@@ -592,28 +707,32 @@ def _load_mopeka_history_items(cmd):
     since, until = _clamped_history_window(cmd)
     items = []
     seen = set()
+    rows = []
     for path in _mopeka_history_paths():
-        for row in _read_mopeka_history_rows(path):
-            timestamp = _history_timestamp_epoch(row.get("timestamp"))
-            if timestamp is None or timestamp < since or timestamp > until:
-                continue
-            item = {
-                "t": timestamp,
-                "r": row.get("reason") or "",
-                "fg": _history_float(row.get("front_gal")),
-                "bg": _history_float(row.get("back_gal")),
-                "fmm": _history_float(row.get("front_mm")),
-                "bmm": _history_float(row.get("back_mm")),
-                "fin": _history_float(row.get("front_in")),
-                "bin": _history_float(row.get("back_in")),
-                "fq": _history_int(row.get("front_quality")),
-                "bq": _history_int(row.get("back_quality")),
-            }
-            key = (item["t"], item["fg"], item["bg"], item["fmm"], item["bmm"])
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(item)
+        rows.extend(_read_mopeka_history_rows(path))
+
+    current_identity = history_identity_from_config(_load_config())
+    for row in filter_rows_for_current_identity(rows, current_identity):
+        timestamp = _history_timestamp_epoch(row.get("timestamp"))
+        if timestamp is None or timestamp < since or timestamp > until:
+            continue
+        item = {
+            "t": timestamp,
+            "r": row.get("reason") or "",
+            "fg": _history_float(row.get("front_gal")),
+            "bg": _history_float(row.get("back_gal")),
+            "fmm": _history_float(row.get("front_mm")),
+            "bmm": _history_float(row.get("back_mm")),
+            "fin": _history_float(row.get("front_in")),
+            "bin": _history_float(row.get("back_in")),
+            "fq": _history_int(row.get("front_quality")),
+            "bq": _history_int(row.get("back_quality")),
+        }
+        key = (item["t"], item["fg"], item["bg"], item["fmm"], item["bmm"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
     return sorted(
         items, key=lambda item: item["t"], reverse=_history_newest_first_requested(cmd)
     )
@@ -647,6 +766,14 @@ class ConfigHandler:
 
     def __init__(self, dashboard):
         self.dashboard = dashboard
+        # One RotorLink server serves multiple WebSocket clients through this
+        # handler. Trailer selection contains await points around a stop/reset/
+        # save/start transaction, so serialize the whole operation to prevent
+        # one device's rollback from overwriting another device's success.
+        # Created lazily inside handle(): Python 3.9 binds asyncio primitives
+        # to the current loop, while RotorLink constructs this handler before
+        # its event loop starts.
+        self._trailer_selection_lock = None
         # Cached page sets keyed by the originating request_id, so a PAGE op can
         # re-serve a page from a prior list request (mirrors bumble's
         # config_response_pages_by_request). Bounded to avoid unbounded growth.
@@ -660,6 +787,40 @@ class ConfigHandler:
         # bumble, every non-PAGE command clears it and every paginated list
         # command sets it.
         self._last_pages = []
+
+    def _selection_lock(self):
+        if self._trailer_selection_lock is None:
+            self._trailer_selection_lock = asyncio.Lock()
+        return self._trailer_selection_lock
+
+    async def recover_interrupted_trailer_selection(self):
+        """Finish crash recovery once the dashboard is reachable again."""
+        async with self._selection_lock():
+            if not sensor_service_transaction_pending():
+                return False
+            if self.dashboard is None:
+                raise RuntimeError("Dashboard unavailable for trailer recovery")
+
+            # The marker means a prior process may have stopped only part of
+            # the service pair. Force both back to the durable current config,
+            # then reset/confirm dashboard cache ownership before clearing it.
+            await asyncio.to_thread(_recover_sensor_services)
+            reset_response = await self.dashboard.send_command(
+                "RESET_TRAILER_SENSOR_TELEMETRY"
+            )
+            if reset_response != "OK":
+                raise RuntimeError(
+                    "Dashboard did not acknowledge interrupted trailer reset"
+                )
+            changed_response = await self.dashboard.send_command(
+                "TRAILER_SENSOR_IDENTITY_CHANGED"
+            )
+            if changed_response != "OK":
+                raise RuntimeError(
+                    "Dashboard did not acknowledge interrupted trailer identity"
+                )
+            await asyncio.to_thread(_clear_sensor_service_transaction)
+            return True
 
     def _store_pages(self, request_id, pages):
         if request_id:
@@ -717,7 +878,8 @@ class ConfigHandler:
         if op == "GET_TRAILER":
             return self._get_trailer(request_id)
         if op == "SELECT_TRAILER":
-            return self._select_trailer(cmd, request_id)
+            async with self._selection_lock():
+                return await self._select_trailer(cmd, request_id)
         if op == "LIST_TRAILERS":
             return self._list_trailers(cmd, request_id)
         if op == "LIST_SENSORS":
@@ -761,6 +923,21 @@ class ConfigHandler:
         return payload
 
     def _select_trailer(self, cmd, request_id):
+        """Preserve the original synchronous helper contract outside a loop.
+
+        RotorLink dispatch runs inside an event loop and awaits the returned
+        coroutine. A few maintenance/test callers historically invoked this
+        private helper directly, so keep those calls synchronous while routing
+        both paths through the same identity-safe implementation.
+        """
+        operation = self._select_trailer_async(cmd, request_id)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(operation)
+        return operation
+
+    async def _select_trailer_async(self, cmd, request_id):
         if not _box_mode_uses_trailer_list():
             return {
                 "ok": False,
@@ -769,33 +946,133 @@ class ConfigHandler:
                 "error": "Trailer selection disabled in customer mode",
             }
         trailer_value = cmd.get("trailer")
-        if _is_clear_trailer_value(trailer_value):
-            result = _clear_trailer_assignment()
-            _schedule_bumble_identity_refresh("trailer cleared over WiFi")
-            return {
-                "ok": True,
-                "op": "SELECT_TRAILER",
-                "request_id": request_id,
-                "current": result,
-            }
-        try:
-            trailer_num = int(trailer_value)
-        except Exception:
-            return {
-                "ok": False,
-                "op": "SELECT_TRAILER",
-                "request_id": request_id,
-                "error": "Invalid trailer",
-            }
-        result = _apply_trailer(trailer_num)
-        if result is None:
-            return {
-                "ok": False,
-                "op": "SELECT_TRAILER",
-                "request_id": request_id,
-                "error": f"Trailer {trailer_num} not found",
-            }
-        _schedule_bumble_identity_refresh(f"trailer changed to {trailer_num} over WiFi")
+        clearing_assignment = _is_clear_trailer_value(trailer_value)
+        if clearing_assignment:
+            trailer_num = None
+            candidate_identity = (None, "", "")
+
+            def apply_selection():
+                return _clear_trailer_assignment()
+
+        else:
+            try:
+                trailer_num = int(trailer_value)
+            except Exception:
+                return {
+                    "ok": False,
+                    "op": "SELECT_TRAILER",
+                    "request_id": request_id,
+                    "error": "Invalid trailer",
+                }
+            candidate_identity = _candidate_trailer_sensor_identity(trailer_num)
+            if candidate_identity is None:
+                return {
+                    "ok": False,
+                    "op": "SELECT_TRAILER",
+                    "request_id": request_id,
+                    "error": f"Trailer {trailer_num} not found",
+                }
+
+            def apply_selection():
+                return _apply_trailer(trailer_num)
+
+        previous_cfg = _load_config()
+        identity_changed = _trailer_sensor_identity(previous_cfg) != candidate_identity
+        if identity_changed:
+            if self.dashboard is None:
+                return {
+                    "ok": False,
+                    "op": "SELECT_TRAILER",
+                    "request_id": request_id,
+                    "error": "Dashboard unavailable for trailer sensor reset",
+                }
+
+            services_need_recovery = False
+            transaction_marked = False
+            config_may_have_changed = False
+            try:
+                # Stop the old scanner before changing the shared identity. A
+                # simple restart-after-write leaves a race where it can publish
+                # one more old-trailer observation under the new config. Stop
+                # its dependent watchdog first so both can be restored.
+                await asyncio.to_thread(_mark_sensor_service_transaction)
+                transaction_marked = True
+                services_need_recovery = True
+                await asyncio.to_thread(_stop_sensor_services)
+                reset_response = await self.dashboard.send_command(
+                    "RESET_TRAILER_SENSOR_TELEMETRY"
+                )
+                if reset_response != "OK":
+                    raise RuntimeError(
+                        "Dashboard did not acknowledge trailer sensor reset"
+                    )
+                config_may_have_changed = True
+                result = apply_selection()
+                if result is None and not clearing_assignment:
+                    raise RuntimeError(f"Trailer {trailer_num} not found")
+                changed_response = await self.dashboard.send_command(
+                    "TRAILER_SENSOR_IDENTITY_CHANGED"
+                )
+                if changed_response != "OK":
+                    raise RuntimeError(
+                        "Dashboard did not acknowledge trailer identity change"
+                    )
+                await asyncio.to_thread(_start_sensor_services)
+                await asyncio.to_thread(_clear_sensor_service_transaction)
+                transaction_marked = False
+                services_need_recovery = False
+            except Exception as exc:
+                if config_may_have_changed:
+                    try:
+                        _save_config(previous_cfg)
+                    except Exception as rollback_exc:
+                        logger.error("trailer config rollback failed: %s", rollback_exc)
+                recovery_error = None
+                if services_need_recovery:
+                    try:
+                        await asyncio.to_thread(_recover_sensor_services)
+                    except Exception as recovery_exc:
+                        recovery_error = recovery_exc
+                if recovery_error is None and config_may_have_changed:
+                    try:
+                        reset_response = await self.dashboard.send_command(
+                            "RESET_TRAILER_SENSOR_TELEMETRY"
+                        )
+                        changed_response = await self.dashboard.send_command(
+                            "TRAILER_SENSOR_IDENTITY_CHANGED"
+                        )
+                        if reset_response != "OK" or changed_response != "OK":
+                            raise RuntimeError(
+                                "Dashboard did not reconcile rolled-back trailer identity"
+                            )
+                    except Exception as reconcile_exc:
+                        recovery_error = reconcile_exc
+                if transaction_marked and recovery_error is None:
+                    try:
+                        await asyncio.to_thread(_clear_sensor_service_transaction)
+                        transaction_marked = False
+                    except Exception as marker_exc:
+                        recovery_error = marker_exc
+                detail = str(exc)
+                if recovery_error is not None:
+                    detail = (
+                        f"{detail}; trailer recovery failed: {recovery_error}"
+                    )
+                return {
+                    "ok": False,
+                    "op": "SELECT_TRAILER",
+                    "request_id": request_id,
+                    "error": detail,
+                }
+        else:
+            result = apply_selection()
+            if result is None and not clearing_assignment:
+                return {
+                    "ok": False,
+                    "op": "SELECT_TRAILER",
+                    "request_id": request_id,
+                    "error": f"Trailer {trailer_num} not found",
+                }
         return {
             "ok": True,
             "op": "SELECT_TRAILER",

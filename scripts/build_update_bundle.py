@@ -14,7 +14,7 @@ import tarfile
 import time
 
 
-REQUIRED_PATHS = ("dashboard.py", "rotorsync_bumble.py", "src")
+REQUIRED_PATHS = ("dashboard.py", "rotorsync_bumble.py", "src", "rotorlink")
 RUNTIME_PATHS = (
     "dashboard.py",
     "rotorsync_bumble.py",
@@ -25,6 +25,7 @@ RUNTIME_PATHS = (
     "install.sh",
     "requirements.txt",
     "src",
+    "rotorlink",
     "deploy",
 )
 

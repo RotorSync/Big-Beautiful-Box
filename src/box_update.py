@@ -16,11 +16,12 @@ this module does NOT verify signatures, it only reassembles + applies):
   update_status   {update_id}                       -> report staged state
 
 Safety mirrors the BLE path: tar members are path-checked (no abs/.. /links),
-the archive must look like a BBB repo snapshot (dashboard.py + rotorsync_bumble.py
-+ src), the new code is compile-gated before it replaces the running code, the
-current runtime is backed up first, and any apply failure ROLLS BACK to the
-backup so a bad package can never brick the box. Services restart out-of-band
-(systemd-run) so the process applying the update can restart itself.
+the archive must look like a BBB repo snapshot (dashboard.py +
+rotorsync_bumble.py + src + rotorlink), the new code is compile-gated before it
+replaces the running code, the current runtime is backed up first, and any
+apply failure ROLLS BACK to the backup so a bad package can never brick the
+box. Services restart out-of-band (systemd-run) so the process applying the
+update can restart itself.
 """
 import base64
 import contextlib
@@ -45,9 +46,10 @@ DEFAULT_RUNTIME_PATHS = (
     "requirements.txt",
     "install.sh",
     "src",
+    "rotorlink",
     "deploy",
 )
-# The WiFi path restarts rotorlink too (the BLE path doesn't touch it).
+# The WiFi path applies and restarts RotorLink along with the other runtimes.
 DEFAULT_RESTART_SERVICES = (
     "iol_dashboard.service",
     "rotorsync_watchdog.service",
@@ -84,7 +86,12 @@ def _tar_contains_bbb_snapshot(members) -> bool:
         has_src = any(
             m.name == f"{prefix}src" or m.name.startswith(f"{prefix}src/") for m in members
         )
-        if has_dashboard and has_bumble and has_src:
+        has_rotorlink = any(
+            m.name == f"{prefix}rotorlink"
+            or m.name.startswith(f"{prefix}rotorlink/")
+            for m in members
+        )
+        if has_dashboard and has_bumble and has_src and has_rotorlink:
             return True
     return False
 
@@ -354,8 +361,14 @@ class BoxUpdateReceiver:
         repo = Path(self.repo_dir)
         for name in self.runtime_paths:
             src = Path(backup_dir) / name
+            dst = repo / name
             if src.exists():
-                _copy_path(src, repo / name)
+                _copy_path(src, dst)
+                continue
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            elif dst.exists():
+                dst.unlink()
 
     def _refresh_opt_runtime(self, repo_root: Path) -> None:
         # Mirror the /opt runtime the root services import (bumble + src) so a
@@ -407,7 +420,7 @@ class BoxUpdateReceiver:
             archive.extractall(extract_dir, members=runtime_members)
 
         update_root = _find_extracted_update_root(extract_dir)
-        for required in ("dashboard.py", "rotorsync_bumble.py", "src"):
+        for required in ("dashboard.py", "rotorsync_bumble.py", "src", "rotorlink"):
             if not (update_root / required).exists():
                 raise ValueError(f"update is missing {required}")
 
@@ -419,7 +432,14 @@ class BoxUpdateReceiver:
             check=True, capture_output=True, text=True, timeout=30,
         )
         subprocess.run(
-            ["python3", "-m", "compileall", "-q", str(update_root / "src")],
+            [
+                "python3",
+                "-m",
+                "compileall",
+                "-q",
+                str(update_root / "src"),
+                str(update_root / "rotorlink"),
+            ],
             check=True, capture_output=True, text=True, timeout=60,
         )
 

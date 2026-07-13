@@ -22,7 +22,11 @@ from typing import Dict, Optional, Set
 import websockets
 
 from . import command_translator, config, protocol, state_encoder
-from .config_handler import ConfigHandler, _current_trailer_info
+from .config_handler import (
+    ConfigHandler,
+    _current_trailer_snapshot,
+    sensor_service_transaction_pending,
+)
 from .dashboard_client import DashboardClient
 from .maintenance_handler import (
     MaintenanceHandler,
@@ -126,6 +130,30 @@ class RotorLinkServer:
         self._last_history: Optional[str] = None
         self._last_bms: Optional[dict] = None
         self._last_mopeka: Dict[int, Optional[dict]] = {1: None, 2: None}
+        # Stable identity owning the cached sensor payloads. A config switch
+        # clears these values before a new client or broadcast can receive them.
+        self._sensor_cache_identity: Optional[str] = None
+        # Distinguish a successfully read, explicitly unassigned config from a
+        # startup read that has not succeeded yet. This avoids rereading the
+        # config on every sensor-state tick for boxes with no assignment.
+        self._sensor_cache_identity_resolved = False
+        # True only after the dashboard generation confirms that its cache was
+        # reset for the current identity. A direct config-file edit therefore
+        # fails closed instead of relabeling an old dashboard reading.
+        self._sensor_cache_identity_confirmed = False
+        self._last_sensor_identity_generation: Optional[int] = None
+        self._last_dashboard_sensor_identity: Optional[str] = None
+        self._dashboard_sensor_identity_seen = False
+        # A pre-V2.46 dashboard has no generation field. Confirm its startup
+        # identity once for rolling-update compatibility, but never use that
+        # fallback to bless a later direct config-file change.
+        self._legacy_sensor_identity_initialized = False
+        # One startup check only. If a prior RotorLink process died during the
+        # explicit service stop window, retry recovery on the existing state
+        # cadence once the dashboard is reachable—no new polling loop.
+        self._sensor_transaction_recovery_pending = (
+            sensor_service_transaction_pending()
+        )
         # Last broadcast trailer-config JSON, so we only re-emit `trailer_config`
         # when the trailer assignment / sensor offsets actually change.
         self._last_trailer_config_json: Optional[str] = None
@@ -208,17 +236,26 @@ class RotorLinkServer:
             # until the next change.
             if self._last_state is not None:
                 await self._send(state, protocol.build_state(self._last_state))
-            if self._last_bms is not None:
-                await self._send(state, protocol.build_bms(self._last_bms))
-            for index in (1, 2):
-                if self._last_mopeka[index] is not None:
-                    await self._send(state, protocol.build_mopeka(index, self._last_mopeka[index]))
-            # Current trailer config (read from the same Pi files bumble uses) so
-            # a fresh client's config UI is populated immediately, not blank
-            # until the next change.
-            trailer = self._read_trailer_config()
-            if trailer is not None:
+            # Resolve identity before cached sensor payloads, and put the config
+            # on the wire first so a fresh client can never guess their owner.
+            trailer_snapshot = self._read_trailer_snapshot()
+            if trailer_snapshot is not None:
+                trailer, durable_identity = trailer_snapshot
+                self._synchronize_sensor_cache_identity(durable_identity)
                 await self._send(state, protocol.build_trailer_config(trailer))
+            if (
+                trailer_snapshot is not None
+                and self._sensor_cache_identity_confirmed
+                and self._last_bms is not None
+            ):
+                await self._send(state, protocol.build_bms(self._last_bms))
+            if trailer_snapshot is not None and self._sensor_cache_identity_confirmed:
+                for index in (1, 2):
+                    if self._last_mopeka[index] is not None:
+                        await self._send(
+                            state,
+                            protocol.build_mopeka(index, self._last_mopeka[index]),
+                        )
             async for raw in websocket:
                 await self._on_message(state, raw)
         except websockets.ConnectionClosed:
@@ -469,7 +506,18 @@ class RotorLinkServer:
         # Pass the message straight through (minus the envelope `type`). Unknown
         # fields are harmless; the handler keys off the ones it knows.
         cmd = {k: v for k, v in message.items() if k != "type"}
+        if op == "SELECT_TRAILER":
+            trailer_before = self._read_trailer_snapshot()
+            if trailer_before is not None:
+                self._synchronize_sensor_cache_identity(trailer_before[1])
         response = await self.config_handler.handle(cmd)
+        if op == "SELECT_TRAILER" and response.get("ok") is True:
+            # No await occurs between the config transaction returning and this
+            # clear, so another connection cannot observe the new identity with
+            # the prior identity's cached sensor values.
+            trailer_after = self._read_trailer_snapshot()
+            if trailer_after is not None:
+                self._synchronize_sensor_cache_identity(trailer_after[1])
         await self._send(state, protocol.build_config_response(op, request_id, response))
         # A write op may have changed the trailer assignment / offsets — re-emit
         # trailer_config to every client if so (cheap; only broadcasts on change).
@@ -508,20 +556,79 @@ class RotorLinkServer:
         else:
             await state.maintenance.handle_input(frame)
 
-    def _read_trailer_config(self) -> Optional[dict]:
-        """Current trailer config (bumble: _current_trailer_info) read from the
-        shared Pi files. Returns None only if reading raises."""
+    def _read_trailer_snapshot(self):
+        """Read public trailer metadata and durable cache ownership together.
+
+        ``None`` means the read itself failed.  A successful unassigned config
+        is represented by ``(trailer_payload, None)`` so it can explicitly
+        revoke the prior identity instead of looking like a transient I/O
+        failure.
+        """
         try:
-            return _current_trailer_info()
+            return _current_trailer_snapshot()
         except Exception as e:
             logger.warning("trailer config read failed: %s", e)
             return None
 
-    async def _broadcast_trailer_config(self) -> None:
+    def _synchronize_sensor_cache_identity(
+        self,
+        identity: Optional[str],
+        *,
+        confirmed: bool = False,
+        validation_performed: bool = False,
+    ) -> bool:
+        self._sensor_cache_identity_resolved = True
+        if identity is None:
+            changed = (
+                self._sensor_cache_identity is not None
+                or self._sensor_cache_identity_confirmed
+                or self._last_bms is not None
+                or any(value is not None for value in self._last_mopeka.values())
+            )
+            self._sensor_cache_identity = None
+            self._sensor_cache_identity_confirmed = False
+            self._last_bms = None
+            self._last_mopeka = {1: None, 2: None}
+            return changed
+        if self._sensor_cache_identity is None:
+            self._sensor_cache_identity = identity
+            self._sensor_cache_identity_confirmed = bool(confirmed)
+            return False
+        if identity == self._sensor_cache_identity:
+            if validation_performed or confirmed:
+                if not confirmed and self._sensor_cache_identity_confirmed:
+                    self._last_bms = None
+                    self._last_mopeka = {1: None, 2: None}
+                self._sensor_cache_identity_confirmed = bool(confirmed)
+            return False
+        self._sensor_cache_identity = identity
+        self._sensor_cache_identity_confirmed = bool(confirmed)
+        self._last_bms = None
+        self._last_mopeka = {1: None, 2: None}
+        return True
+
+    async def _broadcast_trailer_config(
+        self,
+        *,
+        identity_confirmed: bool = False,
+        expected_sensor_identity: Optional[str] = None,
+        trailer_snapshot=None,
+    ) -> None:
         """Broadcast trailer_config when the current trailer config changes."""
-        trailer = self._read_trailer_config()
-        if trailer is None:
+        if trailer_snapshot is None:
+            trailer_snapshot = self._read_trailer_snapshot()
+        if trailer_snapshot is None:
             return
+        trailer, durable_identity = trailer_snapshot
+        self._synchronize_sensor_cache_identity(
+            durable_identity,
+            confirmed=(
+                identity_confirmed
+                and durable_identity is not None
+                and expected_sensor_identity == durable_identity
+            ),
+            validation_performed=identity_confirmed,
+        )
         trailer_json = json.dumps(trailer, sort_keys=True, separators=(",", ":"))
         if trailer_json != self._last_trailer_config_json:
             self._last_trailer_config_json = trailer_json
@@ -541,23 +648,83 @@ class RotorLinkServer:
         return self._controller is state
 
     # --- state broadcasting ------------------------------------------------
+    async def _publish_dashboard_state(self, state: dict) -> None:
+        """Publish independently deduplicated state, identity, and sensors.
+
+        Source-observation timestamps intentionally advance whenever a sensor is
+        decoded.  They are not part of the compact state payload, so comparing
+        the full dashboard snapshot would send a redundant state frame beside
+        every required sensor frame.  Compare the encoded payload instead while
+        still processing identity and sensor changes on every dashboard poll.
+        """
+        compact = state_encoder.encode_ble_state(state, len(self.clients))
+        compact_json = json.dumps(compact, sort_keys=True, separators=(",", ":"))
+        if compact_json != self._last_state_json:
+            self._last_state_json = compact_json
+            self._last_state = compact
+            await self._broadcast(protocol.build_state(compact))
+
+        if "trailer_sensor_identity" in state:
+            reported_identity = state.get("trailer_sensor_identity")
+            identity_changed = (
+                not self._dashboard_sensor_identity_seen
+                or reported_identity != self._last_dashboard_sensor_identity
+            )
+            self._dashboard_sensor_identity_seen = True
+            self._last_dashboard_sensor_identity = reported_identity
+
+            generation = state.get("trailer_sensor_identity_generation")
+            generation_changed = generation != self._last_sensor_identity_generation
+            if generation_changed:
+                self._last_sensor_identity_generation = generation
+            confirmation_retry = (
+                reported_identity is not None
+                and not self._sensor_cache_identity_confirmed
+            )
+            if identity_changed or generation_changed or confirmation_retry:
+                # This field advances only after the new trailer identity is
+                # durable. Reuse the existing state loop to publish config
+                # immediately; no extra polling.
+                await self._broadcast_trailer_config(
+                    identity_confirmed=True,
+                    expected_sensor_identity=reported_identity,
+                )
+        elif not self._legacy_sensor_identity_initialized:
+            # Rolling-update compatibility for an old dashboard: its startup
+            # snapshot predates the explicit generation barrier but belongs to
+            # the config with which it started. This one-shot fallback cannot
+            # confirm a later external identity edit.
+            trailer_snapshot = self._read_trailer_snapshot()
+            if trailer_snapshot is None:
+                return
+            expected_identity = trailer_snapshot[1]
+            await self._broadcast_trailer_config(
+                identity_confirmed=True,
+                expected_sensor_identity=expected_identity,
+                trailer_snapshot=trailer_snapshot,
+            )
+            self._legacy_sensor_identity_initialized = True
+
+        # Battery + tank sensors ride the same dashboard snapshot and have
+        # their own per-payload change detection.
+        await self._broadcast_sensors(state)
+
     async def _state_loop(self) -> None:
         cycles = 0
         while True:
             try:
                 state = await self.dashboard.query_state()
+                if state is not None and self._sensor_transaction_recovery_pending:
+                    recovered = (
+                        await self.config_handler.recover_interrupted_trailer_selection()
+                    )
+                    if recovered:
+                        self._sensor_transaction_recovery_pending = False
+                        # Recovery resets the dashboard cache and identity;
+                        # never publish the pre-recovery snapshot.
+                        state = await self.dashboard.query_state()
                 if state is not None:
-                    state_json = json.dumps(state, sort_keys=True, separators=(",", ":"))
-                    if state_json != self._last_state_json:
-                        self._last_state_json = state_json
-                        # Emit the compact BLE-format payload so the app decodes
-                        # WiFi state with its existing RaspberryPiLiveState model.
-                        compact = state_encoder.encode_ble_state(state, len(self.clients))
-                        self._last_state = compact
-                        await self._broadcast(protocol.build_state(compact))
-                        # Battery + tank sensors ride the same dashboard snapshot;
-                        # broadcast each in its BLE-characteristic shape on change.
-                        await self._broadcast_sensors(state)
+                    await self._publish_dashboard_state(state)
 
                 cycles += 1
                 if cycles >= HISTORY_POLL_CYCLES:
@@ -579,6 +746,15 @@ class RotorLinkServer:
     async def _broadcast_sensors(self, state: dict) -> None:
         """Broadcast BMS + per-tank Mopeka payloads (BLE-characteristic shape)
         when they change, derived from the same dashboard snapshot as state."""
+        if not self._sensor_cache_identity_resolved:
+            # One startup read associates the first sensor cache with a stable
+            # identity. Ongoing identity changes ride the existing config/state
+            # cadence and do not add disk polling.
+            trailer_snapshot = self._read_trailer_snapshot()
+            if trailer_snapshot is not None:
+                self._synchronize_sensor_cache_identity(trailer_snapshot[1])
+        if not self._sensor_cache_identity_confirmed:
+            return
         bms = state_encoder.encode_bms(state)
         if bms != self._last_bms:
             self._last_bms = bms
