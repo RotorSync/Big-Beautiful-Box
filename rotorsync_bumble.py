@@ -95,8 +95,10 @@ GATT_ADVERTISING_RESUME_DELAY_SECONDS = 0.5
 GATT_CONNECTED_ADVERTISING_VERIFY_INTERVAL_SECONDS = 2.0
 GATT_CONNECTED_ADVERTISING_RETRY_INTERVAL_SECONDS = 1.0
 GATT_INACTIVE_CONNECTION_PRUNE_SECONDS = 20.0
+GATT_CONNECTION_LIVENESS_PROBE_INTERVAL_SECONDS = 15.0
+GATT_CONNECTION_LIVENESS_PROBE_TIMEOUT_SECONDS = 2.0
 # 15s (was 8): on a marginal cockpit link discovery+MTU+subscribe+hello can
-# exceed 8s, and the 2s-post-connect parameter-relax adds early traffic. Must
+# exceed 8s, and the connection-parameter request adds early traffic. Must
 # stay under GATT_INACTIVE_CONNECTION_PRUNE_SECONDS so kick precedes prune.
 GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS = 15.0
 # Time-sync from client hello: when the box boots with no network (no NTP since
@@ -248,6 +250,9 @@ gatt_connection_bookkeeping_task = None
 active_gatt_connections = set()
 active_gatt_connection_counts = {}
 gatt_client_metadata_by_connection = {}
+gatt_parameter_relax_tasks_by_connection = {}
+gatt_parameter_update_locks = {}
+gatt_parameter_update_owners = {}
 gatt_controller_changed_at = 0.0
 last_sensor_defer_log_at = 0.0
 gatt_self_advertisement_target = {'address': '', 'name': '', 'short_name': ''}
@@ -300,7 +305,111 @@ def _gatt_connection_is_known_closed(connection):
         if any(token in state for token in ('connect', 'open', 'active')):
             return False
 
+    handle = _connection_handle(connection)
+    device = getattr(connection, 'device', None)
+    device_connections = getattr(device, 'connections', None)
+    if handle is not None and isinstance(device_connections, dict):
+        return device_connections.get(handle) is not connection
+
     return False
+
+
+def _connection_peer(connection):
+    """Return the stable peer address without conflating it with an HCI link."""
+    for attr in ('peer_address', 'address'):
+        value = getattr(connection, attr, None)
+        if value is not None:
+            return str(value)
+    return 'default'
+
+
+def _connection_handle(connection):
+    value = getattr(connection, 'handle', None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _connection_handle_text(connection):
+    handle = _connection_handle(connection)
+    return f'0x{handle:04X}' if handle is not None else 'unknown'
+
+
+def _connection_base_key(connection):
+    peer = _connection_peer(connection)
+    handle = _connection_handle(connection)
+    if handle is None:
+        return peer
+    return f'{peer}#handle={handle}'
+
+
+def _connection_key(connection):
+    return _connection_base_key(connection)
+
+
+def _connection_parameters_text(connection):
+    params = getattr(connection, 'parameters', None)
+    if params is None:
+        return 'unavailable'
+    interval = getattr(params, 'connection_interval', '?')
+    latency = getattr(
+        params,
+        'peripheral_latency',
+        getattr(params, 'slave_latency', '?'),
+    )
+    timeout = getattr(params, 'supervision_timeout', '?')
+    return f'interval={interval}ms latency={latency} supervision_timeout={timeout}ms'
+
+
+def _disconnect_reason_text(reason):
+    if reason is None:
+        return 'unknown'
+    try:
+        code = int(reason)
+    except (TypeError, ValueError):
+        return str(reason)
+    try:
+        name = hci.HCI_Constant.error_name(code)
+    except Exception:
+        name = ''
+    return f'0x{code:02X}{f" ({name})" if name else ""}'
+
+
+def _is_unknown_connection_identifier_error(error):
+    try:
+        return int(getattr(error, 'error_code', -1)) == 0x02
+    except (TypeError, ValueError):
+        return False
+
+
+def _gatt_connection_is_active(connection_key, connection=None):
+    if connection_key not in active_gatt_connections:
+        return False
+    if connection is None:
+        return True
+    metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+    tracked_connection = metadata.get('connection')
+    return tracked_connection is None or tracked_connection is connection
+
+
+def _remove_active_gatt_connection(connection_key):
+    """Remove exactly one HCI link and retain any sibling link for the peer."""
+    if connection_key not in active_gatt_connections:
+        return {}, False
+
+    active_gatt_connections.discard(connection_key)
+    metadata = gatt_client_metadata_by_connection.pop(connection_key, None) or {}
+    peer = str(metadata.get('peer') or connection_key)
+    current_count = active_gatt_connection_counts.get(peer, 0)
+    if current_count > 1:
+        active_gatt_connection_counts[peer] = current_count - 1
+    else:
+        active_gatt_connection_counts.pop(peer, None)
+    _cancel_gatt_parameter_relax(connection_key)
+    return metadata, True
 
 
 def _is_pilot_connected():
@@ -349,14 +458,17 @@ def maybe_log_sensor_defer(kind, reason, *, now=None):
 
 def prune_inactive_gatt_connections(*, now=None, reason=''):
     """Drop stale bookkeeping entries when Bumble misses a disconnect event."""
-    if len(active_gatt_connections) <= 1:
+    if not active_gatt_connections:
         return []
 
     now = time.time() if now is None else float(now)
-    stale_peers = []
-    for peer in list(active_gatt_connections):
-        metadata = gatt_client_metadata_by_connection.get(peer) or {}
-        if not _gatt_connection_is_known_closed(metadata.get('connection')):
+    stale_connections = []
+    for connection_key in list(active_gatt_connections):
+        metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+        known_closed = bool(metadata.get('controller_closed')) or (
+            _gatt_connection_is_known_closed(metadata.get('connection'))
+        )
+        if not known_closed:
             if metadata.get('connection') is not None:
                 continue
         activity_at = float(
@@ -364,20 +476,27 @@ def prune_inactive_gatt_connections(*, now=None, reason=''):
             or metadata.get('connected_at')
             or 0
         )
-        if not activity_at:
+        if not activity_at and not known_closed:
             continue
-        if now - activity_at <= GATT_INACTIVE_CONNECTION_PRUNE_SECONDS:
+        if (
+            not known_closed
+            and now - activity_at <= GATT_INACTIVE_CONNECTION_PRUNE_SECONDS
+        ):
             continue
-        stale_peers.append((activity_at, str(peer), peer))
+        stale_connections.append(
+            (activity_at, str(connection_key), connection_key, known_closed)
+        )
 
-    stale_peers.sort()
-    removable_count = max(0, len(active_gatt_connections) - 1)
+    stale_connections.sort()
     removed = []
-    for _activity_at, _peer_text, peer in stale_peers[:removable_count]:
-        active_gatt_connections.discard(peer)
-        active_gatt_connection_counts.pop(peer, None)
-        gatt_client_metadata_by_connection.pop(peer, None)
-        removed.append(peer)
+    for _activity_at, _key_text, connection_key, known_closed in stale_connections:
+        # Age-only recovery must always retain one possible anchor. Exact
+        # framework/controller proof may safely remove the final phantom link.
+        if len(active_gatt_connections) <= 1 and not known_closed:
+            continue
+        _metadata, was_removed = _remove_active_gatt_connection(connection_key)
+        if was_removed:
+            removed.append(connection_key)
 
     if removed:
         print(
@@ -396,12 +515,14 @@ async def disconnect_unknown_gatt_client_if_no_hello(
     connected_at,
     *,
     grace_seconds=GATT_UNKNOWN_CLIENT_HELLO_GRACE_SECONDS,
+    connection_key=None,
 ):
     """Disconnect a client that opened GATT but never identified with client_hello."""
     await asyncio.sleep(grace_seconds)
 
-    metadata = gatt_client_metadata_by_connection.get(peer) or {}
-    if peer not in active_gatt_connections:
+    connection_key = connection_key or _connection_key(connection)
+    metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+    if not _gatt_connection_is_active(connection_key, connection):
         return False
     if _normalize_client_role(metadata.get('role')) != 'unknown':
         return False
@@ -427,10 +548,8 @@ async def disconnect_unknown_gatt_client_if_no_hello(
             flush=True,
         )
 
-    if peer in active_gatt_connections:
-        active_gatt_connections.discard(peer)
-        active_gatt_connection_counts.pop(peer, None)
-        gatt_client_metadata_by_connection.pop(peer, None)
+    if connection_key in active_gatt_connections:
+        _remove_active_gatt_connection(connection_key)
         mark_gatt_controller_changed()
         persist_gatt_connection_state('unknown_client_no_hello')
     return True
@@ -458,7 +577,111 @@ GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS = 5000.0
 GATT_RELAX_CONN_PARAMS_DELAY_SECONDS = 2.0
 
 
-async def relax_gatt_connection_parameters(device, connection, peer):
+def _gatt_parameter_manager(device):
+    return getattr(device, 'l2cap_channel_manager', None)
+
+
+def _gatt_parameter_manager_key(device):
+    manager = _gatt_parameter_manager(device)
+    target = manager if manager is not None else device
+    return id(target), target
+
+
+def _gatt_parameter_update_lock(device):
+    manager_key, target = _gatt_parameter_manager_key(device)
+    loop = asyncio.get_running_loop()
+    entry = gatt_parameter_update_locks.get(manager_key)
+    if (
+        entry is None
+        or entry.get('target') is not target
+        or (entry.get('loop') is not loop and not entry['lock'].locked())
+    ):
+        entry = {
+            'target': target,
+            'loop': loop,
+            'lock': asyncio.Lock(),
+        }
+        gatt_parameter_update_locks[manager_key] = entry
+    return entry['lock']
+
+
+def _capture_owned_l2cap_pending(device, connection_key, task):
+    manager_key, target = _gatt_parameter_manager_key(device)
+    owner = gatt_parameter_update_owners.get(manager_key)
+    if (
+        owner is None
+        or owner.get('target') is not target
+        or owner.get('connection_key') != connection_key
+        or owner.get('task') is not task
+    ):
+        return None
+    if owner.get('pending') is None:
+        manager = _gatt_parameter_manager(device)
+        owner['pending'] = getattr(
+            manager,
+            'connection_parameters_update_response',
+            None,
+        )
+    return owner.get('pending')
+
+
+def _release_owned_l2cap_pending(
+    device,
+    connection_key,
+    task,
+    *,
+    cancel_pending,
+):
+    manager_key, target = _gatt_parameter_manager_key(device)
+    owner = gatt_parameter_update_owners.get(manager_key)
+    if (
+        owner is None
+        or owner.get('target') is not target
+        or owner.get('connection_key') != connection_key
+        or owner.get('task') is not task
+    ):
+        return False
+
+    pending = owner.get('pending')
+    manager = _gatt_parameter_manager(device)
+    current = getattr(manager, 'connection_parameters_update_response', None)
+    if pending is not None and current is pending:
+        if cancel_pending and not pending.done():
+            pending.cancel()
+        manager.connection_parameters_update_response = None
+    gatt_parameter_update_owners.pop(manager_key, None)
+    return True
+
+
+def _cancel_gatt_parameter_relax(connection_key):
+    task = gatt_parameter_relax_tasks_by_connection.get(connection_key)
+    if task is None:
+        return False
+
+    for owner in list(gatt_parameter_update_owners.values()):
+        if owner.get('connection_key') != connection_key or owner.get('task') is not task:
+            continue
+        device = owner.get('device')
+        if device is not None:
+            _capture_owned_l2cap_pending(device, connection_key, task)
+            _release_owned_l2cap_pending(
+                device,
+                connection_key,
+                task,
+                cancel_pending=True,
+            )
+    if not task.done():
+        task.cancel()
+    return True
+
+
+def _handle_gatt_parameter_relax_done(connection_key, task):
+    if gatt_parameter_relax_tasks_by_connection.get(connection_key) is task:
+        gatt_parameter_relax_tasks_by_connection.pop(connection_key, None)
+    _handle_background_task_done(task)
+
+
+async def relax_gatt_connection_parameters(device, connection, connection_key):
     """Ask the central for relaxed connection parameters shortly after connect.
 
     iOS defaults to a ~15ms connection interval and a 2s supervision timeout
@@ -469,19 +692,24 @@ async def relax_gatt_connection_parameters(device, connection, peer):
     timeout give the radio room to run two links and keep advertising.
     Best effort via L2CAP parameter update request: the central may reject,
     and any failure is logged and ignored."""
-    await asyncio.sleep(GATT_RELAX_CONN_PARAMS_DELAY_SECONDS)
-    if peer not in active_gatt_connections:
+    if GATT_RELAX_CONN_PARAMS_DELAY_SECONDS > 0:
+        await asyncio.sleep(GATT_RELAX_CONN_PARAMS_DELAY_SECONDS)
+    if not _gatt_connection_is_active(connection_key, connection):
         return
     update = getattr(connection, 'update_parameters', None)
     if update is None:
         return
+
+    metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+    peer = str(metadata.get('peer') or _connection_peer(connection))
+    handle_text = _connection_handle_text(connection)
 
     def _log_applied_parameters(*_args, peer=peer, connection=connection):
         # Ground truth that the central actually granted the relax: fires on
         # the HCI connection-parameters-update event, after acceptance.
         params = getattr(connection, 'parameters', None)
         print(
-            f'Connection parameters updated for {peer}: '
+            f'Connection parameters updated for {peer} handle={handle_text}: '
             f'interval={getattr(params, "connection_interval", "?")} '
             f'latency={getattr(params, "peripheral_latency", getattr(params, "slave_latency", "?"))} '
             f'supervision_timeout={getattr(params, "supervision_timeout", "?")}',
@@ -493,43 +721,93 @@ async def relax_gatt_connection_parameters(device, connection, peer):
             connection.on('connection_parameters_update', _log_applied_parameters)
         except Exception:
             pass
-    try:
-        await asyncio.wait_for(
-            update(
-                GATT_RELAXED_CONN_INTERVAL_MIN_MS,
-                GATT_RELAXED_CONN_INTERVAL_MAX_MS,
-                GATT_RELAXED_CONN_LATENCY,
-                GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS,
-                use_l2cap=True,
-            ),
-            timeout=10.0,
+    lock = _gatt_parameter_update_lock(device)
+    async with lock:
+        if not _gatt_connection_is_active(connection_key, connection):
+            return
+
+        manager = _gatt_parameter_manager(device)
+        manager_key, target = _gatt_parameter_manager_key(device)
+        pending_before = getattr(
+            manager,
+            'connection_parameters_update_response',
+            None,
         )
-        print(
-            f'Requested relaxed connection parameters for {peer} '
-            f'(30-45ms interval, 5s supervision timeout); central response '
-            f'pending — watch for "Connection parameters updated"',
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f'Connection parameter relax for {peer} failed: '
-            f'{type(e).__name__}: {e}',
-            flush=True,
-        )
-        # bumble 0.0.229 keeps ONE pending L2CAP parameter-update response
-        # slot per device and never clears it if the link drops mid-request;
-        # a stuck (even cancelled) future there makes every later request
-        # raise InvalidStateError, silently disabling relaxation until
-        # restart. Best-effort un-poison so the next connection can retry.
-        try:
-            manager = getattr(device, 'l2cap_channel_manager', None)
-            pending = getattr(
-                manager, 'connection_parameters_update_response', None
-            )
-            if pending is not None and pending.done():
+        existing_owner = gatt_parameter_update_owners.get(manager_key)
+        if pending_before is not None:
+            if pending_before.done() and existing_owner is None:
+                # A cancelled/done future left by Bumble 0.0.229 has no live
+                # request to receive. Clear only this verified orphan.
                 manager.connection_parameters_update_response = None
-        except Exception:
-            pass
+            else:
+                print(
+                    f'Connection parameter relax deferred for {peer} '
+                    f'handle={handle_text}: another L2CAP response is pending',
+                    flush=True,
+                )
+                return
+
+        task = asyncio.current_task()
+        owner = {
+            'target': target,
+            'device': device,
+            'connection_key': connection_key,
+            'task': task,
+            'pending': None,
+        }
+        gatt_parameter_update_owners[manager_key] = owner
+        request_task = None
+        accepted = False
+        try:
+            request_task = asyncio.create_task(
+                update(
+                    GATT_RELAXED_CONN_INTERVAL_MIN_MS,
+                    GATT_RELAXED_CONN_INTERVAL_MAX_MS,
+                    GATT_RELAXED_CONN_LATENCY,
+                    GATT_RELAXED_CONN_SUPERVISION_TIMEOUT_MS,
+                    use_l2cap=True,
+                )
+            )
+            # Bumble creates its single device-global response future before
+            # the first await. Capture that exact object so cleanup can never
+            # clear a later connection's request.
+            await asyncio.sleep(0)
+            _capture_owned_l2cap_pending(device, connection_key, task)
+            await asyncio.wait_for(request_task, timeout=10.0)
+            accepted = True
+            print(
+                f'Central accepted relaxed connection parameters for {peer} '
+                f'handle={handle_text} (30-45ms interval, 5s supervision timeout); '
+                'watch for "Connection parameters updated" to confirm application',
+                flush=True,
+            )
+        except asyncio.CancelledError:
+            _capture_owned_l2cap_pending(device, connection_key, task)
+            raise
+        except Exception as e:
+            if _is_unknown_connection_identifier_error(e):
+                metadata = gatt_client_metadata_by_connection.get(connection_key)
+                if metadata is not None and metadata.get('connection') is connection:
+                    metadata['controller_closed'] = True
+                    metadata['controller_close_reason'] = (
+                        'parameter update returned UNKNOWN_CONNECTION_IDENTIFIER'
+                    )
+            print(
+                f'Connection parameter relax for {peer} handle={handle_text} failed: '
+                f'{type(e).__name__}: {e}',
+                flush=True,
+            )
+        finally:
+            if request_task is not None and not request_task.done():
+                request_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await request_task
+            _release_owned_l2cap_pending(
+                device,
+                connection_key,
+                task,
+                cancel_pending=not accepted,
+            )
 
 
 def _kernel_clock_is_synchronized():
@@ -1497,14 +1775,27 @@ def persist_gatt_connection_state(reason=''):
     try:
         client_details = []
         registry_clients = []
-        for peer in sorted(str(peer) for peer in active_gatt_connections):
-            metadata = gatt_client_metadata_by_connection.get(peer) or {}
-            client_details.append({
+        client_peers = []
+        for connection_key in sorted(
+            active_gatt_connections,
+            key=lambda value: str(value),
+        ):
+            connection_key = str(connection_key)
+            metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+            peer = str(metadata.get('peer') or connection_key)
+            client_peers.append(peer)
+            detail = {
                 'id': peer,
                 'role': _normalize_client_role(metadata.get('role')),
                 'connected_at': float(metadata.get('connected_at') or 0),
                 'last_seen': float(metadata.get('last_seen') or 0),
-            })
+            }
+            if connection_key != peer:
+                detail['connection_id'] = connection_key
+            handle = metadata.get('handle')
+            if handle is not None:
+                detail['handle'] = handle
+            client_details.append(detail)
             entry = {
                 'transport': 'ble',
                 'peer': peer,
@@ -1520,7 +1811,9 @@ def persist_gatt_connection_state(reason=''):
             'timestamp': time.time(),
             'pid': os.getpid(),
             'count': len(active_gatt_connections),
-            'clients': sorted(str(peer) for peer in active_gatt_connections),
+            # One item per live HCI link. Duplicate peer strings are intentional
+            # when iOS overlaps old/new handles for the same private address.
+            'clients': sorted(client_peers),
             'client_details': client_details,
             'reason': str(reason or '')[:80],
         }
@@ -1950,6 +2243,69 @@ def schedule_single_client_gatt_advertising_maintenance(
     return connected_advertising_maintainer_task
 
 
+async def probe_stale_single_gatt_connection(device, *, now=None):
+    """Ask the controller whether an inactive final handle still exists.
+
+    Bumble may miss a disconnection event and retain a phantom final client.
+    Inactivity alone is not proof because a healthy subscribed client can be
+    quiet. HCI Read RSSI for the exact handle is a cheap, authoritative probe;
+    only UNKNOWN_CONNECTION_IDENTIFIER marks the final link safe to prune.
+    """
+    if len(active_gatt_connections) != 1:
+        return None
+
+    now = time.time() if now is None else float(now)
+    connection_key = next(iter(active_gatt_connections))
+    metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+    connection = metadata.get('connection')
+    if connection is None:
+        return None
+    if metadata.get('controller_closed') or _gatt_connection_is_known_closed(connection):
+        metadata['controller_closed'] = True
+        metadata.setdefault('controller_close_reason', 'Bumble connection no longer active')
+        return connection_key
+
+    last_seen = float(metadata.get('last_seen') or metadata.get('connected_at') or 0)
+    if not last_seen or now - last_seen <= GATT_INACTIVE_CONNECTION_PRUNE_SECONDS:
+        return None
+    last_probe = float(metadata.get('controller_probed_at') or 0)
+    if now - last_probe < GATT_CONNECTION_LIVENESS_PROBE_INTERVAL_SECONDS:
+        return None
+
+    get_connection_rssi = getattr(device, 'get_connection_rssi', None)
+    if get_connection_rssi is None:
+        return None
+    metadata['controller_probed_at'] = now
+    try:
+        await asyncio.wait_for(
+            get_connection_rssi(connection),
+            timeout=GATT_CONNECTION_LIVENESS_PROBE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if not _is_unknown_connection_identifier_error(e):
+            print(
+                f'GATT handle liveness probe inconclusive for '
+                f'{metadata.get("peer") or connection_key} '
+                f'handle={_connection_handle_text(connection)}: '
+                f'{type(e).__name__}: {e}',
+                flush=True,
+            )
+            return None
+        metadata['controller_closed'] = True
+        metadata['controller_close_reason'] = 'HCI Read RSSI returned UNKNOWN_CONNECTION_IDENTIFIER'
+        print(
+            f'GATT handle confirmed absent by controller for '
+            f'{metadata.get("peer") or connection_key} '
+            f'handle={_connection_handle_text(connection)}: '
+            'UNKNOWN_CONNECTION_IDENTIFIER',
+            flush=True,
+        )
+        return connection_key
+    return None
+
+
 def reconcile_gatt_connection_bookkeeping(
     device,
     advertising_data,
@@ -1970,6 +2326,28 @@ def reconcile_gatt_connection_bookkeeping(
             ble_name,
             reason='stale controller pruned; anchor remains',
         )
+    elif removed and not active_gatt_connections:
+        global connected_advertising_maintainer_task
+        if (
+            connected_advertising_maintainer_task is not None
+            and not connected_advertising_maintainer_task.done()
+        ):
+            connected_advertising_maintainer_task.cancel()
+            connected_advertising_maintainer_task = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            task = loop.create_task(
+                restart_gatt_advertising_after_disconnect(
+                    device,
+                    advertising_data,
+                    scan_response_data,
+                    ble_name,
+                )
+            )
+            task.add_done_callback(_handle_background_task_done)
     return removed
 
 
@@ -1983,12 +2361,22 @@ async def maintain_gatt_connection_bookkeeping(
 ):
     """Continuously recover from missed disconnect events while one anchor remains."""
     while True:
-        reconcile_gatt_connection_bookkeeping(
+        removed = reconcile_gatt_connection_bookkeeping(
             device,
             advertising_data,
             scan_response_data,
             ble_name,
         )
+        if not removed and len(active_gatt_connections) == 1:
+            confirmed_closed = await probe_stale_single_gatt_connection(device)
+            if confirmed_closed is not None:
+                reconcile_gatt_connection_bookkeeping(
+                    device,
+                    advertising_data,
+                    scan_response_data,
+                    ble_name,
+                    reason='controller confirmed final handle absent',
+                )
         await asyncio.sleep(interval)
 
 
@@ -2036,20 +2424,35 @@ def install_gatt_advertising_resume_hook(
         print('GATT advertising resume hook unavailable: Bumble device has no event API', flush=True)
         return False
 
-    def on_disconnection(peer):
-        mark_gatt_controller_changed()
-        current_count = active_gatt_connection_counts.get(peer, 0)
-        departed_metadata = {}
-        if current_count > 1:
-            active_gatt_connection_counts[peer] = current_count - 1
-        else:
-            active_gatt_connection_counts.pop(peer, None)
-            active_gatt_connections.discard(peer)
-            departed_metadata = gatt_client_metadata_by_connection.pop(peer, None) or {}
+    def on_disconnection(connection_key, connection, *event_args):
+        tracked_metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+        tracked_connection = tracked_metadata.get('connection')
+        if tracked_connection is not None and tracked_connection is not connection:
+            print(
+                f'Ignored stale GATT disconnection for {_connection_peer(connection)} '
+                f'handle={_connection_handle_text(connection)}: '
+                'that peer/handle now belongs to a newer connection object',
+                flush=True,
+            )
+            return
+        departed_metadata, was_removed = _remove_active_gatt_connection(connection_key)
+        peer = str(departed_metadata.get('peer') or _connection_peer(connection))
+        reason = event_args[0] if event_args else None
+        if not was_removed:
+            print(
+                f'Ignored duplicate GATT disconnection for {peer} '
+                f'handle={_connection_handle_text(connection)} '
+                f'reason={_disconnect_reason_text(reason)}',
+                flush=True,
+            )
+            return
 
+        mark_gatt_controller_changed()
         print(
-            f'GATT client disconnected from {peer}; '
-            f'{len(active_gatt_connections)} controller(s) remain',
+            f'GATT client disconnected from {peer} '
+            f'handle={_connection_handle_text(connection)} '
+            f'reason={_disconnect_reason_text(reason)}; '
+            f'{len(active_gatt_connections)} controller link(s) remain',
             flush=True,
         )
         persist_gatt_connection_state('disconnect')
@@ -2086,15 +2489,30 @@ def install_gatt_advertising_resume_hook(
             task.add_done_callback(_handle_background_task_done)
 
     def on_connection(connection):
-        peer = _connection_key(connection)
         now = time.time()
         prune_inactive_gatt_connections(now=now, reason='new_connection')
+        connection_key = _connection_key(connection)
+        peer = _connection_peer(connection)
+        existing_metadata = gatt_client_metadata_by_connection.get(connection_key) or {}
+        if (
+            connection_key in active_gatt_connections
+            and existing_metadata.get('connection') is connection
+        ):
+            print(
+                f'Ignored duplicate GATT connection event from {peer} '
+                f'handle={_connection_handle_text(connection)}; '
+                'advertising state left untouched',
+                flush=True,
+            )
+            return
+
         mark_gatt_controller_changed(now)
-        previous_count = active_gatt_connection_counts.get(peer, 0)
-        active_gatt_connection_counts[peer] = 1
-        active_gatt_connections.add(peer)
+        active_gatt_connection_counts[peer] = (
+            active_gatt_connection_counts.get(peer, 0) + 1
+        )
+        active_gatt_connections.add(connection_key)
         metadata = gatt_client_metadata_by_connection.setdefault(
-            peer,
+            connection_key,
             {
                 'role': 'unknown',
                 'connected_at': now,
@@ -2104,36 +2522,48 @@ def install_gatt_advertising_resume_hook(
         metadata['connected_at'] = now
         metadata['last_seen'] = now
         metadata['connection'] = connection
+        metadata['peer'] = peer
+        metadata['handle'] = _connection_handle(connection)
         print(
-            f'GATT client connected from {peer}; trying to keep advertising for '
-            'additional controllers',
+            f'GATT client connected from {peer} '
+            f'handle={_connection_handle_text(connection)} '
+            f'initial_parameters={_connection_parameters_text(connection)}; '
+            f'{len(active_gatt_connections)} controller link(s) active',
             flush=True,
         )
         persist_gatt_connection_state('connect')
         connection_registry.record_event('connect', 'ble', peer=peer)
         hello_deadline_task = asyncio.create_task(
-            disconnect_unknown_gatt_client_if_no_hello(connection, peer, now)
+            disconnect_unknown_gatt_client_if_no_hello(
+                connection,
+                peer,
+                now,
+                connection_key=connection_key,
+            )
         )
         hello_deadline_task.add_done_callback(_handle_background_task_done)
         if hasattr(connection, 'on'):
-            connection.on('disconnection', lambda *args, peer=peer: on_disconnection(peer))
+            connection.on(
+                'disconnection',
+                lambda *args, connection_key=connection_key, connection=connection: (
+                    on_disconnection(connection_key, connection, *args)
+                ),
+            )
         else:
             print(
                 'GATT connection object has no event API; disconnect advertising '
                 'restart will rely on watchdog',
                 flush=True,
             )
-        if previous_count > 0:
-            print(
-                f'GATT duplicate connection event from {peer}; '
-                'advertising state left untouched',
-                flush=True,
-            )
-            return
         relax_params_task = asyncio.create_task(
-            relax_gatt_connection_parameters(device, connection, peer)
+            relax_gatt_connection_parameters(device, connection, connection_key)
         )
-        relax_params_task.add_done_callback(_handle_background_task_done)
+        gatt_parameter_relax_tasks_by_connection[connection_key] = relax_params_task
+        relax_params_task.add_done_callback(
+            lambda task, connection_key=connection_key: (
+                _handle_gatt_parameter_relax_done(connection_key, task)
+            )
+        )
         if len(active_gatt_connections) > 1:
             global connected_advertising_maintainer_task
             if (
@@ -2179,18 +2609,18 @@ def mark_gatt_client_seen(connection=None):
     global last_gatt_client_seen_write
 
     now = time.time()
-    peer = _connection_key(connection) if connection is not None else None
-    if peer:
-        was_tracked = peer in active_gatt_connections
+    connection_key = _connection_key(connection) if connection is not None else None
+    peer = _connection_peer(connection) if connection is not None else None
+    if connection_key:
+        was_tracked = connection_key in active_gatt_connections
         if not was_tracked:
-            active_gatt_connections.add(peer)
-            active_gatt_connection_counts[peer] = max(
-                1,
-                active_gatt_connection_counts.get(peer, 0),
+            active_gatt_connections.add(connection_key)
+            active_gatt_connection_counts[peer] = (
+                active_gatt_connection_counts.get(peer, 0) + 1
             )
             mark_gatt_controller_changed(now)
         metadata = gatt_client_metadata_by_connection.setdefault(
-            peer,
+            connection_key,
             {
                 'role': 'unknown',
                 'connected_at': now,
@@ -2199,9 +2629,12 @@ def mark_gatt_client_seen(connection=None):
         )
         metadata['last_seen'] = now
         metadata['connection'] = connection
+        metadata['peer'] = peer
+        metadata['handle'] = _connection_handle(connection)
         if not was_tracked:
             print(
-                f'Recovered active GATT controller from client activity: {peer}',
+                f'Recovered active GATT controller from client activity: {peer} '
+                f'handle={_connection_handle_text(connection)}',
                 flush=True,
             )
         prune_inactive_gatt_connections(now=now, reason='client_seen')
@@ -2212,7 +2645,7 @@ def mark_gatt_client_seen(connection=None):
     try:
         _atomic_write_text(GATT_CLIENT_SEEN_FILE, f'{now:.3f}\n')
         last_gatt_client_seen_write = now
-        if peer:
+        if connection_key:
             persist_gatt_connection_state('client_seen')
     except Exception as e:
         print(f'Failed to persist GATT client heartbeat: {e}', flush=True)
@@ -2445,14 +2878,6 @@ def make_config_notify_read_handler():
         print(f'ReadValue config_notify: {value[:120]}', flush=True)
         return bytes(value, 'utf-8')
     return read_value
-
-
-def _connection_key(connection):
-    for attr in ('peer_address', 'address', 'handle'):
-        value = getattr(connection, attr, None)
-        if value is not None:
-            return str(value)
-    return 'default'
 
 
 def _next_control_command_seq():

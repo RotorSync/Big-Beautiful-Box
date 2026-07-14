@@ -31,8 +31,12 @@ def connection(peer):
 
 
 class FakeConnection:
-    def __init__(self, peer):
+    def __init__(self, peer, *, handle=None, parameters=None):
         self.peer_address = peer
+        if handle is not None:
+            self.handle = handle
+        if parameters is not None:
+            self.parameters = parameters
         self.listeners = {}
         self.disconnect_calls = 0
 
@@ -41,6 +45,29 @@ class FakeConnection:
 
     async def disconnect(self):
         self.disconnect_calls += 1
+
+
+class FakeParameterUpdateConnection(FakeConnection):
+    def __init__(self, peer, *, handle, manager, order):
+        super().__init__(peer, handle=handle)
+        self.manager = manager
+        self.order = order
+        self.pending_response = None
+
+    async def update_parameters(self, *_args, **kwargs):
+        assert kwargs.get('use_l2cap') is True
+        if self.manager.connection_parameters_update_response is not None:
+            raise RuntimeError('request already pending')
+        response = asyncio.get_running_loop().create_future()
+        self.pending_response = response
+        self.manager.connection_parameters_update_response = response
+        self.order.append(('start', self.handle))
+        try:
+            await response
+            self.order.append(('accepted', self.handle))
+        finally:
+            if self.manager.connection_parameters_update_response is response:
+                self.manager.connection_parameters_update_response = None
 
 
 class FakeGattDevice:
@@ -1124,6 +1151,430 @@ def test_gatt_duplicate_connection_event_disconnect_does_not_leave_phantom_ancho
 
     assert bumble_module.active_gatt_connections == {'ipad'}
     assert 'iphone' not in bumble_module.active_gatt_connection_counts
+
+
+def test_same_peer_distinct_hci_handles_preserve_survivor_then_restart_at_zero(
+    bumble_module,
+    monkeypatch,
+    capsys,
+):
+    device = FakeGattDevice()
+    device.advertising = True
+    monkeypatch.delenv('ROTORSYNC_DISABLE_CONNECTED_ADVERTISING', raising=False)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'schedule_gatt_connection_bookkeeping_maintenance',
+        lambda *_args, **_kwargs: None,
+    )
+
+    params = types.SimpleNamespace(
+        connection_interval=15.0,
+        peripheral_latency=0,
+        supervision_timeout=10000.0,
+    )
+    peer = '68:57:AA:BB:CC:DD/P'
+    first = FakeConnection(peer, handle=24, parameters=params)
+    second = FakeConnection(peer, handle=25, parameters=params)
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+
+        # Zero clients starts with normal advertising. One link retains it;
+        # the second same-peer handle is real multipoint and must not collapse.
+        device.listeners['connection'](first)
+        assert device.advertising is True
+        device.listeners['connection'](second)
+        await asyncio.sleep(0)
+        assert bumble_module.active_gatt_connections == {
+            f'{peer}#handle=24',
+            f'{peer}#handle=25',
+        }
+        assert bumble_module.active_gatt_connection_counts == {peer: 2}
+        assert len(bumble_module.gatt_client_metadata_by_connection) == 2
+        assert device.advertising is True
+
+        # The first 0x08 timeout removes only handle 24. Handle 25 remains the
+        # anchor, its metadata survives, and no zero-client restart is launched.
+        first.listeners['disconnection'](0x08)
+        await asyncio.sleep(0.01)
+        assert bumble_module.active_gatt_connections == {f'{peer}#handle=25'}
+        assert bumble_module.active_gatt_connection_counts == {peer: 1}
+        assert f'{peer}#handle=25' in bumble_module.gatt_client_metadata_by_connection
+        assert device.start_calls == []
+        assert device.advertising is True
+
+        # Only final-handle cleanup reaches zero and restores normal advertising.
+        device.advertising = False
+        second.listeners['disconnection'](0x08)
+        await asyncio.sleep(0.30)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == set()
+    assert bumble_module.active_gatt_connection_counts == {}
+    assert bumble_module.gatt_client_metadata_by_connection == {}
+    assert device.advertising is True
+    assert len(device.start_calls) == 1
+    output = capsys.readouterr().out
+    assert 'handle=0x0018 reason=0x08' in output
+    assert 'handle=0x0019 reason=0x08' in output
+    assert '1 controller link(s) remain' in output
+    assert '0 controller link(s) remain' in output
+
+
+def test_reused_handle_ignores_delayed_disconnection_from_old_connection(
+    bumble_module,
+    monkeypatch,
+    capsys,
+):
+    device = FakeGattDevice()
+    device.advertising = True
+    device.connections = {}
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'schedule_gatt_connection_bookkeeping_maintenance',
+        lambda *_args, **_kwargs: None,
+    )
+    peer = '68:57:AA:BB:CC:DD/P'
+    old_connection = FakeConnection(peer, handle=24)
+    new_connection = FakeConnection(peer, handle=24)
+    old_connection.device = device
+    new_connection.device = device
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+        device.connections[24] = old_connection
+        device.listeners['connection'](old_connection)
+
+        # Bumble installs the replacement in Device.connections before it emits
+        # the new event. Registration prunes the now-closed old object and reuses
+        # the same peer+handle key for the replacement.
+        device.connections[24] = new_connection
+        device.listeners['connection'](new_connection)
+        key = f'{peer}#handle=24'
+        assert bumble_module.active_gatt_connections == {key}
+        assert bumble_module.gatt_client_metadata_by_connection[key]['connection'] is new_connection
+
+        # A delayed event from the old object must not delete the replacement.
+        old_connection.listeners['disconnection'](0x08)
+        assert bumble_module.active_gatt_connections == {key}
+        assert bumble_module.active_gatt_connection_counts == {peer: 1}
+        assert bumble_module.gatt_client_metadata_by_connection[key]['connection'] is new_connection
+
+        new_connection.listeners['disconnection'](0x13)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert bumble_module.active_gatt_connections == set()
+    assert 'Ignored stale GATT disconnection' in capsys.readouterr().out
+
+
+def test_same_peer_parameter_relax_requests_are_serialized_by_handle(
+    bumble_module,
+    monkeypatch,
+):
+    manager = types.SimpleNamespace(connection_parameters_update_response=None)
+    device = FakeGattDevice()
+    device.advertising = True
+    device.l2cap_channel_manager = manager
+    order = []
+    peer = '68:57:AA:BB:CC:DD/P'
+    first = FakeParameterUpdateConnection(
+        peer,
+        handle=24,
+        manager=manager,
+        order=order,
+    )
+    second = FakeParameterUpdateConnection(
+        peer,
+        handle=25,
+        manager=manager,
+        order=order,
+    )
+    monkeypatch.setattr(bumble_module, 'GATT_RELAX_CONN_PARAMS_DELAY_SECONDS', 0)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'schedule_gatt_connection_bookkeeping_maintenance',
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def wait_for(predicate):
+        deadline = asyncio.get_running_loop().time() + 1
+        while not predicate() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert predicate()
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+        device.listeners['connection'](first)
+        device.listeners['connection'](second)
+        await wait_for(lambda: first.pending_response is not None)
+        assert second.pending_response is None
+
+        first.pending_response.set_result(0)
+        await wait_for(lambda: second.pending_response is not None)
+        assert manager.connection_parameters_update_response is second.pending_response
+        second.pending_response.set_result(0)
+        await wait_for(lambda: not bumble_module.gatt_parameter_relax_tasks_by_connection)
+
+        first.listeners['disconnection'](0x08)
+        second.listeners['disconnection'](0x08)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert order == [
+        ('start', 24),
+        ('accepted', 24),
+        ('start', 25),
+        ('accepted', 25),
+    ]
+    assert manager.connection_parameters_update_response is None
+    assert bumble_module.gatt_parameter_update_owners == {}
+
+
+def test_disconnect_cancels_only_owned_relax_slot_during_handle_churn(
+    bumble_module,
+    monkeypatch,
+):
+    manager = types.SimpleNamespace(connection_parameters_update_response=None)
+    device = FakeGattDevice()
+    device.advertising = True
+    device.l2cap_channel_manager = manager
+    order = []
+    peer = '68:57:AA:BB:CC:DD/P'
+    first = FakeParameterUpdateConnection(
+        peer,
+        handle=24,
+        manager=manager,
+        order=order,
+    )
+    second = FakeParameterUpdateConnection(
+        peer,
+        handle=25,
+        manager=manager,
+        order=order,
+    )
+    monkeypatch.setattr(bumble_module, 'GATT_RELAX_CONN_PARAMS_DELAY_SECONDS', 0)
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+
+    async def wait_for(predicate):
+        deadline = asyncio.get_running_loop().time() + 1
+        while not predicate() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert predicate()
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+        device.listeners['connection'](first)
+        device.listeners['connection'](second)
+        await wait_for(lambda: first.pending_response is not None)
+        first_pending = first.pending_response
+
+        # Handle 24 owns the device-global slot. Its disconnect cancels that
+        # exact future and lets handle 25 acquire the serialized slot.
+        first.listeners['disconnection'](0x08)
+        await wait_for(lambda: second.pending_response is not None)
+        second_pending = second.pending_response
+        assert first_pending.cancelled()
+        assert second_pending is not first_pending
+        assert manager.connection_parameters_update_response is second_pending
+
+        # Let the cancelled owner finish its finally path; it must not clear
+        # the successor's now-live request.
+        await asyncio.sleep(0.01)
+        assert manager.connection_parameters_update_response is second_pending
+        assert not second_pending.cancelled()
+        second_pending.set_result(0)
+        await wait_for(lambda: not bumble_module.gatt_parameter_relax_tasks_by_connection)
+        second.listeners['disconnection'](0x08)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert order == [('start', 24), ('start', 25), ('accepted', 25)]
+    assert manager.connection_parameters_update_response is None
+    assert bumble_module.gatt_parameter_update_owners == {}
+
+
+def test_final_phantom_handle_prunes_only_after_controller_unknown(
+    bumble_module,
+    monkeypatch,
+):
+    class UnknownHandleError(Exception):
+        error_code = 0x02
+
+    class ProbeDevice(FakeGattDevice):
+        def __init__(self):
+            super().__init__()
+            self.connections = {}
+            self.probes = []
+
+        async def get_connection_rssi(self, connection):
+            self.probes.append(connection.handle)
+            raise UnknownHandleError('UNKNOWN_CONNECTION_IDENTIFIER')
+
+    device = ProbeDevice()
+    device.advertising = False
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_advertising_ready',
+        lambda _name, _address: None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'schedule_gatt_connection_bookkeeping_maintenance',
+        lambda *_args, **_kwargs: None,
+    )
+    peer = '68:57:AA:BB:CC:DD/P'
+    connection = FakeConnection(peer, handle=2)
+    connection.device = device
+    device.connections[2] = connection  # Bumble's stale in-memory view.
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+        device.listeners['connection'](connection)
+        key = f'{peer}#handle=2'
+        metadata = bumble_module.gatt_client_metadata_by_connection[key]
+        metadata['connected_at'] = 50.0
+        metadata['last_seen'] = 50.0
+
+        confirmed = await bumble_module.probe_stale_single_gatt_connection(
+            device,
+            now=100.0,
+        )
+        assert confirmed == key
+        removed = bumble_module.reconcile_gatt_connection_bookkeeping(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+            now=100.0,
+            reason='test controller proof',
+        )
+        assert removed == [key]
+        await asyncio.sleep(0.30)
+
+    asyncio.run(run())
+
+    assert device.probes == [2]
+    assert bumble_module.active_gatt_connections == set()
+    assert device.advertising is True
+    assert len(device.start_calls) == 1
+
+
+def test_quiet_final_handle_survives_successful_controller_probe(
+    bumble_module,
+    monkeypatch,
+):
+    class ProbeDevice(FakeGattDevice):
+        def __init__(self):
+            super().__init__()
+            self.connections = {}
+            self.probes = []
+
+        async def get_connection_rssi(self, connection):
+            self.probes.append(connection.handle)
+            return -72
+
+    device = ProbeDevice()
+    monkeypatch.setattr(
+        bumble_module,
+        'persist_gatt_connection_state',
+        lambda _reason='': None,
+    )
+    monkeypatch.setattr(
+        bumble_module,
+        'schedule_gatt_connection_bookkeeping_maintenance',
+        lambda *_args, **_kwargs: None,
+    )
+    peer = '68:57:AA:BB:CC:DD/P'
+    connection = FakeConnection(peer, handle=7)
+    connection.device = device
+    device.connections[7] = connection
+
+    async def run():
+        assert bumble_module.install_gatt_advertising_resume_hook(
+            device,
+            b'adv',
+            b'scan',
+            'TrailerSync-TR11',
+        )
+        device.listeners['connection'](connection)
+        key = f'{peer}#handle=7'
+        metadata = bumble_module.gatt_client_metadata_by_connection[key]
+        metadata['connected_at'] = 50.0
+        metadata['last_seen'] = 50.0
+        assert await bumble_module.probe_stale_single_gatt_connection(
+            device,
+            now=100.0,
+        ) is None
+        assert bumble_module.prune_inactive_gatt_connections(
+            now=100.0,
+            reason='test live quiet anchor',
+        ) == []
+        connection.listeners['disconnection'](0x13)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert device.probes == [7]
+    assert bumble_module.active_gatt_connections == set()
 
 
 def test_gatt_advertising_restarts_after_all_clients_disconnect(
