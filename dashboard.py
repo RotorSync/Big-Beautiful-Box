@@ -7407,20 +7407,17 @@ def serial_listener():
                             # ---------------------------------------------------------
 
                             # A physical-reset incident must always be escapable,
-                            # even if a menu or confirmation screen is open. Consume
-                            # this press strictly as acknowledgement; never pulse the
-                            # already-reset meter from this path.
-                            if line in ('RST', 'RESET') and physical_reset_safety_active:
-                                msg = "Serial: Box reset acknowledged physical-reset safety"
+                            # even if a menu or confirmation screen is open. Handle
+                            # Pump Stop synchronously so normal state returns as soon
+                            # as the physical button command is received.
+                            if line == 'PS' and physical_reset_safety_active:
+                                msg = "Serial: Pump Stop acknowledged physical-reset safety"
                                 print(msg)
                                 append_debug_log(
                                     debug_log,
                                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n",
                                 )
-                                root.after(
-                                    0,
-                                    lambda: clear_physical_reset_safety("serial reset"),
-                                )
+                                handle_box_pump_stop_button("serial pump stop")
                                 continue
 
                             if should_ignore_menu_ov_bounce(line, "Serial"):
@@ -7873,7 +7870,7 @@ def _activate_physical_reset_safety(previous_gallons, flow_rate_l_per_s):
     return True
 
 
-def clear_physical_reset_safety(source="box reset"):
+def clear_physical_reset_safety(source="pump stop acknowledgment"):
     """Acknowledge an in-flow physical-reset incident without resetting the meter again."""
     global physical_reset_safety_active
 
@@ -8012,11 +8009,10 @@ def force_flow_reset(reason="forced"):
     return reset_completed
 
 
-def handle_box_reset_button(reason="box reset"):
-    """Use the observable Box reset control to acknowledge a physical-reset incident."""
-    if clear_physical_reset_safety(reason):
-        return True
-    return force_flow_reset(reason)
+def handle_box_pump_stop_button(reason="box pump stop"):
+    """Reassert pump stop and immediately acknowledge a physical-reset incident."""
+    start_pump_stop_thread(config.PUMP_STOP_DURATION)
+    return clear_physical_reset_safety(reason)
 
 
 def pulse_flow_reset():
@@ -8160,7 +8156,7 @@ def physical_reset_safety_message():
         "PUMP STOPPED - METER RESET DURING FLOW\n"
         f"METER HAD {physical_reset_gallons_at_event:.1f} GAL WHEN RESET WAS PRESSED\n"
         "DO NOT RESET THE METER WHILE FLOWING\n"
-        "PRESS BOX RESET TO CLEAR"
+        "PRESS PUMP STOP TO ACKNOWLEDGE"
     )
 
 
@@ -9552,7 +9548,7 @@ def _sim_send_command(line):
         draw_requested_number(f"{requested_gallons:.0f}", "red")
         update_batch_mix_overlay()
     elif line == "PS":
-        threading.Thread(target=pump_stop_relay, daemon=True).start()
+        handle_box_pump_stop_button("sim pump stop")
     elif line == "OV":
         if requested_gallons == 0:
             arm_menu_ov_guard()
@@ -9564,7 +9560,7 @@ def _sim_send_command(line):
     elif line == "TU":
         handle_thumbs_up_press("sim TU")
     elif line in ("RST", "RESET"):
-        handle_box_reset_button("sim reset")
+        force_flow_reset("sim reset")
     elif line == "MIX":
         switch_mode("mix")
     elif line == "FILL":

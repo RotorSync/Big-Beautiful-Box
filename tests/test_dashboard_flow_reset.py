@@ -147,7 +147,7 @@ def _reset_namespace(flow_gpm=0.0):
         "detect_totalizer_reset",
         "_pulse_flow_reset_gpio",
         "force_flow_reset",
-        "handle_box_reset_button",
+        "handle_box_pump_stop_button",
         "pulse_flow_reset",
         "schedule_flow_reset",
         "physical_reset_safety_message",
@@ -457,7 +457,7 @@ def test_repeated_unacknowledged_reset_preserves_first_gallons_and_does_not_repu
     assert ns["_pump_stops"] == [config.PUMP_STOP_DURATION]
 
 
-def test_box_reset_button_clears_safety_without_pulsing_meter_again():
+def test_box_pump_stop_button_immediately_clears_safety_and_reasserts_stop():
     ns = _reset_namespace()
     ns["previous_totalizer_liters"] = _liters_for_gallons(75.0)
     ns["detect_totalizer_reset"](
@@ -466,13 +466,17 @@ def test_box_reset_button_clears_safety_without_pulsing_meter_again():
     )
     ns["last_flow_rate"] = 80.0 / config.LITERS_PER_SEC_TO_GPM
 
-    assert ns["handle_box_reset_button"]("serial reset") is True
+    assert ns["handle_box_pump_stop_button"]("serial pump stop") is True
 
     assert ns["physical_reset_safety_active"] is False
     assert ns["_gpio"].outputs == []
+    assert ns["_pump_stops"] == [
+        config.PUMP_STOP_DURATION,
+        config.PUMP_STOP_DURATION,
+    ]
 
 
-def test_older_queued_reset_cannot_clear_a_newer_physical_reset_incident():
+def test_reset_button_cannot_clear_a_physical_reset_incident():
     ns = _reset_namespace()
     ns["physical_reset_safety_active"] = True
     ns["last_flow_rate"] = 80.0 / config.LITERS_PER_SEC_TO_GPM
@@ -481,6 +485,70 @@ def test_older_queued_reset_cannot_clear_a_newer_physical_reset_incident():
 
     assert ns["physical_reset_safety_active"] is True
     assert ns["_gpio"].outputs == []
+
+
+def test_serial_pump_stop_acknowledges_before_any_mode_routing():
+    tree = ast.parse(DASHBOARD_PATH.read_text(encoding="utf-8"))
+    listener = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "serial_listener"
+    )
+    acknowledgement = next(
+        node
+        for node in ast.walk(listener)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "line == 'PS' and physical_reset_safety_active"
+    )
+    first_mode_route = next(
+        node
+        for node in ast.walk(listener)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "exit_confirm_window"
+    )
+    calls = [
+        node
+        for node in ast.walk(acknowledgement)
+        if isinstance(node, ast.Call)
+    ]
+
+    assert any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "handle_box_pump_stop_button"
+        for call in calls
+    )
+    assert not any(
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "root"
+        and call.func.attr == "after"
+        for call in calls
+    )
+    assert acknowledgement.lineno < first_mode_route.lineno
+
+
+def test_socket_pump_stop_cannot_acknowledge_local_physical_reset_safety():
+    tree = ast.parse(DASHBOARD_PATH.read_text(encoding="utf-8"))
+    listener = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "socket_command_listener"
+    )
+    pump_stop_route = next(
+        node
+        for node in ast.walk(listener)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "line == 'PS'"
+    )
+    called_names = {
+        call.func.id
+        for call in ast.walk(pump_stop_route)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+
+    assert "start_pump_stop_thread" in called_names
+    assert "handle_box_pump_stop_button" not in called_names
+    assert "clear_physical_reset_safety" not in called_names
 
 
 def test_physical_reset_banner_tells_operator_gallons_and_how_to_clear():
@@ -495,7 +563,7 @@ def test_physical_reset_banner_tells_operator_gallons_and_how_to_clear():
     text = ns["_canvas"].texts[0][1]["text"]
     assert "METER HAD 75.0 GAL WHEN RESET WAS PRESSED" in text
     assert "DO NOT RESET THE METER WHILE FLOWING" in text
-    assert "PRESS BOX RESET TO CLEAR" in text
+    assert "PRESS PUMP STOP TO ACKNOWLEDGE" in text
 
 
 def test_physical_reset_warning_window_stays_above_fullscreen_workflows():
