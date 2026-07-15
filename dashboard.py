@@ -544,6 +544,13 @@ positive_drift_low_flow_started_at = 0.0
 positive_drift_baseline_liters = 0.0
 positive_drift_gallons = 0.0
 positive_drift_flow_gpm = 0.0
+physical_reset_safety_active = False
+physical_reset_gallons_at_event = 0.0
+physical_reset_flow_gpm_at_event = 0.0
+expected_totalizer_reset_until = 0.0
+expected_totalizer_reset_from_gallons = 0.0
+physical_reset_safety_window = None
+physical_reset_safety_label = None
 flow_meter_reconnect_fresh_reads = 0
 flow_meter_reconnect_started_at = 0.0
 flow_meter_reconnect_last_status_check = 0.0
@@ -5873,7 +5880,7 @@ def read_flow_meter():
             totalizer_liters = signed_totalizer_liters
             flow_rate_l_per_s = raw_flow_rate_l_per_s
             flow_meter_temp_f = _decode_flow_meter_temp_f(raw_data)
-            detect_totalizer_reset(totalizer_liters)
+            detect_totalizer_reset(totalizer_liters, flow_rate_l_per_s)
 
             last_totalizer_liters = totalizer_liters
             last_signed_totalizer_liters = signed_totalizer_liters
@@ -7399,6 +7406,23 @@ def serial_listener():
                                 last_operator_input_ts = time.time()
                             # ---------------------------------------------------------
 
+                            # A physical-reset incident must always be escapable,
+                            # even if a menu or confirmation screen is open. Consume
+                            # this press strictly as acknowledgement; never pulse the
+                            # already-reset meter from this path.
+                            if line in ('RST', 'RESET') and physical_reset_safety_active:
+                                msg = "Serial: Box reset acknowledged physical-reset safety"
+                                print(msg)
+                                append_debug_log(
+                                    debug_log,
+                                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n",
+                                )
+                                root.after(
+                                    0,
+                                    lambda: clear_physical_reset_safety("serial reset"),
+                                )
+                                continue
+
                             if should_ignore_menu_ov_bounce(line, "Serial"):
                                 continue
 
@@ -7771,9 +7795,11 @@ flow_reset_scheduled = False
 flow_reset_cycle_id = None
 flow_cycle_counter = 0
 
-def flow_is_active():
-    """Return True when flow is currently active."""
-    return last_flow_rate >= config.FLOW_STOPPED_THRESHOLD
+def reset_is_blocked_by_flow():
+    """Block reset for forward flow or invalid data; permit reverse flow."""
+    if not math.isfinite(last_flow_rate):
+        return True
+    return last_flow_rate >= config.FLOW_METER_ZERO_THRESHOLD
 
 
 def clear_auto_shutoff_state(reason=""):
@@ -7796,16 +7822,121 @@ def clear_auto_shutoff_state(reason=""):
         print(f"Auto-shutoff state cleared: {reason}")
 
 
-def detect_totalizer_reset(totalizer_liters):
-    """Treat a confirmed nonzero-to-zero totalizer drop as a new cycle boundary."""
+def _mark_expected_totalizer_reset():
+    """Expect one observable nonzero-counter transition after a Box reset pulse."""
+    global expected_totalizer_reset_until, expected_totalizer_reset_from_gallons
+
+    counter_gallons = last_totalizer_liters * config.LITERS_TO_GALLONS
+    if not math.isfinite(counter_gallons) or abs(counter_gallons) < 0.25:
+        expected_totalizer_reset_until = 0.0
+        expected_totalizer_reset_from_gallons = 0.0
+        return False
+    expected_totalizer_reset_from_gallons = counter_gallons
+    expected_totalizer_reset_until = time.time() + 1.0
+    return True
+
+
+def _activate_physical_reset_safety(previous_gallons, flow_rate_l_per_s):
+    """Stop the pump and retain the first unexpected in-flow reset for acknowledgement."""
+    global physical_reset_safety_active
+    global physical_reset_gallons_at_event, physical_reset_flow_gpm_at_event
+
+    flow_gpm = flow_rate_l_per_s * config.LITERS_PER_SEC_TO_GPM
+    if physical_reset_safety_active:
+        log_flow_control(
+            "physical_reset_during_flow_repeated"
+            f" | gallons_before={previous_gallons:.3f}"
+            f" | flow_gpm={flow_gpm:.2f}"
+        )
+        return False
+
+    physical_reset_safety_active = True
+    physical_reset_gallons_at_event = max(0.0, previous_gallons)
+    physical_reset_flow_gpm_at_event = flow_gpm
+    msg = (
+        "Physical meter reset detected during forward flow"
+        f" ({physical_reset_gallons_at_event:.1f} gal at reset, {flow_gpm:.1f} GPM)"
+    )
+    print(msg)
+    log_serial_debug(msg)
+    log_flow_control(
+        "physical_reset_during_flow"
+        f" | gallons_before={physical_reset_gallons_at_event:.3f}"
+        f" | flow_gpm={flow_gpm:.2f}"
+        " | pump_stop"
+    )
+    start_pump_stop_thread(config.PUMP_STOP_DURATION)
+    try:
+        root.after(0, lambda: _show_physical_reset_safety_window())
+    except Exception:
+        pass
+    return True
+
+
+def clear_physical_reset_safety(source="box reset"):
+    """Acknowledge an in-flow physical-reset incident without resetting the meter again."""
+    global physical_reset_safety_active
+
+    if not physical_reset_safety_active:
+        return False
+    physical_reset_safety_active = False
+    msg = f"Physical reset safety cleared by {source}"
+    print(msg)
+    log_serial_debug(msg)
+    log_flow_control(
+        "physical_reset_safety_cleared"
+        f" | source={source}"
+        f" | gallons_before={physical_reset_gallons_at_event:.3f}"
+    )
+    try:
+        root.after(0, lambda: _hide_physical_reset_safety_window())
+    except Exception:
+        pass
+    return True
+
+
+def detect_totalizer_reset(totalizer_liters, flow_rate_l_per_s=None):
+    """Detect a totalizer reset and stop on an unexpected reset during forward flow."""
     global previous_totalizer_liters, flow_cycle_counter
+    global expected_totalizer_reset_until, expected_totalizer_reset_from_gallons
 
     previous_gallons = previous_totalizer_liters * config.LITERS_TO_GALLONS
     current_gallons = totalizer_liters * config.LITERS_TO_GALLONS
-    reset_detected = previous_gallons > 0.25 and current_gallons < 0.05
+    reset_drop_gallons = previous_gallons - current_gallons
+    reset_detected = (
+        (abs(previous_gallons) > 0.25 and abs(current_gallons) < 0.05)
+        or reset_drop_gallons >= 0.25
+    )
+    now = time.time()
+    expected_counter_matches = bool(
+        abs(previous_gallons - expected_totalizer_reset_from_gallons) <= 0.25
+    )
+    expected_reset = bool(
+        reset_detected
+        and expected_totalizer_reset_until > 0.0
+        and now <= expected_totalizer_reset_until
+        and expected_counter_matches
+    )
+    if reset_detected or now > expected_totalizer_reset_until:
+        expected_totalizer_reset_until = 0.0
+        expected_totalizer_reset_from_gallons = 0.0
     previous_totalizer_liters = totalizer_liters
 
     if reset_detected:
+        current_flow = last_flow_rate if flow_rate_l_per_s is None else flow_rate_l_per_s
+        positive_flow = bool(
+            math.isfinite(current_flow)
+            and current_flow >= config.FLOW_METER_ZERO_THRESHOLD
+        )
+        if positive_flow and not expected_reset:
+            _activate_physical_reset_safety(previous_gallons, current_flow)
+        elif expected_reset:
+            log_flow_control(
+                "expected_box_totalizer_reset_observed"
+                f" | gallons_before={previous_gallons:.3f}"
+                f" | gallons_after={current_gallons:.3f}"
+                f" | flow_lps={current_flow:.4f}"
+            )
         flow_cycle_counter += 1
         clear_auto_shutoff_state("totalizer reset to zero")
         print(
@@ -7814,24 +7945,46 @@ def detect_totalizer_reset(totalizer_liters):
         )
 
 
-def _pulse_flow_reset_gpio():
+def _pulse_flow_reset_gpio(reason="flow reset"):
     global flow_reset_scheduled, flow_reset_cycle_id
+    global expected_totalizer_reset_until, expected_totalizer_reset_from_gallons
+    if reset_is_blocked_by_flow():
+        msg = f"Flow reset blocked: forward flow active ({last_flow_rate:.3f} L/s)"
+        print(msg)
+        log_serial_debug(msg)
+        with open("/home/pi/reset_debug.log", "a") as dbg:
+            dbg.write(msg + "\n")
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return False
     if SIM_MODE:
-        _sim_flow_reset("gpio pulse")
-        return
+        _mark_expected_totalizer_reset()
+        _sim_flow_reset(reason)
+        return True
+    if not GPIO_AVAILABLE:
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return False
     try:
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write("pulsing gpio0\n")
+        _mark_expected_totalizer_reset()
         GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
         time.sleep(config.FLOW_RESET_DURATION)
         GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write("done\n")
     except Exception as e:
+        expected_totalizer_reset_until = 0.0
+        expected_totalizer_reset_from_gallons = 0.0
         with open("/home/pi/reset_debug.log", "a") as dbg:
             dbg.write(str(e) + "\n")
+        flow_reset_scheduled = False
+        flow_reset_cycle_id = None
+        return False
     flow_reset_scheduled = False
     flow_reset_cycle_id = None
+    return True
 
 
 def _sim_flow_reset(reason):
@@ -7848,26 +8001,22 @@ def _sim_flow_reset(reason):
 
 def force_flow_reset(reason="forced"):
     global flow_reset_scheduled, flow_reset_cycle_id
-    if SIM_MODE:
-        msg = f"Flow reset forced: {reason} ({last_flow_rate:.3f} L/s)"
-        print(msg)
-        log_serial_debug(msg)
-        with open("/home/pi/reset_debug.log", "a") as dbg:
-            dbg.write(msg + "\n")
-        clear_auto_shutoff_state(reason)
-        _sim_flow_reset(reason)
-        return
-    if not GPIO_AVAILABLE:
-        flow_reset_scheduled = False
-        flow_reset_cycle_id = None
-        return
-    msg = f"Flow reset forced: {reason} ({last_flow_rate:.3f} L/s)"
+    msg = f"Flow reset requested: {reason} ({last_flow_rate:.3f} L/s)"
     print(msg)
     log_serial_debug(msg)
     with open("/home/pi/reset_debug.log", "a") as dbg:
         dbg.write(msg + "\n")
-    clear_auto_shutoff_state(reason)
-    _pulse_flow_reset_gpio()
+    reset_completed = _pulse_flow_reset_gpio(reason)
+    if reset_completed:
+        clear_auto_shutoff_state(reason)
+    return reset_completed
+
+
+def handle_box_reset_button(reason="box reset"):
+    """Use the observable Box reset control to acknowledge a physical-reset incident."""
+    if clear_physical_reset_safety(reason):
+        return True
+    return force_flow_reset(reason)
 
 
 def pulse_flow_reset():
@@ -7883,42 +8032,14 @@ def pulse_flow_reset():
         flow_reset_scheduled = False
         flow_reset_cycle_id = None
         return
-    if flow_is_active():
-        msg = f"Flow reset blocked: flow still active ({last_flow_rate:.3f} L/s)"
-        print(msg)
-        log_serial_debug(msg)
-        with open("/home/pi/reset_debug.log", "a") as dbg:
-            dbg.write(msg + "\n")
-        flow_reset_scheduled = False
-        flow_reset_cycle_id = None
-        return
-    if SIM_MODE:
-        _sim_flow_reset("scheduled pulse")
-        return
-    if not GPIO_AVAILABLE:
-        flow_reset_scheduled = False
-        flow_reset_cycle_id = None
-        return
-    try:
-        with open("/home/pi/reset_debug.log", "a") as dbg:
-            dbg.write("pulsing gpio0\n")
-        GPIO.output(config.FLOW_RESET_PIN, GPIO.HIGH)
-        time.sleep(config.FLOW_RESET_DURATION)
-        GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
-        with open("/home/pi/reset_debug.log", "a") as dbg:
-            dbg.write("done\n")
-    except Exception as e:
-        with open("/home/pi/reset_debug.log", "a") as dbg:
-            dbg.write(str(e) + "\n")
-    flow_reset_scheduled = False
-    flow_reset_cycle_id = None
+    _pulse_flow_reset_gpio("scheduled pulse")
 
 def schedule_flow_reset():
     global flow_reset_scheduled, flow_reset_cycle_id
     if flow_reset_scheduled:
         return
-    if flow_is_active():
-        msg = f"Flow reset not scheduled: flow still active ({last_flow_rate:.3f} L/s)"
+    if reset_is_blocked_by_flow():
+        msg = f"Flow reset not scheduled: forward flow active ({last_flow_rate:.3f} L/s)"
         print(msg)
         log_serial_debug(msg)
         with open("/home/pi/reset_debug.log", "a") as dbg:
@@ -8031,6 +8152,115 @@ def _canvas_width():
 def _canvas_height():
     height = canvas.winfo_height()
     return SIM_WINDOW_HEIGHT if SIM_MODE else height
+
+
+def physical_reset_safety_message():
+    """Operator instructions for an unexpected meter reset during forward flow."""
+    return (
+        "PUMP STOPPED - METER RESET DURING FLOW\n"
+        f"METER HAD {physical_reset_gallons_at_event:.1f} GAL WHEN RESET WAS PRESSED\n"
+        "DO NOT RESET THE METER WHILE FLOWING\n"
+        "PRESS BOX RESET TO CLEAR"
+    )
+
+
+def draw_physical_reset_safety_banner():
+    """Draw a persistent compact warning without hiding requested or actual gallons."""
+    canvas.delete("physical_reset_safety")
+    if not physical_reset_safety_active:
+        return
+
+    width = _canvas_width()
+    height = _canvas_height()
+    banner_top = max(0, height - 175)
+    banner_bottom = max(banner_top + 1, height - 40)
+    canvas.create_rectangle(
+        20,
+        banner_top,
+        width - 20,
+        banner_bottom,
+        fill="black",
+        outline="yellow",
+        width=5,
+        tags="physical_reset_safety",
+    )
+    canvas.create_text(
+        width // 2,
+        (banner_top + banner_bottom) // 2,
+        text=physical_reset_safety_message(),
+        font=("Helvetica", max(20, int(height * 0.025)), "bold"),
+        fill="yellow",
+        justify="center",
+        tags="physical_reset_safety",
+    )
+    canvas.tag_raise("physical_reset_safety")
+
+
+def _show_physical_reset_safety_window():
+    """Keep the reset warning visible above fullscreen menus and workflows."""
+    global physical_reset_safety_window, physical_reset_safety_label
+
+    if not physical_reset_safety_active:
+        _hide_physical_reset_safety_window()
+        return
+    try:
+        window_exists = bool(
+            physical_reset_safety_window is not None
+            and physical_reset_safety_window.winfo_exists()
+        )
+        if not window_exists:
+            physical_reset_safety_window = tk.Toplevel(root)
+            physical_reset_safety_window.overrideredirect(True)
+            physical_reset_safety_window.configure(bg="black")
+            physical_reset_safety_label = tk.Label(
+                physical_reset_safety_window,
+                bg="black",
+                fg="yellow",
+                justify="center",
+                bd=5,
+                relief="solid",
+                highlightbackground="yellow",
+                highlightcolor="yellow",
+                highlightthickness=3,
+            )
+            physical_reset_safety_label.pack(fill="both", expand=True)
+
+        root.update_idletasks()
+        root_width = max(1, root.winfo_width())
+        root_height = max(1, root.winfo_height())
+        banner_width = max(400, root_width - 40)
+        banner_height = max(110, min(150, int(root_height * 0.14)))
+        banner_x = root.winfo_rootx() + max(0, (root_width - banner_width) // 2)
+        banner_y = root.winfo_rooty() + max(0, root_height - banner_height - 35)
+        font_size = max(16, min(28, int(root_height * 0.025)))
+        physical_reset_safety_label.configure(
+            text=physical_reset_safety_message(),
+            font=("Helvetica", font_size, "bold"),
+            wraplength=max(200, banner_width - 30),
+        )
+        physical_reset_safety_window.geometry(
+            f"{banner_width}x{banner_height}+{banner_x}+{banner_y}"
+        )
+        physical_reset_safety_window.deiconify()
+        physical_reset_safety_window.lift()
+        try:
+            physical_reset_safety_window.attributes("-topmost", True)
+        except Exception:
+            pass
+    except Exception as exc:
+        log_flow_control(f"physical_reset_safety_window_error | error={exc}")
+
+
+def _hide_physical_reset_safety_window():
+    """Hide the cross-window reset warning after local acknowledgement."""
+    try:
+        if (
+            physical_reset_safety_window is not None
+            and physical_reset_safety_window.winfo_exists()
+        ):
+            physical_reset_safety_window.withdraw()
+    except Exception:
+        pass
 
 
 def update_negative_totalizer_fault_flash():
@@ -9274,6 +9504,7 @@ def _update_dashboard_tick():
         or positive_drift_fault_active
     ) and negative_totalizer_alarm_visible:
         canvas.tag_raise("negative_totalizer_alarm")
+    draw_physical_reset_safety_banner()
 
 
 def _sim_send_command(line):
@@ -9333,7 +9564,7 @@ def _sim_send_command(line):
     elif line == "TU":
         handle_thumbs_up_press("sim TU")
     elif line in ("RST", "RESET"):
-        force_flow_reset("sim reset")
+        handle_box_reset_button("sim reset")
     elif line == "MIX":
         switch_mode("mix")
     elif line == "FILL":
