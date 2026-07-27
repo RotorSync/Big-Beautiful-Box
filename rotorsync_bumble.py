@@ -5559,6 +5559,18 @@ def _cmd_add_sensor(cmd, *, request_id=None):
         _set_config_response_obj({'ok': False, 'op': 'ADD_SENSOR', 'request_id': request_id, 'error': 'Required: id, trailer, tank'})
         return
 
+    new_sensor_id = new_sensor['Mopeka ID'].strip().upper()
+    if any(s.get('Mopeka ID', '').strip().upper() == new_sensor_id for s in sensors):
+        config_response_pages = []
+        _set_config_response_obj({
+            'ok': True,
+            'op': 'ADD_SENSOR',
+            'request_id': request_id,
+            'id': new_sensor.get('Mopeka ID', ''),
+            'existing': True,
+        })
+        return
+
     sensors.append(new_sensor)
     tank_order = {'Front': 0, 'Back': 1}
     sensors.sort(key=lambda s: (int(s['Trailer']) if s.get('Trailer', '').isdigit() else 999,
@@ -5588,12 +5600,11 @@ def _cmd_update_sensor(cmd, *, request_id=None):
         'mqtt_topic': 'MQTT Topic for app', 'added_to_app': 'Added to app'
     }
     for s in sensors:
-        if s.get('Mopeka ID') == sensor_id:
+        if s.get('Mopeka ID', '').strip().upper() == sensor_id.strip().upper():
             for json_key, csv_key in field_map.items():
                 if json_key in data:
                     s[csv_key] = str(data[json_key])
             found = True
-            break
 
     if not found:
         config_response_pages = []

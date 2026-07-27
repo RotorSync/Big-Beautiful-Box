@@ -4535,9 +4535,11 @@ def run_system_update():
                 "for mopeka_file in /home/pi/Big-Beautiful-Box/mopeka/*; do "
                 "[ -f \"$mopeka_file\" ] || continue; "
                 "base_name=$(basename \"$mopeka_file\"); "
-                "if [ \"$base_name\" = \"mopeka_config.json\" ] && [ -f /opt/mopeka/mopeka_config.json ]; then continue; fi; "
+                "if { [ \"$base_name\" = \"mopeka_config.json\" ] || [ \"$base_name\" = \"mopeka-sensor-details.csv\" ]; } "
+                "&& [ -f \"/opt/mopeka/$base_name\" ]; then continue; fi; "
                 "cp \"$mopeka_file\" /opt/mopeka/; "
                 "done; "
+                "chown -R pi:pi /opt/mopeka; "
                 # Purge a RETIRED maintenance secret so the box re-adopts the
                 # current shared fleet key on its next maintenance session. A box
                 # that adopted a now-retired key (e.g. a company's interim key

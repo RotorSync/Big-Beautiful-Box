@@ -18,7 +18,7 @@ Stan,6,Front,,0.115,TR6-Mopeka Front Tank,C3:93:D3,trailer/trailer6/mopeka/front
 Eric,7,Front,,0.4,TR7-Mopeka Front Tank,2C:25:CE,trailer/trailer7/mopeka/front,Yes
 ,7,Back,,-0.38,TR7-Mopeka Back Tank,EC:C6:E6,trailer/trailer7/mopeka/back,Yes
 Eugene,8,Front,,0,TR8-Mopeka Front Tank,FB:30:71,trailer/trailer8/mopeka/front,Yes
-,8,Back,,,TR8-Mopeka Back Tank,A9:B8:9A,trailer/trailer8/mopeka/back,Yes
+,8,Back,,-0.90,TR8-Mopeka Back Tank,9A:E3:35,trailer/trailer8/mopeka/back,Yes
 Jake,9,Front,,0.45,TR9-Mopeka Front Tank,35:6C:81,trailer/trailer9/mopeka/front,Yes
 ,9,Back,,-0.05,TR9-Mopeka Back Tank,B1:09:B1,trailer/trailer9/mopeka/back,Yes
 Levi,10,Front,,0,TR10-Mopeka Front Tank,03:7D:C2,trailer/trailer10/mopeka/front,Yes

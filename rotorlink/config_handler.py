@@ -1157,6 +1157,18 @@ class ConfigHandler:
                 new_sensor[csv_key] = str(data[json_key])
         if "Mopeka ID" not in new_sensor or "Trailer" not in new_sensor or "Tank" not in new_sensor:
             return {"ok": False, "op": "ADD_SENSOR", "request_id": request_id, "error": "Required: id, trailer, tank"}
+        new_sensor_id = new_sensor["Mopeka ID"].strip().upper()
+        if any(
+            s.get("Mopeka ID", "").strip().upper() == new_sensor_id
+            for s in sensors
+        ):
+            return {
+                "ok": True,
+                "op": "ADD_SENSOR",
+                "request_id": request_id,
+                "id": new_sensor.get("Mopeka ID", ""),
+                "existing": True,
+            }
         sensors.append(new_sensor)
         tank_order = {"Front": 0, "Back": 1}
         sensors.sort(
@@ -1176,12 +1188,11 @@ class ConfigHandler:
         sensors = _load_sensor_csv()
         found = False
         for s in sensors:
-            if s.get("Mopeka ID") == sensor_id:
+            if s.get("Mopeka ID", "").strip().upper() == sensor_id.strip().upper():
                 for json_key, csv_key in self._SENSOR_FIELD_MAP.items():
                     if json_key in data:
                         s[csv_key] = str(data[json_key])
                 found = True
-                break
         if not found:
             return {"ok": False, "op": "UPDATE_SENSOR", "request_id": request_id, "error": f"Sensor {sensor_id} not found"}
         _save_sensor_csv(sensors)

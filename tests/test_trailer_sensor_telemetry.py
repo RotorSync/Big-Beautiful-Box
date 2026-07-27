@@ -346,6 +346,77 @@ def test_wifi_trailer_selections_are_serialized_across_clients(monkeypatch):
     assert [response["request_id"] for response in responses] == ["one", "two"]
 
 
+def test_ble_duplicate_sensor_add_is_idempotent(
+    bumble_module,
+    monkeypatch,
+    tmp_path,
+):
+    sensor_path = tmp_path / "mopeka-sensor-details.csv"
+    monkeypatch.setattr(bumble_module, "SENSOR_CSV_PATH", str(sensor_path))
+    sensor = {
+        "Man": "Jake",
+        "Trailer": "8",
+        "Tank": "Back",
+        "Center Sump?": "",
+        "Height Offset": "0.0",
+        "Mopeka Name in app": "TR8-Mopeka Back tank",
+        "Mopeka ID": "9A:E3:35",
+        "MQTT Topic for app": "",
+        "Added to app": "No",
+    }
+    bumble_module.save_sensor_csv([sensor])
+
+    bumble_module._cmd_add_sensor({
+        "data": {
+            "trailer": 8,
+            "tank": "Back",
+            "height_offset": "-0.90",
+            "id": "9a:e3:35",
+        }
+    }, request_id="retry")
+
+    assert len(bumble_module.load_sensor_csv()) == 1
+    response = json.loads(bumble_module.config_response)
+    assert response["ok"] is True
+    assert response["existing"] is True
+
+
+def test_ble_update_repairs_all_legacy_duplicate_offsets(
+    bumble_module,
+    monkeypatch,
+    tmp_path,
+):
+    sensor_path = tmp_path / "mopeka-sensor-details.csv"
+    monkeypatch.setattr(bumble_module, "SENSOR_CSV_PATH", str(sensor_path))
+    monkeypatch.setattr(bumble_module, "_reload_converter", lambda: None)
+    sensor = {
+        "Man": "Jake",
+        "Trailer": "8",
+        "Tank": "Back",
+        "Center Sump?": "",
+        "Height Offset": "0.0",
+        "Mopeka Name in app": "TR8-Mopeka Back tank",
+        "Mopeka ID": "9A:E3:35",
+        "MQTT Topic for app": "",
+        "Added to app": "No",
+    }
+    duplicate = dict(sensor, **{"Height Offset": "-.92"})
+    bumble_module.save_sensor_csv([sensor, duplicate])
+
+    bumble_module._cmd_update_sensor({
+        "id": "9a:e3:35",
+        "data": {"height_offset": "-0.90"},
+    }, request_id="offset")
+
+    matches = [
+        row
+        for row in bumble_module.load_sensor_csv()
+        if row["Mopeka ID"].strip().upper() == "9A:E3:35"
+    ]
+    assert len(matches) == 2
+    assert {float(row["Height Offset"]) for row in matches} == {-0.90}
+
+
 def test_wifi_select_stops_old_scanner_resets_then_starts_new_identity(monkeypatch):
     previous = {
         "box_mode": "fleet",
