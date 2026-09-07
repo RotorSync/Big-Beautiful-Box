@@ -1214,14 +1214,24 @@ static uint64_t iolink_dl_now_ns (void)
    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void iolink_dl_arm_operate_watchdog (iolink_dl_t * dl)
+/* A retry (same message re-sent after DelayErr/RxErr) either gets its reply
+ * within a few cycle times or never; wait ~5 COM2 cycles, not the full 1 s. */
+#define IOL_DL_RETRY_WATCHDOG_US 60000u
+
+static void iolink_dl_arm_watchdog_us (iolink_dl_t * dl, uint32_t us)
 {
    os_timer_stop (dl->timer);
-   os_timer_set (dl->timer, IOL_DL_OPERATE_WATCHDOG_US);
+   os_timer_set (dl->timer, us);
    dl->timer_elapsed = false;
    dl->timer_type    = IOL_DL_TIMER_TINITCYC_MH;
    dl->wd_armed_ns   = iolink_dl_now_ns ();
+   dl->wd_period_ns  = (uint64_t)us * 1000ull;
    os_timer_start (dl->timer);
+}
+
+static void iolink_dl_arm_operate_watchdog (iolink_dl_t * dl)
+{
+   iolink_dl_arm_watchdog_us (dl, IOL_DL_OPERATE_WATCHDOG_US);
 }
 
 /* Returns true if a TINITCYC_MH timeout event is a stale expiry that must be
@@ -1233,7 +1243,7 @@ static bool iolink_dl_operate_watchdog_stale (iolink_dl_t * dl)
       return false; /* not an OPERATE watchdog arming (e.g. TInitcyc at startup) */
    }
    uint64_t age_ns = iolink_dl_now_ns () - dl->wd_armed_ns;
-   return age_ns < ((uint64_t)IOL_DL_OPERATE_WATCHDOG_US * 900ull);
+   return age_ns < (dl->wd_period_ns / 10ull) * 9ull;
 }
 
 static void iolink_dl_message_h_sm_get_od14 (iolink_port_t * port)
@@ -1307,6 +1317,10 @@ static void iolink_dl_message_h_sm_await_reply16 (iolink_port_t * port)
    }
    else if (dl->dataready)
    {
+      /* BBB 2026-09-07: a good reply ends any retry sequence. Without this the
+       * retry budget accumulated across unrelated blips minutes apart, so the
+       * third isolated late reply of the day became "retries exhausted". */
+      dl->message_handler.retry = 0;
       dl->message_handler.cks =
          dl->rxbuffer[dl->od_handler.od_rxlen + dl->pd_handler.pd_rxlen];
       EventFlag_ind (dl, getCKSEvFlag (dl));
@@ -1387,20 +1401,47 @@ static void iolink_dl_message_h_sm_await_reply16 (iolink_port_t * port)
          dl->txerror = false;
          dl->message_handler.retry++;
 #if IOLINK_HW == IOLINK_HW_MAX14819
-         PL_Resend (port);
+         /* BBB 2026-09-05: retry by reloading the same master message and
+          * sending it now. The previous PL_Resend() only pulsed CQSend on a
+          * TX FIFO the framer had already consumed, so after a single late
+          * device reply nothing was transmitted, no interrupt ever came, and
+          * the OPERATE watchdog tore the link down 1 s later (seen 3x in 36 h
+          * of idle bench running, each one a pump-stop pulse). */
+         PL_Transfer_req (
+            port,
+            dl->od_handler.od_rxlen + dl->pd_handler.pd_rxlen + 1,
+            dl->od_handler.od_txlen + dl->pd_handler.pd_txlen + 2,
+            dl->txbuffer);
 #endif
-         iolink_dl_arm_operate_watchdog (dl);
+         iolink_dl_arm_watchdog_us (dl, IOL_DL_RETRY_WATCHDOG_US);
          dl->message_handler.state = IOL_DL_MH_ST_AW_REPLY_16;
       }
    }
    else if (dl->timer_elapsed)
    {
+      if (dl->message_handler.retry > 0 && dl->message_handler.retry < 3)
+      {
+         /* A retry got no reply at all within the short retry window: count it
+          * as another failed attempt and re-run the retry logic. */
+         LOG_WARNING (
+            IOLINK_DL_LOG,
+            "%s: %s: retry %d got no reply within %u ms on Port %d - retrying\n",
+            __func__,
+            iolink_dl_mh_st_literals[dl->message_handler.state],
+            dl->message_handler.retry,
+            (unsigned)(dl->wd_period_ns / 1000000ull),
+            iolink_get_portnumber (port));
+         dl->rxtimeout = true;
+         iolink_dl_message_h_sm_await_reply16 (port);
+         dl->rxtimeout = false;
+         return;
+      }
       LOG_ERROR (
          IOLINK_DL_LOG,
          "%s: %s: OPERATE watchdog (%u ms, no reply interrupt) in AW_REPLY - recovering. Port %d\n",
          __func__,
          iolink_dl_mh_st_literals[dl->message_handler.state],
-         (unsigned)(IOL_DL_OPERATE_WATCHDOG_US / 1000u),
+         (unsigned)(dl->wd_period_ns / 1000000ull),
          iolink_get_portnumber (port));
       iolink_dl_mh_handle_com_lost (port);
    }
@@ -3724,6 +3765,7 @@ void iolink_dl_reset (iolink_port_t * port)
    dl->devdly                  = 0;
    dl->cqerr                   = 0;
    dl->wd_armed_ns             = 0;
+   dl->wd_period_ns            = 0;
    dl->force_comlost           = false;
    dl->first_read_min_cycl     = true;
 

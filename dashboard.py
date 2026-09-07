@@ -498,6 +498,7 @@ recent_flow_rates_l_per_s = deque(maxlen=config.FLOW_AVERAGING_SAMPLES)
 last_heartbeat_time = time.time()  # Last time we received OK heartbeat from switch box
 heartbeat_disconnected = False  # Track if heartbeat has timed out
 consecutive_identical_raw = 0  # Track byte-for-byte identical reads
+consecutive_all_zero_reads = 0  # all-zero PD reads in a row (master has no valid data yet)
 last_raw_data = None  # Previous raw bytes for stale detection
 last_power_cycle_time = 0         # Timestamp of last IOL power-cycle attempt
 iol_power_cycle_in_progress = False  # Flag to prevent overlapping power-cycle threads
@@ -5805,7 +5806,7 @@ def read_flow_meter():
     global connection_error, error_message, last_successful_read_time
     global last_flow_meter_temp_f
     global last_flow_read_was_fresh, last_fresh_flow_read_time
-    global consecutive_identical_raw, last_raw_data
+    global consecutive_identical_raw, last_raw_data, consecutive_all_zero_reads
 
     try:
         last_flow_read_was_fresh = False
@@ -5816,6 +5817,20 @@ def read_flow_meter():
 
         if len(raw_data) >= 15:
             if raw_data == b'\x00' * len(raw_data):
+                # All-zero = the IOL master has no valid process data (port not
+                # RUNNING, e.g. during a ~1-2 s COMLOST/re-establish). Give it
+                # the same FLOW_METER_TIMEOUT grace as stale data / read
+                # timeouts: keep the cached value, do not refresh
+                # last_successful_read_time (so the 5 s read-timeout latch still
+                # fails closed), and only declare the fault once the outage has
+                # actually lasted that long. Before this, a single all-zero read
+                # latched the pump-stop relay immediately, so every brief link
+                # blip became a pump stop.
+                consecutive_all_zero_reads += 1
+                last_raw_data = None
+                consecutive_identical_raw = 0
+                if consecutive_all_zero_reads < stale_raw_threshold_reads():
+                    return last_totalizer_liters * config.LITERS_TO_GALLONS
                 if not connection_error:
                     _log_iol_disconnect_status("all-zero data")
                 connection_error = True
@@ -5824,10 +5839,9 @@ def read_flow_meter():
                     iolhat.led(config.IOL_PORT, iolhat.LED_RED)
                 except:
                     pass
-                last_raw_data = None
-                consecutive_identical_raw = 0
                 _try_iol_power_cycle()
                 return last_totalizer_liters * config.LITERS_TO_GALLONS
+            consecutive_all_zero_reads = 0
 
             # If we were in error state and now getting valid non-stale data, log recovery
             if connection_error and raw_data != last_raw_data:

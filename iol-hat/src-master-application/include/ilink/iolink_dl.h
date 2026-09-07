@@ -333,6 +333,7 @@ typedef struct iolink_dl
    uint8_t devdly;
    uint8_t cqerr;
    uint64_t wd_armed_ns; /* CLOCK_MONOTONIC ns of the last OPERATE watchdog arming (0 = none) */
+   uint64_t wd_period_ns; /* period of that arming */
    bool force_comlost;   /* set by iolink_dl_request_comlost(); consumed in dl_main */
    uint8_t txbuffer[IOLINK_RXTX_BUFFER_SIZE];
    uint8_t rxbuffer[IOLINK_RXTX_BUFFER_SIZE];

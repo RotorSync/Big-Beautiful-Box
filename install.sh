@@ -351,7 +351,11 @@ log_info "Installed vendored iol-hat snapshot from BBB repo"
 if [ -d "$INSTALL_HOME/iol-hat/src-master-application" ]; then
     cd "$INSTALL_HOME/iol-hat/src-master-application"
     make clean 2>/dev/null || true
-    make debug || log_warn "IOL-HAT build failed (may need hardware)"
+    # Release build: the debug build's per-cycle logging through the log pipe
+    # stalled the IO-Link cycle thread in the field (see README "Flow Meter
+    # Disconnect Recovery"). start_iol_dashboard.sh rebuilds this on every
+    # source change, so this is only the first build.
+    make BUILD=release || log_warn "IOL-HAT build failed (may need hardware)"
 fi
 
 # Step 4: Configure hardware
