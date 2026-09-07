@@ -433,6 +433,11 @@ captured the same day. Changes:
   start script's supervisor relaunches it. Under 3 min of continuous 0.3–4 s stalls the link
   always came back within ~10 s of the stalls ending.
 
+- Single late device replies (seen ~1 per 12 h idle on the bench) no longer drop the link:
+  the retry reloads and re-sends the message (`PL_Resend` sent nothing), gets a 60 ms window,
+  and the retry counter resets on every good reply. The dashboard also gives all-zero reads the
+  same 5 s grace as stale data, so a ~1 s COMLOST/re-establish never pulses the pump-stop relay
+  (the meter's totalizer keeps counting through a link blip; no gallons are lost).
 - TCP fuzzing of the master's socket (random/malformed frames, half-open clients, connect
   storms, split sends) found and fixed three master-killing inputs: data commands addressed to
   the unallocated OFF port (null port in the stack), `CMD_PD_HISTORY` overflowing the reply
