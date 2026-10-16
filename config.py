@@ -52,6 +52,20 @@ RELAY_SLOWDOWN_ALARM_COLOR_B = "white"
 IOL_PORT = 2  # Flow meter on X1 (port 0)
 DATA_LENGTH = 15              # Expected data length from flow meter
 
+# =============================================================================
+# TANK-TEST LOGGER (MFP accuracy test) -- OFF BY DEFAULT
+# =============================================================================
+# Opt-in recorder of Picomag flow (from the flow-control thread, never a second
+# IO-Link session) + MFP CAN frames on one monotonic clock. See
+# docs/TANK_TEST_LOGGER.md. Can also be enabled for one run with the env var
+# BBB_TANK_TEST_LOGGER=1 (optional BBB_TANK_TEST_LABEL=<name>).
+TANK_TEST_LOGGER_ENABLED = False
+TANK_TEST_LOG_DIR = "/home/pi/tank_test_logs"
+TANK_TEST_CAN_INTERFACE = "socketcan"   # socketcan (gs_usb/candleLight) | slcan | gs_usb
+TANK_TEST_CAN_CHANNEL = "can0"          # slcan: e.g. "/dev/ttyACM0"
+TANK_TEST_CAN_BITRATE = 250000          # MFP bus: 250 kbit/s, 29-bit IDs
+TANK_TEST_MFP_SA = None                 # None = any MFP source address (bench probe is 0x10)
+
 # Flow meter monitoring thresholds
 FLOW_STOPPED_THRESHOLD = 0.25236     # L/s - 4 GPM: flow below this is not a fill event.
 #   The pump idles at 25-30 GPM and fills at ~80, so anything under 4 GPM is
