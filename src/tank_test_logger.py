@@ -152,8 +152,10 @@ class TankTestLogger:
         self._events.append((self.clock(), time.time(), "STOP"))
         self.running = False           # producers stop enqueuing now
         self._stop_evt.set()
+        # The writer drains the backlog before exiting; files are closed only
+        # after it has stopped (or after 10 s, when late writes are ignored).
         for t in self._threads:
-            t.join(timeout=3.0)
+            t.join(timeout=10.0)
         self._threads = []
         if self._own_bus and self._bus is not None:
             try:
@@ -218,7 +220,7 @@ class TankTestLogger:
             cid = f"{msg.arbitration_id:08X}" if ide else f"{msg.arbitration_id:03X}"
             try:
                 self._can_f.write(f"({wall:.6f}) {chan} {cid}#{data.hex().upper()}\n")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 self.error = f"can log write: {exc}"
             self.can_frames += 1
             if not ide:
@@ -255,7 +257,7 @@ class TankTestLogger:
                         threading.Thread(target=self.stop, daemon=True).start()
             while self._events:
                 self._write_event(*self._events.popleft())
-            while self._q:
+            while self._q and self._csv_f is not None and not self._csv_f.closed:
                 s = self._q.popleft()
                 if self.fresh_only and not s[3] and (s[0] - last_row_mono) < self.heartbeat_s:
                     continue
@@ -267,7 +269,7 @@ class TankTestLogger:
                 for f in (self._csv_f, self._can_f, self._mark_f):
                     try:
                         f.flush()
-                    except OSError as exc:
+                    except (OSError, ValueError) as exc:
                         self.error = f"flush: {exc}"
             if stopping and not self._q and not self._events:
                 return
@@ -287,7 +289,7 @@ class TankTestLogger:
             self._csv.writerow([row[k] for k in CSV_FIELDS])
             # candump comment-free: put a marker as a non-frame line is not valid
             # candump, so markers live in markers.txt + CSV only.
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self.error = f"event write: {exc}"
 
     def _write_sample(self, s):
@@ -326,7 +328,7 @@ class TankTestLogger:
         try:
             self._csv.writerow([row[k] for k in CSV_FIELDS])
             self.rows += 1
-        except OSError as exc:  # disk full etc.: stop writing, keep counting
+        except (OSError, ValueError) as exc:  # disk full etc.: stop writing, keep counting
             self.error = f"csv write: {exc}"
 
 
