@@ -144,3 +144,36 @@ def test_align_script(tmp_path):
     assert align.main([str(p), "--table", str(table), "--initial-gal", "100", "--out", str(tmp_path)]) == 0
     out = list(csv.DictReader(open(tmp_path / "align_error.csv")))
     assert abs(float(out[-1]["error_gal"]) - 0.02 * 290) < 0.05
+
+
+def test_build_table_monotonic(tmp_path):
+    import importlib.util
+    import random
+    spec = importlib.util.spec_from_file_location("align2", ROOT / "tools" / "tank_test_align.py")
+    align = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(align)
+    from src.tank_test_logger import CSV_FIELDS
+    rng = random.Random(3)
+    rows = []
+    for k in range(200):                     # 2 gal/s from empty; level = gal/10 + noise
+        g = 2.0 * k
+        r = {f: "" for f in CSV_FIELDS}
+        r.update(mono_s=float(k), totalizer_gal=g, level_in=g / 10 + rng.gauss(0, 0.05),
+                 level_age_s=0.0, level_seq=k % 256, mfp_status_text="OK|SG_DEFAULT")
+        rows.append(r)
+    rows[50]["mfp_status_text"] = "SENSOR_FAULT"
+    p = tmp_path / "flow_mfp.csv"
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    out = tmp_path / "table.csv"
+    assert align.main([str(p), "--build-table", str(out), "--bin-in", "1"]) == 0
+    t = list(csv.DictReader(open(out)))
+    gals = [float(x["gallons"]) for x in t]
+    lv = [float(x["level_in"]) for x in t]
+    assert gals == sorted(gals) and len(t) >= 35
+    for l, g in zip(lv, gals):
+        assert abs(g - 10 * l) < 3.0
+    # the built table is accepted as --table input
+    assert align.main([str(p), "--table", str(out), "--initial-gal", "0", "--out", str(tmp_path)]) == 0

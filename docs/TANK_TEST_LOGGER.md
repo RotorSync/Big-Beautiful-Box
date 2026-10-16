@@ -60,6 +60,13 @@ distance-from-top tables such as the Mopeka file. Each LEVEL frame (by `level_se
 is matched to the totalizer interpolated at the frame's receive time. The script
 writes `align_error.csv`, `align_summary.txt` and `align_error.png` (if matplotlib).
 
+### Building the tank table (first test: no table exists yet)
+    python3 tools/tank_test_align.py RUN/flow_mfp.csv --build-table tank.csv --initial-gal 0 --bin-in 0.5
+Start from a known volume (empty = 0), fill slowly, and log the whole fill. Each LEVEL frame's
+`level_in` is paired with the metered gallons at the same moment, then binned by level (median per
+bin). Gallons are forced to be non-decreasing. Frames without the status OK bit are skipped
+(override with `--allow-not-ok`). The output `level_in,gallons,n` can be passed as `--table` on later runs.
+
 ## PC acceptance / latency bench
     python3 tools/tank_test_bench.py --phase-s 30 --pairs 2 --interface virtual --channel bench
 The bench runs the real `flow_control_loop` / `read_flow_meter` source against a mock Picomag,
