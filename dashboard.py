@@ -506,6 +506,7 @@ override_enabled_time = 0  # Timestamp when override mode was last enabled
 iol_io_lock = threading.RLock()  # Single gate for direct IO-Link process-data calls
 flow_control_stop_event = threading.Event()
 flow_control_thread = None
+tank_test_logger = None  # opt-in MFP tank-test logger (config.TANK_TEST_LOGGER_ENABLED)
 flow_control_was_flowing = False
 flow_control_last_tick = None
 flow_control_last_loop_time = time.time()
@@ -6201,6 +6202,13 @@ def flow_control_loop():
             flow_control_last_loop_time = time.time()
             _record_flow_control_audit(loop_dt_ms, read_ok=True)
             _flow_control_process_sample(actual, time.time(), loop_dt_ms)
+            # Opt-in tank-test logger: AFTER the shutoff decision, O(1)
+            # non-blocking deque append; None (the default) costs one check.
+            if tank_test_logger is not None:
+                tank_test_logger.submit_flow(
+                    now_mono, time.time(), last_totalizer_liters, last_flow_rate,
+                    last_flow_meter_temp_f, last_flow_read_was_fresh,
+                )
         except Exception as exc:
             set_pump_stop_fault_hold(True, f"flow control read exception: {exc}")
             flow_control_last_loop_time = time.time()
@@ -9815,6 +9823,15 @@ else:
     green_button_thread = threading.Thread(target=green_button_monitor, daemon=True)
     green_button_thread.start()
 
+try:
+    from src.tank_test_logger import maybe_create_from_config as _tank_test_create
+    tank_test_logger = _tank_test_create(config)
+    if tank_test_logger is not None:
+        log_flow_control(f"tank_test_logger_start | dir={tank_test_logger.run_dir}")
+except Exception as _tank_test_exc:  # never let the test logger stop the box
+    tank_test_logger = None
+    print(f"tank test logger unavailable: {_tank_test_exc}", flush=True)
+
 start_flow_control_thread()
 
 def daily_total_checker():
@@ -9891,6 +9908,11 @@ finally:
     flow_control_stop_event.set()
     if flow_control_thread and flow_control_thread.is_alive():
         flow_control_thread.join(timeout=1.0)
+    if tank_test_logger is not None:
+        try:
+            tank_test_logger.stop()
+        except Exception:
+            pass
     # Cleanup GPIO on exit
     if GPIO_AVAILABLE:
         GPIO.cleanup()
