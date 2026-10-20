@@ -852,13 +852,31 @@ def _history_named_field(parts, name):
     return ""
 
 
+flow_control_log_write_failures = 0
+_flow_control_log_last_error_report = 0.0
+
+
 def log_flow_control(message):
     """Append a timestamped flow-control event for shutoff timing audits."""
+    global flow_control_log_write_failures, _flow_control_log_last_error_report
     try:
         with open(config.FLOW_CONTROL_LOG_FILE, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        # Report (rate-limited) instead of silently dropping: a full disk or a
+        # read-only SD card must be visible in the journal.
+        flow_control_log_write_failures += 1
+        now = time.time()
+        if now - _flow_control_log_last_error_report >= 60:
+            _flow_control_log_last_error_report = now
+            try:
+                print(
+                    f"flow_control.log write failed ({flow_control_log_write_failures} total): {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
 
 
 def log_relay_event(message):
@@ -5717,7 +5735,7 @@ def iol_power_cycle():
                         print(f"IOL power-cycle: Device reconnected successfully", flush=True)
                         try:
                             iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
-                        except:
+                        except Exception:
                             pass
                         return
                 except Exception as e:
@@ -5837,7 +5855,7 @@ def read_flow_meter():
                 error_message = "Device not responding (all-zero data)"
                 try:
                     iolhat.led(config.IOL_PORT, iolhat.LED_RED)
-                except:
+                except Exception:
                     pass
                 _try_iol_power_cycle()
                 return last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -5893,7 +5911,7 @@ def read_flow_meter():
                             _log_iol_disconnect_status("stale data")
                             try:
                                 iolhat.led(config.IOL_PORT, iolhat.LED_RED)
-                            except:
+                            except Exception:
                                 pass
                         _try_iol_power_cycle()
                         return last_totalizer_liters * config.LITERS_TO_GALLONS
@@ -5923,7 +5941,7 @@ def read_flow_meter():
             if connection_error:
                 try:
                     iolhat.led(config.IOL_PORT, iolhat.LED_GREEN)
-                except:
+                except Exception:
                     pass
             connection_error = False
             error_message = ""
@@ -6222,6 +6240,36 @@ def flow_control_loop():
     log_flow_control("thread_stop")
 
 
+def _flow_control_supervised():
+    """Run flow_control_loop and restart it if it ever dies.
+
+    flow_control_loop only catches Exception per tick; anything escaping it
+    used to end the pump-shutoff thread silently. Log the traceback, latch the
+    pump-stop fault hold (safe state while shutoff timing is not running) and
+    restart with backoff until the stop event is set."""
+    backoff = 0.5
+    while not flow_control_stop_event.is_set():
+        started = time.monotonic()
+        try:
+            flow_control_loop()
+            return
+        except BaseException as exc:  # noqa: BLE001 - supervisor must see everything
+            detail = traceback.format_exc()
+            log_flow_control(f"thread_crash | {exc!r} | restarting in {backoff:.1f}s")
+            try:
+                print(f"flow-control thread crashed:\n{detail}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
+            try:
+                set_pump_stop_fault_hold(True, f"flow control thread crashed: {exc!r}")
+            except Exception:
+                pass
+        if time.monotonic() - started > 60:
+            backoff = 0.5
+        flow_control_stop_event.wait(backoff)
+        backoff = min(backoff * 2, 5.0)
+
+
 def start_flow_control_thread():
     """Start the dedicated flow-control loop when configured."""
     global flow_control_thread
@@ -6234,7 +6282,7 @@ def start_flow_control_thread():
 
     flow_control_stop_event.clear()
     flow_control_thread = threading.Thread(
-        target=flow_control_loop,
+        target=_flow_control_supervised,
         name="flow-control",
         daemon=True,
     )
