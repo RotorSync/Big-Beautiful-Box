@@ -1372,6 +1372,28 @@ async def run_dashboard_io(fn, *args):
     )
 
 
+# Read-only poll commands run several times a second; logging every 1.5 KB
+# response filled the journal (300k lines / 3 days). Log those at most once per
+# DASHBOARD_POLL_LOG_INTERVAL seconds per verb; set ROTORSYNC_LOG_POLLS=1 to log all.
+DASHBOARD_POLL_VERBS = frozenset({'STATE_JSON', 'HISTORY'})
+DASHBOARD_POLL_LOG_INTERVAL = 300.0
+_LOG_ALL_DASHBOARD_POLLS = os.environ.get('ROTORSYNC_LOG_POLLS') == '1'
+_last_poll_log_at = {}
+
+
+def _log_dashboard_command(cmd, response, now=None):
+    verb = str(cmd).split(' ', 1)[0].strip().upper()
+    if verb in DASHBOARD_POLL_VERBS and not _LOG_ALL_DASHBOARD_POLLS:
+        now = time.time() if now is None else now
+        if now - _last_poll_log_at.get(verb, 0.0) < DASHBOARD_POLL_LOG_INTERVAL:
+            return False
+        _last_poll_log_at[verb] = now
+        print(f"Dashboard command: {verb} -> ({len(response or '')} bytes, poll log rate-limited)", flush=True)
+        return True
+    print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
+    return True
+
+
 def send_dashboard_command(cmd):
     """Send command to dashboard via socket"""
     global dashboard_ready, last_dashboard_error_log, last_dashboard_error_message
@@ -1382,7 +1404,7 @@ def send_dashboard_command(cmd):
             s.send(f'{cmd}\n'.encode())
             response = s.recv(4096).decode().strip()
             dashboard_ready = True
-            print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
+            _log_dashboard_command(cmd, response)
             return response
     except Exception as e:
         dashboard_ready = False
