@@ -383,3 +383,31 @@ def test_read_gatt_connection_state_returns_fresh_count_and_timestamp(
     monkeypatch.setattr(rotorsync_watchdog, 'GATT_CONNECTION_STATE_FILE', path)
 
     assert rotorsync_watchdog.read_gatt_connection_state(100) == (1, 101.5)
+
+
+def test_idle_without_client_is_healthy_when_no_ipad_and_no_self_scan():
+    assert rotorsync_watchdog.idle_without_client(100, None, None, 0) is True
+    assert rotorsync_watchdog.idle_without_client(100, 50, None, None) is True
+
+
+def test_idle_without_client_false_when_evidence_exists():
+    assert rotorsync_watchdog.idle_without_client(100, 150, None, 0) is False
+    assert rotorsync_watchdog.idle_without_client(100, None, 150, 0) is False
+    assert rotorsync_watchdog.idle_without_client(100, None, None, 1) is False
+    assert rotorsync_watchdog.idle_without_client(None, None, None, 0) is False
+
+
+def test_stale_recovery_backoff_doubles_and_caps():
+    b = rotorsync_watchdog.next_stale_recovery_backoff(0)
+    assert b == 300
+    seq = [b]
+    for _ in range(6):
+        b = rotorsync_watchdog.next_stale_recovery_backoff(b)
+        seq.append(b)
+    assert seq[:5] == [300, 600, 1200, 2400, 3600] and max(seq) == 3600
+
+
+def test_watchdog_unit_uses_wants_not_requires():
+    from pathlib import Path
+    unit = (Path(__file__).resolve().parents[1] / 'rotorsync_watchdog.service').read_text()
+    assert 'Requires=rotorsync' not in unit and 'Wants=rotorsync.service' in unit
