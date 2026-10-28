@@ -19,7 +19,16 @@ NOISY_PATTERNS = (
     "CMD_PD",
     "Close socket",
     "Listen on port 12011",
+    # The release IOL master prints this once per second forever (~98% of
+    # iol_dashboard.log on sn018, ~5 MB/day of SD writes). A sample plus a
+    # repeat count per window keeps the diagnostic value.
+    "Cycle time chn #",
 )
+
+DIGITS_RE = re.compile(r"\d+")
+# Hard cap on distinct suppression buckets so a stream of only-noisy lines
+# with ever-changing content can never grow memory without bound.
+MAX_NOISY_KEYS = 64
 
 PREFIX_RE = re.compile(
     r"^\[(?P<ts>\d{2}:\d{2}:\d{2})\s+(?P<level>[A-Z]+)\]\s+"
@@ -130,7 +139,11 @@ def main() -> int:
                 emit(line)
                 continue
 
-            key = normalize(line)
+            # Bucket by shape, not exact digits: "Cycle time chn #1=12 ms"
+            # and "...=13 ms" are the same message.
+            key = DIGITS_RE.sub("#", normalize(line))
+            if key not in noisy_state and len(noisy_state) >= MAX_NOISY_KEYS:
+                flush_noisy(now=now)
             state = noisy_state.get(key)
             if state is None:
                 noisy_state[key] = {"sample": line, "count": 1, "first": now}
