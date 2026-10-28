@@ -92,15 +92,21 @@ def _load_config():
     """Load mopeka_config.json (bumble: load_config)."""
     try:
         return _load_config_strict()
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # Missing, torn, non-UTF-8 or non-object config: defaults, never a
+        # crashed config request.
         return {"box_mode": "fleet", "assigned_trailer": None, "trailer": None}
 
 
 def _save_config(cfg):
     """Write mopeka_config.json (bumble: save_config — json.dump indent=2)."""
     os.makedirs(os.path.dirname(config.MOPEKA_CONFIG_PATH), exist_ok=True)
-    with open(config.MOPEKA_CONFIG_PATH, "w") as f:
+    tmp_path = config.MOPEKA_CONFIG_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, config.MOPEKA_CONFIG_PATH)
 
 
 def _load_sensor_csv():
@@ -111,11 +117,14 @@ def _load_sensor_csv():
     """
     sensors = []
     try:
-        with open(config.SENSOR_CSV_PATH, "r", newline="") as f:
+        with open(config.SENSOR_CSV_PATH, "r", newline="", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f)
-            for _ in range(4):
-                next(reader)
-            header = next(reader)
+            # A truncated/empty file (torn write) must read as "no sensors",
+            # not raise StopIteration out of a BLE/WS handler.
+            preamble = [next(reader, None) for _ in range(5)]
+            header = preamble[-1]
+            if header is None:
+                return sensors
             current_man = ""
             for row in reader:
                 if not row or len(row) < 2 or not row[1].strip():

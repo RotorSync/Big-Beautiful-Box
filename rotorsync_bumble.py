@@ -4502,11 +4502,14 @@ def load_sensor_csv():
     Man column only on Front rows - carry forward for Back rows."""
     sensors = []
     try:
-        with open(SENSOR_CSV_PATH, 'r', newline='') as f:
+        with open(SENSOR_CSV_PATH, 'r', newline='', encoding='utf-8', errors='replace') as f:
             reader = csv.reader(f)
-            for _ in range(4):
-                next(reader)
-            header = next(reader)
+            # A truncated/empty file (torn write) must read as "no sensors",
+            # not raise StopIteration out of a BLE/WS handler.
+            preamble = [next(reader, None) for _ in range(5)]
+            header = preamble[-1]
+            if header is None:
+                return sensors
             current_man = ''
             for row in reader:
                 if not row or len(row) < 2 or not row[1].strip():
@@ -4647,22 +4650,36 @@ def reload_converter_if_calibration_changed(force=False):
 
 def load_config():
     """Load mopeka_config.json."""
+    # A torn/corrupt config (power loss mid-write, non-UTF-8 bytes, a JSON
+    # list) must fall back to defaults, never crash-loop the BLE bridge.
     try:
         with open(MOPEKA_CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {
-            'box_mode': 'fleet',
-            'assigned_trailer': None,
-            'trailer': None,
-        }
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            return cfg
+        print('mopeka_config.json is not a JSON object; using defaults', flush=True)
+    except FileNotFoundError:
+        pass
+    except (ValueError, OSError) as e:
+        print(f'mopeka_config.json unreadable ({type(e).__name__}); using defaults', flush=True)
+    return {
+        'box_mode': 'fleet',
+        'assigned_trailer': None,
+        'trailer': None,
+    }
 
 
 def save_config(cfg):
     """Write mopeka_config.json."""
     os.makedirs(os.path.dirname(MOPEKA_CONFIG_PATH), exist_ok=True)
-    with open(MOPEKA_CONFIG_PATH, 'w') as f:
+    # Atomic replace: a power cut mid-write must leave the old or the new
+    # config, never a torn file.
+    tmp_path = f'{MOPEKA_CONFIG_PATH}.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, MOPEKA_CONFIG_PATH)
 
 
 def _normalize_ble_mac(value):
@@ -6907,8 +6924,12 @@ async def main():
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     _log_maintenance_secret_status()
     ensure_cursor_control_setup()
-    # Initialize Mopeka gallon converter
-    mopeka_init()
+    # Initialize Mopeka gallon converter. A corrupt calibration CSV must
+    # degrade tank readings, not crash-loop the whole GATT bridge.
+    try:
+        mopeka_init()
+    except Exception as e:
+        print(f'mopeka_converter init failed: {type(e).__name__}: {e}', flush=True)
     reload_converter_if_calibration_changed(force=True)
 
     # Restore adapter config from last session
