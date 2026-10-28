@@ -6884,12 +6884,12 @@ def socket_command_listener():
                             if line == "STATUS":
                                 actual = last_totalizer_liters * config.LITERS_TO_GALLONS
                                 response = f"REQ:{requested_gallons:.1f}|ACT:{actual:.1f}|MODE:{current_mode}\n"
-                                client.send(response.encode())
+                                client.sendall(response.encode())
                                 continue
 
                             if line == "STATE_JSON":
                                 snapshot = _build_dashboard_state_snapshot()
-                                client.send(
+                                client.sendall(
                                     f"STATE_JSON:{json.dumps(snapshot, separators=(',', ':'))}\n".encode()
                                 )
                                 continue
@@ -6909,7 +6909,7 @@ def socket_command_listener():
                                     payload["fc"] = flow_fault_code
                                     if flow_fault_reason:
                                         payload["fmr"] = flow_fault_reason
-                                client.send(
+                                client.sendall(
                                     f"LIVE:{json.dumps(payload, separators=(',', ':'))}\n".encode()
                                 )
                                 continue
@@ -6922,13 +6922,13 @@ def socket_command_listener():
                                 # with sensor applies.  OK means the command has
                                 # run; ERROR makes RotorLink abort/roll back.
                                 command_applied = _run_trailer_sensor_identity_command(line)
-                                client.send(b"OK\n" if command_applied else b"ERROR\n")
+                                client.sendall(b"OK\n" if command_applied else b"ERROR\n")
                                 continue
 
                             elif line == "ACCEPT_PENDING_CURVE":
                                 ok, payload = accept_pending_flow_curve("Socket")
                                 prefix = "CURVE_ACCEPTED" if ok else "CURVE_ACCEPT_ERR"
-                                client.send(
+                                client.sendall(
                                     f"{prefix}:{json.dumps(payload, separators=(',', ':'))}\n".encode()
                                 )
                                 continue
@@ -6943,39 +6943,39 @@ def socket_command_listener():
                                 try:
                                     cal_params = json.loads(line[len("CAL_START:"):])
                                 except Exception as ce:
-                                    client.send(f"CAL_ERR:invalid params: {ce}\n".encode())
+                                    client.sendall(f"CAL_ERR:invalid params: {ce}\n".encode())
                                     continue
                                 ok, cal_err = start_tank_calibration_remote(cal_params)
-                                client.send((f"CAL_OK\n" if ok else f"CAL_ERR:{cal_err}\n").encode())
+                                client.sendall((f"CAL_OK\n" if ok else f"CAL_ERR:{cal_err}\n").encode())
                                 continue
 
                             elif line == "CAL_CONFIRM":
                                 if calibration_mode:
                                     root.after(0, calibration_confirm)
-                                    client.send(b"CAL_OK\n")
+                                    client.sendall(b"CAL_OK\n")
                                 else:
-                                    client.send(b"CAL_ERR:not running\n")
+                                    client.sendall(b"CAL_ERR:not running\n")
                                 continue
 
                             elif line == "CAL_CANCEL":
                                 if calibration_mode:
                                     root.after(0, calibration_cancel)
-                                    client.send(b"CAL_OK\n")
+                                    client.sendall(b"CAL_OK\n")
                                 else:
-                                    client.send(b"CAL_ERR:not running\n")
+                                    client.sendall(b"CAL_ERR:not running\n")
                                 continue
 
                             elif line.startswith("CAL_ADJUST:"):
                                 try:
                                     cal_delta = int(line[len("CAL_ADJUST:"):])
                                 except ValueError:
-                                    client.send(b"CAL_ERR:invalid delta\n")
+                                    client.sendall(b"CAL_ERR:invalid delta\n")
                                     continue
                                 if calibration_mode:
                                     root.after(0, lambda d=cal_delta: calibration_adjust_value(d))
-                                    client.send(b"CAL_OK\n")
+                                    client.sendall(b"CAL_OK\n")
                                 else:
-                                    client.send(b"CAL_ERR:not running\n")
+                                    client.sendall(b"CAL_ERR:not running\n")
                                 continue
 
                             elif line == "TU":
@@ -6984,37 +6984,37 @@ def socket_command_listener():
                             elif line.startswith("PILOT_CONNECTED:"):
                                 pilot_name = line[len("PILOT_CONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_pilot_status(True, n))
-                                client.send(b"PILOT_OK\n")
+                                client.sendall(b"PILOT_OK\n")
                                 continue
 
                             elif line.startswith("PILOT_DISCONNECTED:"):
                                 pilot_name = line[len("PILOT_DISCONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_pilot_status(False, n))
-                                client.send(b"PILOT_OK\n")
+                                client.sendall(b"PILOT_OK\n")
                                 continue
 
                             elif line.startswith("WIFI_PILOT_CONNECTED:"):
                                 pilot_name = line[len("WIFI_PILOT_CONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_wifi_pilot_status(True, n))
-                                client.send(b"PILOT_OK\n")
+                                client.sendall(b"PILOT_OK\n")
                                 continue
 
                             elif line.startswith("WIFI_PILOT_DISCONNECTED:"):
                                 pilot_name = line[len("WIFI_PILOT_DISCONNECTED:"):].strip()
                                 root.after(0, lambda n=pilot_name: update_wifi_pilot_status(False, n))
-                                client.send(b"PILOT_OK\n")
+                                client.sendall(b"PILOT_OK\n")
                                 continue
 
                             elif line.startswith("PILOT_LOC:"):
                                 loc_payload = line[len("PILOT_LOC:"):].strip()
                                 root.after(0, lambda p=loc_payload: update_pilot_loc("ble", p))
-                                client.send(b"LOC_OK\n")
+                                client.sendall(b"LOC_OK\n")
                                 continue
 
                             elif line.startswith("WIFI_PILOT_LOC:"):
                                 loc_payload = line[len("WIFI_PILOT_LOC:"):].strip()
                                 root.after(0, lambda p=loc_payload: update_pilot_loc("wifi", p))
-                                client.send(b"LOC_OK\n")
+                                client.sendall(b"LOC_OK\n")
                                 continue
 
                             elif line == "FILL":
@@ -7025,13 +7025,13 @@ def socket_command_listener():
                                 print(msg)
                                 append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 if update_mode:
-                                    client.send(b"UPDATE_ALREADY_RUNNING\n")
+                                    client.sendall(b"UPDATE_ALREADY_RUNNING\n")
                                 else:
                                     # Same entry point as the box menu's SYSTEM
                                     # UPDATE — fullscreen progress on the box
                                     # screen, services restart at the end.
                                     root.after(0, run_system_update)
-                                    client.send(b"UPDATE_STARTED\n")
+                                    client.sendall(b"UPDATE_STARTED\n")
                                 continue
 
                             elif line == "REBOOT":
@@ -7063,35 +7063,35 @@ def socket_command_listener():
                                         str(ssid or '').strip(), str(password or '')
                                     )
                                     if validation_error is not None:
-                                        client.send(f"WIFI_ERR:{json.dumps(validation_error, separators=(',', ':'))}\n".encode())
+                                        client.sendall(f"WIFI_ERR:{json.dumps(validation_error, separators=(',', ':'))}\n".encode())
                                         continue
                                     result = _wifi_async.request_connect(ssid, password, hidden)
                                     if result.get('ok'):
-                                        client.send(f"WIFI_OK:{json.dumps(result, separators=(',', ':'))}\n".encode())
+                                        client.sendall(f"WIFI_OK:{json.dumps(result, separators=(',', ':'))}\n".encode())
                                     else:
                                         err_payload = {
                                             'code': result.get('code', 'NMCLI_ERROR'),
                                             'message': result.get('message', ''),
                                         }
-                                        client.send(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
+                                        client.sendall(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
                                     continue
                                 except Exception as we:
                                     err_payload = {'code': 'NMCLI_ERROR', 'message': str(we)}
-                                    client.send(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
+                                    client.sendall(f"WIFI_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
                                     continue
 
                             elif line == "WIFI_STATUS":
                                 status = _wifi_async.status()
-                                client.send(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
+                                client.sendall(f"WIFI_STATUS:{json.dumps(status, separators=(',', ':'))}\n".encode())
                                 continue
 
                             elif line.startswith("MOUSE:"):
                                 payload = line[6:]
                                 ok, mouse_message = handle_mouse_command(payload)
                                 if ok:
-                                    client.send(b"MOUSE_OK\n")
+                                    client.sendall(b"MOUSE_OK\n")
                                 else:
-                                    client.send(f"MOUSE_ERR:{mouse_message}\n".encode())
+                                    client.sendall(f"MOUSE_ERR:{mouse_message}\n".encode())
                                 continue
 
                             elif line.startswith("BATCHMIX_ERROR:"):
@@ -7250,18 +7250,18 @@ def socket_command_listener():
                                                     f"{minute_token},{req_token},{act_token},{shutoff_token},{temp_token},{stop_to_thumb_token}"
                                                 )
                                         history_response = "H2:" + ";".join(history_items)
-                                        client.send(f"HIST:{history_response}\n".encode())
+                                        client.sendall(f"HIST:{history_response}\n".encode())
                                 except Exception:
-                                    client.send(b"HIST:\n")
+                                    client.sendall(b"HIST:\n")
                                 continue
 
                             elif line.startswith("SET_REQUESTED_GALLONS:"):
                                 value = line.split(":", 1)[1].strip()
                                 ok, result = set_requested_gallons(value, "Socket")
                                 if ok:
-                                    client.send(f"SET_REQUESTED_GALLONS_OK:{float(result):.3f}\n".encode())
+                                    client.sendall(f"SET_REQUESTED_GALLONS_OK:{float(result):.3f}\n".encode())
                                 else:
-                                    client.send(f"SET_REQUESTED_GALLONS_ERR:{result}\n".encode())
+                                    client.sendall(f"SET_REQUESTED_GALLONS_ERR:{result}\n".encode())
                                 continue
 
                             elif line in ['+1', '-1', '+10', '-10']:
@@ -7400,7 +7400,7 @@ def socket_command_listener():
                                     print(msg)
                                     append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
-                            client.send(b"OK\n")
+                            client.sendall(b"OK\n")
                 except sock_module.timeout:
                     pass
                 finally:
