@@ -235,6 +235,8 @@ dashboard_status = {
     'last_update': 0
 }
 
+# time.monotonic() stamp: wall-clock jumps (NTP sync after an RTC-less boot)
+# must never look like a stalled sensor loop and force a BLE bridge restart.
 sensor_loop_heartbeat = 0.0
 calibration_mtime_snapshot = None
 last_calibration_reload_check = 0.0
@@ -6716,7 +6718,7 @@ async def read_sensors(sensor_device, sensor_adapter):
     mopeka_disabled_announced = False
 
     while True:
-        sensor_loop_heartbeat = time.time()
+        sensor_loop_heartbeat = time.monotonic()
         cycle_count += 1
         current_time = time.time()
         reload_converter_if_calibration_changed()
@@ -6792,7 +6794,7 @@ async def read_sensors(sensor_device, sensor_adapter):
                 submit_dashboard_io(send_dashboard_command, 'MOPEKA_DISABLED')
                 mopeka_disabled_announced = True
 
-        sensor_loop_heartbeat = time.time()
+        sensor_loop_heartbeat = time.monotonic()
         if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
             bms_defer_reason = gatt_sensor_defer_reason('bms', now=time.time())
             if bms_defer_reason:
@@ -6860,7 +6862,7 @@ async def monitor_sensor_health(sensor_task):
         if sensor_loop_heartbeat == 0:
             continue
 
-        stale_for = time.time() - sensor_loop_heartbeat
+        stale_for = time.monotonic() - sensor_loop_heartbeat
         if stale_for > SENSOR_LOOP_HEARTBEAT_TIMEOUT:
             log_watchdog_event(
                 f'Sensor loop heartbeat stale for {stale_for:.0f}s; exiting for restart'
