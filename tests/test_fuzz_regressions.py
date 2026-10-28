@@ -96,3 +96,19 @@ def test_maintenance_decode_frame_non_utf8():
         mp.decode_frame(b"\x8a")
     with pytest.raises(mp.MaintenanceProtocolError):
         mp.decode_frame("x" * (mp.MAX_FRAME_BYTES + 1))
+
+
+def test_serial_buffer_is_bounded():
+    import ast
+    src = (HERE.parent / "dashboard.py").read_text()
+    tree = ast.parse(src)
+    keep = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == "bound_serial_buffer")
+            or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "SERIAL_LINE_BUFFER_MAX_CHARS")]
+    ns = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=keep, type_ignores=[])), "dashboard.py", "exec"), ns)
+    buf = ""
+    for _ in range(10000):
+        buf, _dropped = ns["bound_serial_buffer"](buf + "\x00garbage")
+    assert len(buf) <= ns["SERIAL_LINE_BUFFER_MAX_CHARS"]
+    assert ns["bound_serial_buffer"]("PS") == ("PS", 0)
+    assert "bound_serial_buffer(buffer)" in src

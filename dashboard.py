@@ -243,6 +243,18 @@ button_logger = get_button_logger()
 relay_logger = get_relay_logger()
 
 
+SERIAL_LINE_BUFFER_MAX_CHARS = 512
+
+
+def bound_serial_buffer(buffer, limit=SERIAL_LINE_BUFFER_MAX_CHARS):
+    """Cap the unterminated serial tail. Switch-box commands are a few chars;
+    line noise / a wrong baud with no newline used to grow this buffer (and
+    the per-chunk debug log line that echoes it) without bound."""
+    if len(buffer) <= limit:
+        return buffer, 0
+    return buffer[-limit:], len(buffer) - limit
+
+
 def log_serial_debug(message):
     """Append a timestamped message to the serial debug log."""
     try:
@@ -7460,6 +7472,9 @@ def serial_listener():
                     # Decode and add to buffer
                     chunk = raw_bytes.decode('utf-8', errors='ignore')
                     buffer += chunk
+                    buffer, dropped = bound_serial_buffer(buffer)
+                    if dropped:
+                        log_serial_debug(f"Serial buffer overflow: dropped {dropped} chars without a line ending")
                     log_serial_debug(f"Decoded: '{chunk}' | Buffer now: '{buffer}'")
 
                     # Process complete lines (ending with \n or \r)
