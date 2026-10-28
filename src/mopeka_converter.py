@@ -38,14 +38,14 @@ _data_dir = None
 
 def _read_calibration_table(calibration_csv_path):
     table = []
-    with open(calibration_csv_path, 'r') as f:
+    with open(calibration_csv_path, 'r', encoding='utf-8', errors='replace') as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
                 inches_from_top = float(row['Tank Level (in)'])
                 gallons = float(row['Gallons'])
                 table.append((inches_from_top, gallons))
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue
 
     table.sort(key=lambda x: x[0], reverse=True)
@@ -150,6 +150,12 @@ def load_calibration_profiles(data_dir):
         print(f'Loaded {len(_calibration_profiles)} calibration profiles', flush=True)
 
 
+def _cell(row, key):
+    """Stripped CSV cell; short rows give None from DictReader."""
+    value = row.get(key)
+    return value.strip() if isinstance(value, str) else ''
+
+
 def load_sensor_offsets(sensor_csv_path):
     """Load per-sensor height offsets from CSV.
 
@@ -161,7 +167,7 @@ def load_sensor_offsets(sensor_csv_path):
     global _sensor_offsets
     _sensor_offsets = {}
 
-    with open(sensor_csv_path, 'r') as f:
+    with open(sensor_csv_path, 'r', encoding='utf-8', errors='replace') as f:
         # Skip blank rows at top of file
         lines = f.readlines()
         # Find the header row (first row with 'Mopeka ID' in it)
@@ -175,8 +181,8 @@ def load_sensor_offsets(sensor_csv_path):
         reader = csv.DictReader(io.StringIO(''.join(lines[header_idx:])))
         for row in reader:
             try:
-                mac_suffix = row.get('Mopeka ID', '').strip()
-                offset_str = row.get('Height Offset', '').strip()
+                mac_suffix = _cell(row, 'Mopeka ID')
+                offset_str = _cell(row, 'Height Offset')
                 if mac_suffix and offset_str and mac_suffix != '---------------':
                     _sensor_offsets[mac_suffix.upper()] = float(offset_str)
             except (ValueError, KeyError):
@@ -205,7 +211,7 @@ def load_sensor_calibration_profiles(sensor_csv_path, config=None):
     _add_sensor_profile(back_id, _profile_key_for(mode, trailer, 'back'))
 
     try:
-        with open(sensor_csv_path, 'r') as f:
+        with open(sensor_csv_path, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
     except FileNotFoundError:
         return
@@ -219,9 +225,9 @@ def load_sensor_calibration_profiles(sensor_csv_path, config=None):
     import io
     reader = csv.DictReader(io.StringIO(''.join(lines[header_idx:])))
     for row in reader:
-        sensor_id = row.get('Mopeka ID', '').strip()
-        tank = _normalize_tank_name(row.get('Tank', ''))
-        trailer_num = row.get('Trailer', '').strip()
+        sensor_id = _cell(row, 'Mopeka ID')
+        tank = _normalize_tank_name(_cell(row, 'Tank'))
+        trailer_num = _cell(row, 'Trailer')
         if mode == 'customer' and sensor_id.upper() in manual_sensor_ids:
             continue
         if sensor_id and tank and trailer_num:
@@ -363,7 +369,7 @@ def init(data_dir=None, ble_mac_mapping=None):
     if os.path.exists(config_path):
         import json
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                 config = json.load(f)
         except Exception as e:
             print(f'WARNING: Failed to load mopeka config: {e}', flush=True)
@@ -403,7 +409,7 @@ def reload():
         if os.path.exists(config_path):
             import json
             try:
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                     config = json.load(f)
             except Exception as e:
                 print(f'WARNING: Failed to load mopeka config: {e}', flush=True)
