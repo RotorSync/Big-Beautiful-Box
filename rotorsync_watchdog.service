@@ -1,7 +1,9 @@
 [Unit]
 Description=Rotorsync BLE Watchdog
 After=rotorsync.service
-Requires=rotorsync.service
+# Wants=, not Requires=: the watchdog restarts rotorsync itself, and Requires=
+# made that restart kill the watchdog mid-command.
+Wants=rotorsync.service
 
 [Service]
 Type=simple

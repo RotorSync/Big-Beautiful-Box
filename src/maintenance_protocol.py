@@ -106,7 +106,12 @@ def decode_frame(data: bytes | str) -> dict[str, Any]:
     if isinstance(data, bytes):
         if len(data) > MAX_FRAME_BYTES:
             raise MaintenanceProtocolError(f"maintenance frame exceeds {MAX_FRAME_BYTES} bytes")
-        data = data.decode("utf-8")
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MaintenanceProtocolError("maintenance frame is not UTF-8") from exc
+    elif len(data) > MAX_FRAME_BYTES:
+        raise MaintenanceProtocolError(f"maintenance frame exceeds {MAX_FRAME_BYTES} bytes")
 
     try:
         frame = json.loads(data)

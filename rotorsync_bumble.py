@@ -193,6 +193,7 @@ MAINTENANCE_RUNTIME_PATHS = (
     'dashboard.py',
     'rotorsync_bumble.py',
     'rotorsync_watchdog.py',
+    'rotorsync_watchdog.service',
     'start_iol_dashboard.sh',
     'VERSION',
     'config.py',
@@ -208,11 +209,6 @@ MAINTENANCE_SECRET_PATHS = (
 )
 MAINTENANCE_DEVELOPMENT_SECRET = b'rotorsync-development-maintenance-secret'
 MAINTENANCE_USER_SECRET_PATH = '/home/pi/.rotorsync-maintenance-secret'
-MAINTENANCE_FRAME_SECRET_FIELDS = (
-    'maintenance_secret_b64',
-    'relay_secret_b64',
-    'bbb_maintenance_secret_b64',
-)
 CURSOR_CONTROL_SETUP_SCRIPT = '/home/pi/Big-Beautiful-Box/deploy/setup-cursor-control.sh'
 
 def _new_sensor_data_cache():
@@ -240,6 +236,8 @@ dashboard_status = {
     'last_update': 0
 }
 
+# time.monotonic() stamp: wall-clock jumps (NTP sync after an RTC-less boot)
+# must never look like a stalled sensor loop and force a BLE bridge restart.
 sensor_loop_heartbeat = 0.0
 calibration_mtime_snapshot = None
 last_calibration_reload_check = 0.0
@@ -1372,6 +1370,28 @@ async def run_dashboard_io(fn, *args):
     )
 
 
+# Read-only poll commands run several times a second; logging every 1.5 KB
+# response filled the journal (300k lines / 3 days). Log those at most once per
+# DASHBOARD_POLL_LOG_INTERVAL seconds per verb; set ROTORSYNC_LOG_POLLS=1 to log all.
+DASHBOARD_POLL_VERBS = frozenset({'STATE_JSON', 'HISTORY'})
+DASHBOARD_POLL_LOG_INTERVAL = 300.0
+_LOG_ALL_DASHBOARD_POLLS = os.environ.get('ROTORSYNC_LOG_POLLS') == '1'
+_last_poll_log_at = {}
+
+
+def _log_dashboard_command(cmd, response, now=None):
+    verb = str(cmd).split(' ', 1)[0].strip().upper()
+    if verb in DASHBOARD_POLL_VERBS and not _LOG_ALL_DASHBOARD_POLLS:
+        now = time.time() if now is None else now
+        if now - _last_poll_log_at.get(verb, 0.0) < DASHBOARD_POLL_LOG_INTERVAL:
+            return False
+        _last_poll_log_at[verb] = now
+        print(f"Dashboard command: {verb} -> ({len(response or '')} bytes, poll log rate-limited)", flush=True)
+        return True
+    print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
+    return True
+
+
 def send_dashboard_command(cmd):
     """Send command to dashboard via socket"""
     global dashboard_ready, last_dashboard_error_log, last_dashboard_error_message
@@ -1382,7 +1402,7 @@ def send_dashboard_command(cmd):
             s.send(f'{cmd}\n'.encode())
             response = s.recv(4096).decode().strip()
             dashboard_ready = True
-            print(f"Dashboard command: {_redact_dashboard_command(cmd)} -> {response}", flush=True)
+            _log_dashboard_command(cmd, response)
             return response
     except Exception as e:
         dashboard_ready = False
@@ -3163,8 +3183,9 @@ def _log_maintenance_secret_status():
     source, _secret = _maintenance_secret_source()
     if source == 'development-default':
         print(
-            'WARNING: maintenance relay secret missing; admin maintenance frames '
-            'signed with the fleet secret will be rejected',
+            'SECURITY WARNING: maintenance relay secret missing; falling back to the '
+            'PUBLIC development-default secret. Frames signed with the fleet secret '
+            'will be rejected. Provision /etc/rotorsync/maintenance.secret (0600 root).',
             flush=True,
         )
     else:
@@ -3197,38 +3218,6 @@ def ensure_cursor_control_setup():
         print(f'Cursor control setup ok: {output or "no output"}', flush=True)
     else:
         print(f'Cursor control setup failed ({result.returncode}): {output[:240]}', flush=True)
-
-
-def _frame_maintenance_secret(frame):
-    for key in MAINTENANCE_FRAME_SECRET_FIELDS:
-        value = frame.get(key)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        try:
-            secret = base64.b64decode(value.strip(), validate=True)
-        except Exception as e:
-            raise ValueError('invalid maintenance secret bootstrap') from e
-        secret = secret.strip()
-        if len(secret) < 32 or len(secret) > 4096:
-            raise ValueError('invalid maintenance secret bootstrap length')
-        return secret
-    return None
-
-
-def _install_maintenance_secret(secret):
-    source, _existing = _provisioned_maintenance_secret_source()
-    if source:
-        return False
-
-    path = Path(MAINTENANCE_USER_SECRET_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + '.tmp')
-    with open(tmp_path, 'wb') as f:
-        f.write(secret.strip() + b'\n')
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
-    print(f'Maintenance relay secret provisioned at {path}', flush=True)
-    return True
 
 
 def _canonical_maintenance_payload(frame):
@@ -3267,23 +3256,20 @@ def _verify_maintenance_frame(frame, now=None):
     if not isinstance(signature, str) or not signature:
         raise ValueError('missing frame signature')
 
+    # A secret carried inside the frame is never trusted or adopted: on an
+    # unprovisioned box that let anyone sign a frame with their own secret
+    # (root maintenance shell + admin lockout). Provision
+    # /etc/rotorsync/maintenance.secret instead.
     source, secret = _maintenance_secret_source()
     expected = _maintenance_frame_signature_with_secret(frame, secret)
-    if hmac.compare_digest(signature, expected):
-        pass
-    else:
-        bootstrap_secret = None
-        if source == 'development-default':
-            bootstrap_secret = _frame_maintenance_secret(frame)
-        if not bootstrap_secret:
-            raise ValueError('invalid frame signature')
-        expected = _maintenance_frame_signature_with_secret(frame, bootstrap_secret)
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError('invalid frame signature')
-        _install_maintenance_secret(bootstrap_secret)
-
     if not hmac.compare_digest(signature, expected):
         raise ValueError('invalid frame signature')
+    if source == 'development-default':
+        print(
+            'SECURITY WARNING: maintenance frame accepted with the PUBLIC '
+            'development-default secret; provision /etc/rotorsync/maintenance.secret',
+            flush=True,
+        )
 
     expires_at = frame.get('expires_at')
     if expires_at is not None:
@@ -3777,6 +3763,22 @@ def _refresh_opt_runtime(repo_root):
         _copy_path(src, dst)
 
 
+def _install_system_units(repo_root):
+    """Install the watchdog unit + journald cap the way install.sh does.
+
+    Best-effort: the script always exits 0 and any error here is only logged,
+    so it can never fail (and roll back) an otherwise good update."""
+    script = Path(repo_root) / 'deploy' / 'install-system-units.sh'
+    if not script.exists():
+        return
+    try:
+        r = subprocess.run(['bash', str(script)], capture_output=True, text=True, timeout=60)
+        for line in ((r.stdout or '') + (r.stderr or '')).splitlines():
+            print(line, flush=True)
+    except Exception as e:
+        print(f'install-system-units failed (ignored): {e}', flush=True)
+
+
 def _apply_tar_update(update_id, artifact_path):
     extract_dir = Path(MAINTENANCE_TMP_DIR) / update_id
     if extract_dir.exists():
@@ -3830,6 +3832,7 @@ def _apply_tar_update(update_id, artifact_path):
         _refresh_opt_runtime(repo)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
         subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
+        _install_system_units(repo)
     except Exception as apply_error:
         try:
             _restore_runtime_backup(backup_dir)
@@ -4517,11 +4520,14 @@ def load_sensor_csv():
     Man column only on Front rows - carry forward for Back rows."""
     sensors = []
     try:
-        with open(SENSOR_CSV_PATH, 'r', newline='') as f:
+        with open(SENSOR_CSV_PATH, 'r', newline='', encoding='utf-8', errors='replace') as f:
             reader = csv.reader(f)
-            for _ in range(4):
-                next(reader)
-            header = next(reader)
+            # A truncated/empty file (torn write) must read as "no sensors",
+            # not raise StopIteration out of a BLE/WS handler.
+            preamble = [next(reader, None) for _ in range(5)]
+            header = preamble[-1]
+            if header is None:
+                return sensors
             current_man = ''
             for row in reader:
                 if not row or len(row) < 2 or not row[1].strip():
@@ -4662,22 +4668,36 @@ def reload_converter_if_calibration_changed(force=False):
 
 def load_config():
     """Load mopeka_config.json."""
+    # A torn/corrupt config (power loss mid-write, non-UTF-8 bytes, a JSON
+    # list) must fall back to defaults, never crash-loop the BLE bridge.
     try:
         with open(MOPEKA_CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {
-            'box_mode': 'fleet',
-            'assigned_trailer': None,
-            'trailer': None,
-        }
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            return cfg
+        print('mopeka_config.json is not a JSON object; using defaults', flush=True)
+    except FileNotFoundError:
+        pass
+    except (ValueError, OSError) as e:
+        print(f'mopeka_config.json unreadable ({type(e).__name__}); using defaults', flush=True)
+    return {
+        'box_mode': 'fleet',
+        'assigned_trailer': None,
+        'trailer': None,
+    }
 
 
 def save_config(cfg):
     """Write mopeka_config.json."""
     os.makedirs(os.path.dirname(MOPEKA_CONFIG_PATH), exist_ok=True)
-    with open(MOPEKA_CONFIG_PATH, 'w') as f:
+    # Atomic replace: a power cut mid-write must leave the old or the new
+    # config, never a torn file.
+    tmp_path = f'{MOPEKA_CONFIG_PATH}.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, MOPEKA_CONFIG_PATH)
 
 
 def _normalize_ble_mac(value):
@@ -6733,7 +6753,7 @@ async def read_sensors(sensor_device, sensor_adapter):
     mopeka_disabled_announced = False
 
     while True:
-        sensor_loop_heartbeat = time.time()
+        sensor_loop_heartbeat = time.monotonic()
         cycle_count += 1
         current_time = time.time()
         reload_converter_if_calibration_changed()
@@ -6809,7 +6829,7 @@ async def read_sensors(sensor_device, sensor_adapter):
                 submit_dashboard_io(send_dashboard_command, 'MOPEKA_DISABLED')
                 mopeka_disabled_announced = True
 
-        sensor_loop_heartbeat = time.time()
+        sensor_loop_heartbeat = time.monotonic()
         if BMS_ENABLED and (cycle_count == 1 or cycle_count % BMS_READ_INTERVAL == 0):
             bms_defer_reason = gatt_sensor_defer_reason('bms', now=time.time())
             if bms_defer_reason:
@@ -6877,7 +6897,7 @@ async def monitor_sensor_health(sensor_task):
         if sensor_loop_heartbeat == 0:
             continue
 
-        stale_for = time.time() - sensor_loop_heartbeat
+        stale_for = time.monotonic() - sensor_loop_heartbeat
         if stale_for > SENSOR_LOOP_HEARTBEAT_TIMEOUT:
             log_watchdog_event(
                 f'Sensor loop heartbeat stale for {stale_for:.0f}s; exiting for restart'
@@ -6922,8 +6942,12 @@ async def main():
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     _log_maintenance_secret_status()
     ensure_cursor_control_setup()
-    # Initialize Mopeka gallon converter
-    mopeka_init()
+    # Initialize Mopeka gallon converter. A corrupt calibration CSV must
+    # degrade tank readings, not crash-loop the whole GATT bridge.
+    try:
+        mopeka_init()
+    except Exception as e:
+        print(f'mopeka_converter init failed: {type(e).__name__}: {e}', flush=True)
     reload_converter_if_calibration_changed(force=True)
 
     # Restore adapter config from last session

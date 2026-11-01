@@ -23,6 +23,9 @@ GATT_CONNECTED_DISCOVERABILITY_STALE_SECONDS = 75
 GATT_CONNECTED_CLIENT_DETAIL_STALE_SECONDS = 45
 GATT_CONNECTION_PROOF_STALE_SECONDS = 110
 GATT_STALE_RECOVERY_MIN_INTERVAL_SECONDS = 180
+# Exponential backoff between stale-advertising recovery restarts.
+STALE_RECOVERY_BACKOFF_INITIAL_SECONDS = 300
+STALE_RECOVERY_BACKOFF_MAX_SECONDS = 3600
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'
 GATT_DEVICE_PATH_FILE = Path('/home/pi/rotorsync_gatt_device_path')
 GATT_ADVERTISING_READY_FILE = Path('/home/pi/rotorsync_gatt_advertising_ready.json')
@@ -238,6 +241,29 @@ def stale_gatt_recovery_reason(
     return f'{stale_client_reason}; {stale_self_adv_reason}'
 
 
+def idle_without_client(advertising_started_at, client_seen_at, self_adv_seen_at, connection_count):
+    """True when nothing has connected yet this session and there is no
+    self-scan proof either way (e.g. no sensor adapter). That is the normal
+    "no iPad nearby" state, not an advertising wedge, so it must not trigger
+    a restart."""
+    if not advertising_started_at:
+        return False
+    if connection_count:
+        return False
+    if client_seen_at and client_seen_at >= advertising_started_at:
+        return False
+    if self_adv_seen_at and self_adv_seen_at >= advertising_started_at:
+        return False
+    return True
+
+
+def next_stale_recovery_backoff(current):
+    """Double the stale-recovery backoff, bounded to [initial, max]."""
+    if not current:
+        return STALE_RECOVERY_BACKOFF_INITIAL_SECONDS
+    return min(current * 2, STALE_RECOVERY_BACKOFF_MAX_SECONDS)
+
+
 def _connected_self_adv_stale_reason(now, advertising_started_at, self_adv_seen_at):
     if not advertising_started_at:
         return None
@@ -327,6 +353,8 @@ def main():
 
     consecutive_failures = 0
     last_stale_client_log_at = 0
+    last_idle_log_at = 0
+    stale_backoff = 0
     last_stale_recovery_restart_at = (
         read_timestamp_file(GATT_STALE_RECOVERY_RESTART_FILE) or 0
     )
@@ -393,6 +421,17 @@ def main():
                     self_adv_seen_at,
                     connection_payload,
                 )
+            if stale_recovery_reason and idle_without_client(
+                advertising_started_at, client_seen_at, self_adv_seen_at, connection_count
+            ):
+                if now - last_idle_log_at >= 600:
+                    logging.info('GATT idle: no iPad/client connected yet and no self-scan proof; healthy, not restarting')
+                    last_idle_log_at = now
+                stale_recovery_reason = None
+            if client_seen_at and advertising_started_at and client_seen_at >= advertising_started_at:
+                stale_backoff = 0
+            if stale_recovery_reason and stale_backoff and now - last_stale_recovery_restart_at < stale_backoff:
+                stale_recovery_reason = None
             recovery_reason = stale_recovery_reason or connected_discoverability_reason
             if (stale_client_reason or stale_self_adv_reason) and now - last_stale_client_log_at >= 60:
                 logging.info(
@@ -444,7 +483,10 @@ def main():
                 )
 
                 if hci_changed or consecutive_failures >= FAIL_THRESHOLD:
-                    if connected_discoverability_reason:
+                    if stale_recovery_reason and not (hci_changed or not service_ok or not adapter_ok):
+                        stale_backoff = next_stale_recovery_backoff(stale_backoff)
+                        logging.info(f'Stale recovery restart; next one no sooner than {stale_backoff}s')
+                    if connected_discoverability_reason or stale_recovery_reason:
                         last_stale_recovery_restart_at = now
                         write_timestamp_file(GATT_STALE_RECOVERY_RESTART_FILE, now)
                     restart_rotorsync()

@@ -75,7 +75,7 @@ def _maybe_prune(log_path):
     try:
         if os.path.getsize(log_path) <= LOG_MAX_BYTES:
             return
-        with open(log_path) as f:
+        with open(log_path, encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
         kept = lines[-LOG_KEEP_LINES:]
         tmp = log_path + '.tmp'
@@ -131,13 +131,21 @@ def read_log_since(since_ts, limit=500, log_path=LOG_PATH):
     """Events with ts > since_ts, oldest first, capped at limit."""
     items = []
     try:
-        with open(log_path) as f:
+        with open(log_path, encoding='utf-8', errors='replace') as f:
             for line in f:
+                # Skip (don't abort on) a torn/foreign line: one bad record
+                # used to make the whole connection log read back empty.
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                    if not isinstance(entry, dict):
+                        continue
+                    ts = float(entry.get('ts') or 0)
+                except (ValueError, TypeError):
                     continue
-                if float(entry.get('ts') or 0) > since_ts:
+                if ts != ts or ts in (float('inf'), float('-inf')):
+                    continue
+                if ts > since_ts:
+                    entry['ts'] = ts
                     items.append(entry)
     except FileNotFoundError:
         return []

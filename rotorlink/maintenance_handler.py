@@ -82,11 +82,6 @@ MAINTENANCE_SECRET_PATHS = (
 )
 MAINTENANCE_DEVELOPMENT_SECRET = b"rotorsync-development-maintenance-secret"
 MAINTENANCE_USER_SECRET_PATH = "/home/pi/.rotorsync-maintenance-secret"
-MAINTENANCE_FRAME_SECRET_FIELDS = (
-    "maintenance_secret_b64",
-    "relay_secret_b64",
-    "bbb_maintenance_secret_b64",
-)
 
 # The login shell runs here when the directory exists (same repo dir bumble uses
 # so `git`/`./install.sh` land in the right place), else the process cwd.
@@ -129,46 +124,12 @@ def log_maintenance_secret_status() -> None:
     source, _secret = _maintenance_secret_source()
     if source == "development-default":
         logger.warning(
-            "maintenance relay secret missing; admin maintenance frames signed "
-            "with the fleet secret will be rejected"
+            "SECURITY WARNING: maintenance relay secret missing; falling back to "
+            "the PUBLIC development-default secret. Frames signed with the fleet "
+            "secret will be rejected. Provision /etc/rotorsync/maintenance.secret"
         )
     else:
         logger.info("maintenance relay secret source: %s", source)
-
-
-def _frame_maintenance_secret(frame: dict) -> Optional[bytes]:
-    for key in MAINTENANCE_FRAME_SECRET_FIELDS:
-        value = frame.get(key)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        try:
-            secret = base64.b64decode(value.strip(), validate=True)
-        except Exception as e:  # noqa: BLE001 - match bumble's broad raise
-            raise ValueError("invalid maintenance secret bootstrap") from e
-        secret = secret.strip()
-        if len(secret) < 32 or len(secret) > 4096:
-            raise ValueError("invalid maintenance secret bootstrap length")
-        return secret
-    return None
-
-
-def _install_maintenance_secret(secret: bytes) -> bool:
-    source, _existing = _provisioned_maintenance_secret_source()
-    if source:
-        return False
-    try:
-        path = Path(MAINTENANCE_USER_SECRET_PATH)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(path.name + ".tmp")
-        with open(tmp_path, "wb") as f:
-            f.write(secret.strip() + b"\n")
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
-        logger.info("maintenance relay secret provisioned at %s", path)
-        return True
-    except OSError as e:
-        logger.warning("could not persist bootstrapped maintenance secret: %s", e)
-        return False
 
 
 def _canonical_maintenance_payload(frame: dict) -> bytes:
@@ -194,8 +155,8 @@ def verify_maintenance_frame(frame: dict, now: Optional[float] = None) -> None:
     """Raise ValueError unless `frame` carries a valid `sig` and is unexpired.
 
     Identical semantics to bumble's `_verify_maintenance_frame`: compare_digest
-    against the provisioned/dev secret; on a development-default box, fall back
-    to a frame-carried bootstrap secret and adopt it; enforce `expires_at`.
+    against the provisioned/dev secret only (frame-carried secrets are never
+    adopted); warn loudly on the dev secret; enforce `expires_at`.
     """
     import time
 
@@ -206,23 +167,16 @@ def verify_maintenance_frame(frame: dict, now: Optional[float] = None) -> None:
     if not isinstance(signature, str) or not signature:
         raise ValueError("missing frame signature")
 
+    # Never trust or adopt a secret carried inside the frame (see bumble).
     source, secret = _maintenance_secret_source()
     expected = _maintenance_frame_signature_with_secret(frame, secret)
-    if hmac.compare_digest(signature, expected):
-        pass
-    else:
-        bootstrap_secret = None
-        if source == "development-default":
-            bootstrap_secret = _frame_maintenance_secret(frame)
-        if not bootstrap_secret:
-            raise ValueError("invalid frame signature")
-        expected = _maintenance_frame_signature_with_secret(frame, bootstrap_secret)
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError("invalid frame signature")
-        _install_maintenance_secret(bootstrap_secret)
-
     if not hmac.compare_digest(signature, expected):
         raise ValueError("invalid frame signature")
+    if source == "development-default":
+        logger.warning(
+            "SECURITY WARNING: maintenance frame accepted with the PUBLIC "
+            "development-default secret; provision /etc/rotorsync/maintenance.secret"
+        )
 
     expires_at = frame.get("expires_at")
     if expires_at is not None:

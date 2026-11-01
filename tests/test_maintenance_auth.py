@@ -138,7 +138,7 @@ def test_rejects_expired_maintenance_frame(bumble_module):
         bumble_module._verify_maintenance_frame(frame)
 
 
-def test_bootstrap_secret_frame_provisions_unconfigured_trailer(monkeypatch, tmp_path):
+def test_frame_carried_secret_is_rejected_and_not_adopted(monkeypatch, tmp_path):
     monkeypatch.delenv('BBB_MAINTENANCE_SECRET', raising=False)
     monkeypatch.delenv('MAINTENANCE_RELAY_SECRET', raising=False)
     install_bumble_stubs(monkeypatch)
@@ -160,11 +160,32 @@ def test_bootstrap_secret_frame_provisions_unconfigured_trailer(monkeypatch, tmp
     }
     frame['sig'] = module._maintenance_frame_signature_with_secret(frame, new_secret)
 
-    module._verify_maintenance_frame(frame)
+    with pytest.raises(ValueError, match='invalid frame signature'):
+        module._verify_maintenance_frame(frame)
 
-    assert secret_path.read_bytes().strip() == new_secret
-    assert oct(secret_path.stat().st_mode & 0o777) == '0o600'
+    assert not secret_path.exists()
     sys.modules.pop('rotorsync_bumble', None)
+
+
+def test_rotorlink_rejects_frame_carried_secret(monkeypatch, tmp_path):
+    from rotorlink import maintenance_handler as mh
+    monkeypatch.delenv('BBB_MAINTENANCE_SECRET', raising=False)
+    monkeypatch.delenv('MAINTENANCE_RELAY_SECRET', raising=False)
+    secret_path = tmp_path / 'm.secret'
+    monkeypatch.setattr(mh, 'MAINTENANCE_SECRET_PATHS', (str(secret_path),))
+    monkeypatch.setattr(mh, 'MAINTENANCE_USER_SECRET_PATH', str(secret_path))
+    new_secret = b'y' * 64
+    frame = {'type': 'shell_open', 'session_id': 's',
+             'maintenance_secret_b64': base64.b64encode(new_secret).decode('ascii'),
+             'expires_at': time.time() + 60}
+    frame['sig'] = mh._maintenance_frame_signature_with_secret(frame, new_secret)
+    with pytest.raises(ValueError, match='invalid frame signature'):
+        mh.verify_maintenance_frame(frame)
+    assert not secret_path.exists()
+    # dev-secret frames still verify (with a loud warning) so unprovisioned boxes keep working
+    ok = {'type': 'shell_open', 'session_id': 's', 'expires_at': time.time() + 60}
+    ok['sig'] = mh._maintenance_frame_signature_with_secret(ok, mh.MAINTENANCE_DEVELOPMENT_SECRET)
+    mh.verify_maintenance_frame(ok)
 
 
 def test_bootstrap_secret_does_not_replace_existing_secret(bumble_module, monkeypatch, tmp_path):
