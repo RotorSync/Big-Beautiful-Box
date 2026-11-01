@@ -4651,6 +4651,9 @@ def run_system_update():
                 "python3 -m pip install --break-system-packages --ignore-installed bleak bumble==0.0.229 > /tmp/bbb-bumble-install.log 2>&1 || true; "
                 "mkdir -p /etc/rotorlink; [ -f /etc/rotorlink/ap.psk ] || printf 'rotorsync' > /etc/rotorlink/ap.psk; "
                 "cp /home/pi/Big-Beautiful-Box/systemd/rotorlink.service /etc/systemd/system/rotorlink.service; "
+                # Same watchdog unit + journald cap as install.sh. Idempotent and
+                # fail-soft (the script always exits 0), so it can't abort the update.
+                "bash /home/pi/Big-Beautiful-Box/deploy/install-system-units.sh || true; "
                 "systemctl daemon-reload; "
                 "systemctl enable --now rotorlink.service || true; "
                 "systemctl enable --now bbb-logrotate.timer; "

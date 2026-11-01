@@ -193,6 +193,7 @@ MAINTENANCE_RUNTIME_PATHS = (
     'dashboard.py',
     'rotorsync_bumble.py',
     'rotorsync_watchdog.py',
+    'rotorsync_watchdog.service',
     'start_iol_dashboard.sh',
     'VERSION',
     'config.py',
@@ -3762,6 +3763,22 @@ def _refresh_opt_runtime(repo_root):
         _copy_path(src, dst)
 
 
+def _install_system_units(repo_root):
+    """Install the watchdog unit + journald cap the way install.sh does.
+
+    Best-effort: the script always exits 0 and any error here is only logged,
+    so it can never fail (and roll back) an otherwise good update."""
+    script = Path(repo_root) / 'deploy' / 'install-system-units.sh'
+    if not script.exists():
+        return
+    try:
+        r = subprocess.run(['bash', str(script)], capture_output=True, text=True, timeout=60)
+        for line in ((r.stdout or '') + (r.stderr or '')).splitlines():
+            print(line, flush=True)
+    except Exception as e:
+        print(f'install-system-units failed (ignored): {e}', flush=True)
+
+
 def _apply_tar_update(update_id, artifact_path):
     extract_dir = Path(MAINTENANCE_TMP_DIR) / update_id
     if extract_dir.exists():
@@ -3815,6 +3832,7 @@ def _apply_tar_update(update_id, artifact_path):
         _refresh_opt_runtime(repo)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
         subprocess.run(['systemctl', 'enable', '--now', 'bbb-logrotate.timer'], capture_output=True, text=True, timeout=10)
+        _install_system_units(repo)
     except Exception as apply_error:
         try:
             _restore_runtime_backup(backup_dir)
