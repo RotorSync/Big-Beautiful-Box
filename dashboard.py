@@ -223,6 +223,7 @@ if SIM_MODE:
     config.FLOW_CONTROL_LOG_FILE = _pi_path(config.FLOW_CONTROL_LOG_FILE)
 
 from src import flow_curve
+from src import swbox_can
 FLOW_CURVE_OVERRIDE_PATH = _pi_path(config.FLOW_CURVE_OVERRIDE_FILE)
 FLOW_CURVE_SAMPLES_PATH = _pi_path(config.FLOW_CURVE_SAMPLES_FILE)
 FLOW_CURVE_PROPOSAL_PATH = _pi_path(config.FLOW_CURVE_PROPOSAL_FILE)
@@ -7414,6 +7415,439 @@ def _log_ov_diag(source):
             pass
 
 
+_switchbox_dispatch_lock = threading.RLock()
+
+
+def handle_switchbox_line(line, source="Serial"):
+    """Dispatch one switch box command token (V1.9 serial line or swbox r2 CAN
+    translation). Shared by serial_listener and can_switchbox_listener."""
+    global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
+    global fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_serial_ov_toggle_time, last_operator_input_ts
+    global override_enabled_time
+    debug_log = config.SERIAL_DEBUG_LOG
+    with _switchbox_dispatch_lock:
+        _handle_switchbox_line_locked(line, source, debug_log)
+
+
+def _handle_switchbox_line_locked(line, source, debug_log):
+    global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
+    global fill_requested_gallons, mix_requested_gallons, current_mode
+    global last_serial_ov_toggle_time, last_operator_input_ts
+    global override_enabled_time
+    # Update heartbeat if we receive OK message
+    if line == 'OK':
+        last_heartbeat_time = time.time()
+        log_serial_debug("Heartbeat received (OK)")
+        return  # Don't process OK as a command
+
+    # --- Phantom-OV diagnostics (event-driven; OV is rare) ---
+    if line == 'OV':
+        _log_ov_diag("Serial")
+    elif line != 'BOOT':
+        last_operator_input_ts = time.time()
+    # ---------------------------------------------------------
+
+    # A physical-reset incident must always be escapable,
+    # even if a menu or confirmation screen is open. Handle
+    # Pump Stop synchronously so normal state returns as soon
+    # as the physical button command is received.
+    if line == 'PS' and physical_reset_safety_active:
+        msg = "Serial: Pump Stop acknowledged physical-reset safety"
+        print(msg)
+        append_debug_log(
+            debug_log,
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n",
+        )
+        handle_box_pump_stop_button("serial pump stop")
+        return
+
+    if should_ignore_menu_ov_bounce(line, "Serial"):
+        return
+
+    # Handle exit confirmation dialog
+    if exit_confirm_window:
+        if line == 'OV':
+            msg = "Serial: Exit confirmation (OV - Confirm)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if exit_confirm_handler:
+                root.after(0, exit_confirm_handler)
+        elif line == 'PS':
+            msg = "Serial: Exit confirmation (PS - Cancel)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if exit_cancel_handler:
+                root.after(0, exit_cancel_handler)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in exit confirmation: '{line}'\n")
+
+    # Handle reset season confirmation dialog
+    elif reset_season_confirm_window:
+        if line == 'OV':
+            msg = "Serial: Reset season confirmation (OV - Confirm)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if reset_season_confirm_handler:
+                root.after(0, reset_season_confirm_handler)
+        elif line == 'PS':
+            msg = "Serial: Reset season confirmation (PS - Cancel)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if reset_season_cancel_handler:
+                root.after(0, reset_season_cancel_handler)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
+
+    # Handle flow curve reset confirmation dialog
+    elif reset_flow_curve_confirm_window:
+        if line == 'OV':
+            msg = "Serial: Flow curve reset confirmation (OV - Confirm)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if reset_flow_curve_confirm_handler:
+                root.after(0, reset_flow_curve_confirm_handler)
+        elif line == 'PS':
+            msg = "Serial: Flow curve reset confirmation (PS - Cancel)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if reset_flow_curve_cancel_handler:
+                root.after(0, reset_flow_curve_cancel_handler)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
+
+    # Handle learned flow curve accept confirmation dialog
+    elif accept_flow_curve_confirm_window:
+        if line == 'OV':
+            msg = "Serial: Flow curve accept confirmation (OV - Confirm)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if accept_flow_curve_confirm_handler:
+                root.after(0, accept_flow_curve_confirm_handler)
+        elif line == 'PS':
+            msg = "Serial: Flow curve accept confirmation (PS - Cancel)"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            if accept_flow_curve_cancel_handler:
+                root.after(0, accept_flow_curve_cancel_handler)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
+
+    # Handle reminders mode - dismiss on OV
+    elif reminders_mode:
+        if line == 'OV':
+            msg = "Serial: Dismiss reminders"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, dismiss_reminders)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reminders mode: '{line}'\n")
+
+    elif calibration_mode:
+        if calibration_state and calibration_state.get("phase") == "review" and line == '+1':
+            msg = "Serial: Calibration reread"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, calibration_reread_now)
+        elif line in ('+1', '-1', '+10', '-10'):
+            msg = f"Serial: Calibration command {line}"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, calibration_adjust_value, int(line))
+        elif line == 'OV':
+            msg = "Serial: Calibration confirm"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, calibration_confirm)
+        elif line == 'PS':
+            msg = "Serial: Calibration cancel/back"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, calibration_cancel)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in calibration mode: '{line}'\n")
+
+    # Handle log viewer navigation if in log viewer mode
+    elif log_viewer_mode:
+        if line == '+1':
+            msg = "Serial: Log viewer scroll down"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, log_viewer_scroll_down)
+        elif line == '-1':
+            msg = "Serial: Log viewer scroll up"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, log_viewer_scroll_up)
+        elif line == 'OV':
+            msg = "Serial: Log viewer exit"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, close_log_viewer)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in log viewer mode: '{line}'\n")
+
+    # Handle fill history navigation if in fill history mode
+    elif fill_history_mode:
+        if line == '+1':
+            msg = "Serial: Fill history scroll down"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, fill_history_scroll_down)
+        elif line == '-1':
+            msg = "Serial: Fill history scroll up"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, fill_history_scroll_up)
+        elif line == 'OV':
+            msg = "Serial: Fill history exit"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, close_fill_history)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in fill history mode: '{line}'\n")
+
+    # Handle self-test mode
+    elif self_test_mode:
+        if line == 'OV':
+            msg = "Serial: Self-test exit"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, close_self_test)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in self-test mode: '{line}'\n")
+
+    # Handle full-test mode
+    elif full_test_mode:
+        if line == 'OV':
+            # Check if OV test has been done already
+            if full_test_window and hasattr(full_test_window, 'test_status'):
+                if not full_test_window.test_status['OV']:
+                    # First press: mark OV as tested
+                    msg = "Serial: Full-test OV command detected (marked as tested)"
+                    print(msg)
+                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                    root.after(0, lambda: full_test_window.mark_tested('OV'))
+                else:
+                    # Second press: exit full test
+                    msg = "Serial: Full-test exit (OV pressed second time)"
+                    print(msg)
+                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                    root.after(0, close_full_test)
+            else:
+                # Fallback: just exit
+                msg = "Serial: Full-test exit (OV pressed)"
+                print(msg)
+                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                root.after(0, close_full_test)
+        elif line in ['-1', '+1', '-10', '+10', 'PS']:
+            msg = f"Serial: Full-test {line} command detected"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            # Mark the corresponding test as passed
+            if full_test_window and hasattr(full_test_window, 'mark_tested'):
+                if line == '-1':
+                    root.after(0, lambda: full_test_window.mark_tested('minus_1'))
+                elif line == '+1':
+                    root.after(0, lambda: full_test_window.mark_tested('plus_1'))
+                elif line == '-10':
+                    root.after(0, lambda: full_test_window.mark_tested('minus_10'))
+                elif line == '+10':
+                    root.after(0, lambda: full_test_window.mark_tested('plus_10'))
+                elif line == 'PS':
+                    root.after(0, lambda: full_test_window.mark_tested('PS'))
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in full-test mode: '{line}'\n")
+
+    # Handle update mode
+    elif update_mode:
+        if line == 'OV':
+            msg = "Serial: Update exit"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, close_update)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in update mode: '{line}'\n")
+
+    # Handle menu navigation if in menu mode
+    elif menu_mode:
+        if line == '+1':
+            msg = "Serial: Menu navigate down"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            menu_navigate_down()
+        elif line == '-1':
+            msg = "Serial: Menu navigate up"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            menu_navigate_up()
+        elif line == 'OV':
+            msg = "Serial: Menu select"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            arm_menu_ov_guard()
+            root.after(0, menu_select)
+        else:
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
+
+    # Normal dashboard mode
+    else:
+        # Handle adjustment commands
+        if line in ['+1', '-1', '+10', '-10']:
+            try:
+                adjustment = int(line)
+                if adjust_batch_mix_gallons(adjustment, "Serial"):
+                    return
+                requested_gallons += adjustment
+                # Don't allow requested gallons to go below zero
+                if requested_gallons < 0:
+                    requested_gallons = 0
+                colors_are_green = False  # Reset colors when requested gallons changes
+                # Update the current mode's preset
+                if current_mode == 'fill':
+                    fill_requested_gallons = requested_gallons
+                else:
+                    mix_requested_gallons = requested_gallons
+                save_mode_presets()
+                heartbeat_age = time.time() - last_heartbeat_time if last_heartbeat_time else -1
+                msg = (
+                    f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons} "
+                    f"(heartbeat_age={heartbeat_age:.1f}s, mode={current_mode})"
+                )
+                print(msg)
+                log_serial_debug(msg)
+                root.after(
+                    0,
+                    lambda value=requested_gallons, is_green=colors_are_green: (
+                        draw_requested_number(f"{value:.0f}", "green" if is_green else "red")
+                        if batch_mix_layout_active
+                        else (draw_requested_number(f"{value:.0f}", "green" if is_green else "red"), update_batch_mix_overlay())
+                    ),
+                )
+            except ValueError as ve:
+                log_serial_debug(f"ValueError parsing adjustment: {ve}")
+
+        # Handle special commands
+        elif line == 'PS':
+            msg = "Serial: Pump Stop command received - activating relay"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            start_pump_stop_thread(config.PUMP_STOP_DURATION)
+
+        elif line == 'OV':
+            # Check if requested gallons is 0 to trigger menu or leave batch mix screen.
+            if requested_gallons == 0:
+                if current_mode == 'mix' and batch_mix_data is not None:
+                    msg = "Serial: Batch mix screen exit triggered (gallons=0, OV pressed)"
+                    print(msg)
+                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                    root.after(0, lambda: clear_batch_mix_screen("serial OV at zero gallons"))
+                else:
+                    msg = "Serial: Menu access triggered (gallons=0, OV pressed)"
+                    print(msg)
+                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                    # Show menu in main thread
+                    arm_menu_ov_guard()
+                    root.after(0, show_menu)
+            else:
+                now = time.monotonic()
+                if now - last_serial_ov_toggle_time < SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS:
+                    msg = "Serial: Ignored OV debounce during override toggle"
+                    print(msg)
+                    log_serial_debug(msg)
+                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+                    return
+                last_serial_ov_toggle_time = now
+                override_mode = not override_mode
+                if override_mode:
+                    override_enabled_time = time.time()  # Record when enabled
+                msg = f"Serial: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
+                print(msg)
+                append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+
+
+        elif line == 'TU':
+            msg = "Serial: Thumbs Up command received"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, lambda: handle_thumbs_up_press("serial TU"))
+
+        elif line in ('RST', 'RESET'):
+            msg = "Serial: Flow reset command received"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, lambda: force_flow_reset("serial reset"))
+
+        elif line == 'MIX':
+            msg = "Serial: Mix mode command received"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, lambda: switch_mode('mix'))
+
+        elif line == 'FILL':
+            msg = "Serial: Fill mode command received"
+            print(msg)
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            root.after(0, lambda: switch_mode('fill'))
+
+        else:
+            # Unknown command
+            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Unknown command: '{line}'\n")
+
+
+
+def can_switchbox_listener():
+    """swbox r2 CAN consumer: translates frames into the V1.9 tokens and feeds
+    handle_switchbox_line(). Missing/down can0 is logged and retried."""
+    global serial_connected
+    if not getattr(config, "SWITCHBOX_CAN_ENABLED", False) or not getattr(config, "CAN_INTERFACE", None):
+        print("CAN switch box listener disabled")
+        return
+    ifname = config.CAN_INTERFACE
+    retry = getattr(config, "SWITCHBOX_CAN_RETRY_SECONDS", 5.0)
+    last_err = None
+    while True:
+        sock = None
+        try:
+            sock = swbox_can.open_can_socket(ifname, timeout=1.0)
+            consumer = swbox_can.SwitchboxCanConsumer(
+                dispatch=lambda tok: handle_switchbox_line(tok, "CAN"),
+                send=lambda cid, data: sock.send(swbox_can.pack_frame(cid, data)),
+                log=log_serial_debug,
+            )
+            serial_connected = True
+            last_err = None
+            msg = f"CAN switch box listener started on {ifname}"
+            print(msg)
+            log_serial_debug(msg)
+            while True:
+                try:
+                    raw = sock.recv(swbox_can.CAN_FRAME_SIZE)
+                except socket.timeout:
+                    continue
+                can_id, data = swbox_can.unpack_frame(raw)
+                if can_id is None:
+                    continue
+                try:
+                    consumer.handle(can_id, data)
+                except Exception as e:  # never let one bad frame kill the link
+                    log_serial_debug(f"CAN frame handling error ({can_id:#x}): {e}")
+        except (OSError, AttributeError) as e:
+            serial_connected = False
+            if str(e) != last_err:
+                msg = f"CAN switch box: {ifname} unavailable ({e}); retrying every {retry:.0f}s"
+                print(msg)
+                log_serial_debug(msg)
+                last_err = str(e)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        time.sleep(retry)
+
+
 def serial_listener():
     """Listen for serial messages with format: requested,actual"""
     global requested_gallons, serial_connected, override_mode, colors_are_green, last_heartbeat_time
@@ -7462,365 +7896,7 @@ def serial_listener():
                         log_serial_debug(f"Complete line: '{line}'")
 
                         if line:
-                            # Update heartbeat if we receive OK message
-                            if line == 'OK':
-                                last_heartbeat_time = time.time()
-                                log_serial_debug("Heartbeat received (OK)")
-                                continue  # Don't process OK as a command
-
-                            # --- Phantom-OV diagnostics (event-driven; OV is rare) ---
-                            if line == 'OV':
-                                _log_ov_diag("Serial")
-                            elif line != 'BOOT':
-                                last_operator_input_ts = time.time()
-                            # ---------------------------------------------------------
-
-                            # A physical-reset incident must always be escapable,
-                            # even if a menu or confirmation screen is open. Handle
-                            # Pump Stop synchronously so normal state returns as soon
-                            # as the physical button command is received.
-                            if line == 'PS' and physical_reset_safety_active:
-                                msg = "Serial: Pump Stop acknowledged physical-reset safety"
-                                print(msg)
-                                append_debug_log(
-                                    debug_log,
-                                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n",
-                                )
-                                handle_box_pump_stop_button("serial pump stop")
-                                continue
-
-                            if should_ignore_menu_ov_bounce(line, "Serial"):
-                                continue
-
-                            # Handle exit confirmation dialog
-                            if exit_confirm_window:
-                                if line == 'OV':
-                                    msg = "Serial: Exit confirmation (OV - Confirm)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if exit_confirm_handler:
-                                        root.after(0, exit_confirm_handler)
-                                elif line == 'PS':
-                                    msg = "Serial: Exit confirmation (PS - Cancel)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if exit_cancel_handler:
-                                        root.after(0, exit_cancel_handler)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in exit confirmation: '{line}'\n")
-
-                            # Handle reset season confirmation dialog
-                            elif reset_season_confirm_window:
-                                if line == 'OV':
-                                    msg = "Serial: Reset season confirmation (OV - Confirm)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if reset_season_confirm_handler:
-                                        root.after(0, reset_season_confirm_handler)
-                                elif line == 'PS':
-                                    msg = "Serial: Reset season confirmation (PS - Cancel)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if reset_season_cancel_handler:
-                                        root.after(0, reset_season_cancel_handler)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reset season confirmation: '{line}'\n")
-
-                            # Handle flow curve reset confirmation dialog
-                            elif reset_flow_curve_confirm_window:
-                                if line == 'OV':
-                                    msg = "Serial: Flow curve reset confirmation (OV - Confirm)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if reset_flow_curve_confirm_handler:
-                                        root.after(0, reset_flow_curve_confirm_handler)
-                                elif line == 'PS':
-                                    msg = "Serial: Flow curve reset confirmation (PS - Cancel)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if reset_flow_curve_cancel_handler:
-                                        root.after(0, reset_flow_curve_cancel_handler)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve reset confirmation: '{line}'\n")
-
-                            # Handle learned flow curve accept confirmation dialog
-                            elif accept_flow_curve_confirm_window:
-                                if line == 'OV':
-                                    msg = "Serial: Flow curve accept confirmation (OV - Confirm)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if accept_flow_curve_confirm_handler:
-                                        root.after(0, accept_flow_curve_confirm_handler)
-                                elif line == 'PS':
-                                    msg = "Serial: Flow curve accept confirmation (PS - Cancel)"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    if accept_flow_curve_cancel_handler:
-                                        root.after(0, accept_flow_curve_cancel_handler)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in flow curve accept confirmation: '{line}'\n")
-
-                            # Handle reminders mode - dismiss on OV
-                            elif reminders_mode:
-                                if line == 'OV':
-                                    msg = "Serial: Dismiss reminders"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, dismiss_reminders)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in reminders mode: '{line}'\n")
-
-                            elif calibration_mode:
-                                if calibration_state and calibration_state.get("phase") == "review" and line == '+1':
-                                    msg = "Serial: Calibration reread"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, calibration_reread_now)
-                                elif line in ('+1', '-1', '+10', '-10'):
-                                    msg = f"Serial: Calibration command {line}"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, calibration_adjust_value, int(line))
-                                elif line == 'OV':
-                                    msg = "Serial: Calibration confirm"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, calibration_confirm)
-                                elif line == 'PS':
-                                    msg = "Serial: Calibration cancel/back"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, calibration_cancel)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in calibration mode: '{line}'\n")
-
-                            # Handle log viewer navigation if in log viewer mode
-                            elif log_viewer_mode:
-                                if line == '+1':
-                                    msg = "Serial: Log viewer scroll down"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, log_viewer_scroll_down)
-                                elif line == '-1':
-                                    msg = "Serial: Log viewer scroll up"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, log_viewer_scroll_up)
-                                elif line == 'OV':
-                                    msg = "Serial: Log viewer exit"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, close_log_viewer)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in log viewer mode: '{line}'\n")
-
-                            # Handle fill history navigation if in fill history mode
-                            elif fill_history_mode:
-                                if line == '+1':
-                                    msg = "Serial: Fill history scroll down"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, fill_history_scroll_down)
-                                elif line == '-1':
-                                    msg = "Serial: Fill history scroll up"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, fill_history_scroll_up)
-                                elif line == 'OV':
-                                    msg = "Serial: Fill history exit"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, close_fill_history)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in fill history mode: '{line}'\n")
-
-                            # Handle self-test mode
-                            elif self_test_mode:
-                                if line == 'OV':
-                                    msg = "Serial: Self-test exit"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, close_self_test)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in self-test mode: '{line}'\n")
-
-                            # Handle full-test mode
-                            elif full_test_mode:
-                                if line == 'OV':
-                                    # Check if OV test has been done already
-                                    if full_test_window and hasattr(full_test_window, 'test_status'):
-                                        if not full_test_window.test_status['OV']:
-                                            # First press: mark OV as tested
-                                            msg = "Serial: Full-test OV command detected (marked as tested)"
-                                            print(msg)
-                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                            root.after(0, lambda: full_test_window.mark_tested('OV'))
-                                        else:
-                                            # Second press: exit full test
-                                            msg = "Serial: Full-test exit (OV pressed second time)"
-                                            print(msg)
-                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                            root.after(0, close_full_test)
-                                    else:
-                                        # Fallback: just exit
-                                        msg = "Serial: Full-test exit (OV pressed)"
-                                        print(msg)
-                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                        root.after(0, close_full_test)
-                                elif line in ['-1', '+1', '-10', '+10', 'PS']:
-                                    msg = f"Serial: Full-test {line} command detected"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    # Mark the corresponding test as passed
-                                    if full_test_window and hasattr(full_test_window, 'mark_tested'):
-                                        if line == '-1':
-                                            root.after(0, lambda: full_test_window.mark_tested('minus_1'))
-                                        elif line == '+1':
-                                            root.after(0, lambda: full_test_window.mark_tested('plus_1'))
-                                        elif line == '-10':
-                                            root.after(0, lambda: full_test_window.mark_tested('minus_10'))
-                                        elif line == '+10':
-                                            root.after(0, lambda: full_test_window.mark_tested('plus_10'))
-                                        elif line == 'PS':
-                                            root.after(0, lambda: full_test_window.mark_tested('PS'))
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in full-test mode: '{line}'\n")
-
-                            # Handle update mode
-                            elif update_mode:
-                                if line == 'OV':
-                                    msg = "Serial: Update exit"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, close_update)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in update mode: '{line}'\n")
-
-                            # Handle menu navigation if in menu mode
-                            elif menu_mode:
-                                if line == '+1':
-                                    msg = "Serial: Menu navigate down"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    menu_navigate_down()
-                                elif line == '-1':
-                                    msg = "Serial: Menu navigate up"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    menu_navigate_up()
-                                elif line == 'OV':
-                                    msg = "Serial: Menu select"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    arm_menu_ov_guard()
-                                    root.after(0, menu_select)
-                                else:
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Ignored in menu mode: '{line}'\n")
-
-                            # Normal dashboard mode
-                            else:
-                                # Handle adjustment commands
-                                if line in ['+1', '-1', '+10', '-10']:
-                                    try:
-                                        adjustment = int(line)
-                                        if adjust_batch_mix_gallons(adjustment, "Serial"):
-                                            continue
-                                        requested_gallons += adjustment
-                                        # Don't allow requested gallons to go below zero
-                                        if requested_gallons < 0:
-                                            requested_gallons = 0
-                                        colors_are_green = False  # Reset colors when requested gallons changes
-                                        # Update the current mode's preset
-                                        if current_mode == 'fill':
-                                            fill_requested_gallons = requested_gallons
-                                        else:
-                                            mix_requested_gallons = requested_gallons
-                                        save_mode_presets()
-                                        heartbeat_age = time.time() - last_heartbeat_time if last_heartbeat_time else -1
-                                        msg = (
-                                            f"Serial: Adjusted by {adjustment}, requested gallons now {requested_gallons} "
-                                            f"(heartbeat_age={heartbeat_age:.1f}s, mode={current_mode})"
-                                        )
-                                        print(msg)
-                                        log_serial_debug(msg)
-                                        root.after(
-                                            0,
-                                            lambda value=requested_gallons, is_green=colors_are_green: (
-                                                draw_requested_number(f"{value:.0f}", "green" if is_green else "red")
-                                                if batch_mix_layout_active
-                                                else (draw_requested_number(f"{value:.0f}", "green" if is_green else "red"), update_batch_mix_overlay())
-                                            ),
-                                        )
-                                    except ValueError as ve:
-                                        log_serial_debug(f"ValueError parsing adjustment: {ve}")
-
-                                # Handle special commands
-                                elif line == 'PS':
-                                    msg = "Serial: Pump Stop command received - activating relay"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    start_pump_stop_thread(config.PUMP_STOP_DURATION)
-
-                                elif line == 'OV':
-                                    global override_enabled_time
-                                    # Check if requested gallons is 0 to trigger menu or leave batch mix screen.
-                                    if requested_gallons == 0:
-                                        if current_mode == 'mix' and batch_mix_data is not None:
-                                            msg = "Serial: Batch mix screen exit triggered (gallons=0, OV pressed)"
-                                            print(msg)
-                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                            root.after(0, lambda: clear_batch_mix_screen("serial OV at zero gallons"))
-                                        else:
-                                            msg = "Serial: Menu access triggered (gallons=0, OV pressed)"
-                                            print(msg)
-                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                            # Show menu in main thread
-                                            arm_menu_ov_guard()
-                                            root.after(0, show_menu)
-                                    else:
-                                        now = time.monotonic()
-                                        if now - last_serial_ov_toggle_time < SERIAL_OV_TOGGLE_DEBOUNCE_SECONDS:
-                                            msg = "Serial: Ignored OV debounce during override toggle"
-                                            print(msg)
-                                            log_serial_debug(msg)
-                                            append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                            continue
-                                        last_serial_ov_toggle_time = now
-                                        override_mode = not override_mode
-                                        if override_mode:
-                                            override_enabled_time = time.time()  # Record when enabled
-                                        msg = f"Serial: Override mode {'ENABLED' if override_mode else 'DISABLED'}"
-                                        print(msg)
-                                        append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-
-
-                                elif line == 'TU':
-                                    msg = "Serial: Thumbs Up command received"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, lambda: handle_thumbs_up_press("serial TU"))
-
-                                elif line in ('RST', 'RESET'):
-                                    msg = "Serial: Flow reset command received"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, lambda: force_flow_reset("serial reset"))
-
-                                elif line == 'MIX':
-                                    msg = "Serial: Mix mode command received"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, lambda: switch_mode('mix'))
-
-                                elif line == 'FILL':
-                                    msg = "Serial: Fill mode command received"
-                                    print(msg)
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-                                    root.after(0, lambda: switch_mode('fill'))
-
-                                else:
-                                    # Unknown command
-                                    append_debug_log(debug_log, f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Unknown command: '{line}'\n")
+                            handle_switchbox_line(line, "Serial")
                 else:
                     time.sleep(0.1)
             except Exception as e:
@@ -9120,8 +9196,8 @@ def _update_dashboard_tick():
     flow_meter_disconnected = (time.time() - last_successful_read_time) > config.FLOW_METER_TIMEOUT
     update_flow_meter_fault_hold(flow_meter_disconnected)
 
-    # Check if heartbeat has timed out (no OK message in 11 seconds)
-    heartbeat_timeout = (time.time() - last_heartbeat_time) > 11
+    # Check if heartbeat has timed out (serial "OK" 11 s / CAN STATUS 3 s)
+    heartbeat_timeout = (time.time() - last_heartbeat_time) > getattr(config, "SWITCHBOX_HEARTBEAT_TIMEOUT", 11)
     if heartbeat_timeout and not heartbeat_disconnected:
         heartbeat_disconnected = True
         msg = "Heartbeat timeout - Switch box disconnected"
@@ -9844,6 +9920,10 @@ else:
     # Start serial listener in background thread (works without IOL)
     serial_thread = threading.Thread(target=serial_listener, daemon=True)
     serial_thread.start()
+
+    # swbox r2 switch box over CAN (HAT v2)
+    can_switchbox_thread = threading.Thread(target=can_switchbox_listener, daemon=True)
+    can_switchbox_thread.start()
 
     # Start socket command listener in background thread (for BLE server communication)
     socket_thread = threading.Thread(target=socket_command_listener, daemon=True)

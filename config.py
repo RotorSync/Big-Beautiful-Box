@@ -46,6 +46,13 @@ SERIAL_BAUD = 115200          # Kept for a legacy board that sets SERIAL_PORT
 CAN_INTERFACE = "can0"
 CAN_BITRATE = 250000
 
+# swbox r2 switch box over CAN (replaces the serial link). None disables it.
+SWITCHBOX_CAN_ENABLED = True
+SWITCHBOX_CAN_RETRY_SECONDS = 5.0
+# Heartbeat loss timeout. V1.9 serial: "OK" every 10 s -> 11 s. swbox r2 CAN:
+# STATUS every 1 s, receiver timeout 3 s (swbox.dbc).
+SWITCHBOX_HEARTBEAT_TIMEOUT = 3.0 if not SERIAL_PORT else 11.0
+
 
 # =============================================================================
 # RELAY TIMING

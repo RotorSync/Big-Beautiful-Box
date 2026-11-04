@@ -489,10 +489,11 @@ def test_reset_button_cannot_clear_a_physical_reset_incident():
 
 def test_serial_pump_stop_acknowledges_before_any_mode_routing():
     tree = ast.parse(DASHBOARD_PATH.read_text(encoding="utf-8"))
+    # Dispatch moved into the shared handler used by serial and CAN.
     listener = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "serial_listener"
+        if isinstance(node, ast.FunctionDef) and node.name == "_handle_switchbox_line_locked"
     )
     acknowledgement = next(
         node
