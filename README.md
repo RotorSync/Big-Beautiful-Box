@@ -67,10 +67,18 @@ Check for v1.2 branch or updated documentation before use with newer hardware.
 
 | GPIO | Function |
 |------|----------|
-| GPIO 14/15 | UART RX/TX (Serial to Switch Box) |
+| GPIO 14/15 | Not used on HAT v2 (was UART /dev/ttyAMA0 to the Pico switch box; `SERIAL_PORT = None`) |
+| GPIO 16 | K4 spare relay (HAT v2, J7 NC/COM/NO dry contact; `AUX_RELAY_PIN`) |
+| GPIO 18-21 | SPI1 (CE0/MISO/MOSI/SCLK) to the HAT v2 MCP2518FD CAN controller |
 | GPIO 22 | Thumbs Up button input |
-| GPIO 27 | Pump stop relay |
-| GPIO 7-11, 24-25 | SPI + interrupts (IOL HAT) |
+| GPIO 23 | K3 flow meter reset relay |
+| GPIO 26 | MCP2518FD nINT (CAN interrupt) |
+| GPIO 27 | Pump stop relay (K2) |
+| GPIO 7-11, 24-25 | SPI0 + interrupts (IOL HAT; GPIO25 = IRQ for IOL ports 3/4 with `-i 34`, GPIO24 = IRQ for ports 1/2) |
+
+CAN (HAT v2): `can0` at 250 kbit/s (same bus as the MFP head and swbox r2), from
+`dtoverlay=mcp251xfd,spi1-0,oscillator=40000000,interrupt=26` and `deploy/bbb-can0.service`.
+No dashboard code reads CAN yet.
 
 ### Switch Box Controls
 
@@ -287,7 +295,7 @@ Run the installer as user `pi`, then reboot when it finishes.
 The install script configures:
 - Python dependencies
 - HDMI display settings
-- UART on GPIO 14/15
+- HAT v2 CAN overlay (MCP2518FD on SPI1) and can0 bring-up (no UART on HAT v2)
 - Auto-login and screen timeout
 - Systemd services
 

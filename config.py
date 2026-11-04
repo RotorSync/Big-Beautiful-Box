@@ -14,6 +14,12 @@ Edit values here to customize behavior without modifying the main code.
 FLOW_RESET_PIN = 23           # GPIO pin for flow meter reset relay (K3 on BCM GPIO23, physical pin 16; was GPIO0/ID_SD)
 PUMP_STOP_RELAY_PIN = 27      # GPIO pin for pump stop/alert relay
 GREEN_BUTTON_PIN = 22         # GPIO pin for green button (active low with pull-up)
+AUX_RELAY_PIN = 16            # K4 on HAT v2 (BCM GPIO16, physical pin 36, net RLY_AUX -> R53/Q3).
+                              # Spare non-latching relay (J107F 5 V); its dry contact goes to
+                              # J7 (1 NC, 2 COM, 3 NO) with snubber R58/C36. Nothing on the
+                              # HAT powers it; whatever is wired to J7 is switched. Driven LOW
+                              # (off) at boot; no automatic logic uses it yet.
+AUX_RELAY_PULSE_DURATION = 0.5  # Seconds for pulse_aux_relay()
 
 # Flow meter reset timing
 FLOW_RESET_DELAY = 30         # Seconds to wait after thumbs up before resetting
@@ -24,9 +30,21 @@ FLOW_RESET_DURATION = 0.2     # Seconds to hold reset relay closed
 # SERIAL COMMUNICATION
 # =============================================================================
 
-# RS485 serial interface settings
-SERIAL_PORT = "/dev/ttyAMA0"  # Primary UART on GPIO 14/15 (physical pins 8/10)
-SERIAL_BAUD = 115200          # Serial baud rate (must match sender device)
+# Legacy switch box serial link. HAT v2 has no UART: GPIO14/15 (pins 8/10)
+# are not connected, so /dev/ttyAMA0 is no longer used. None disables the
+# serial listener and the serial self-test. The swbox r2 talks CAN instead.
+SERIAL_PORT = None            # was "/dev/ttyAMA0"
+SERIAL_BAUD = 115200          # Kept for a legacy board that sets SERIAL_PORT
+
+
+# =============================================================================
+# CAN (HAT v2: MCP2518FD on SPI1 CE0, INT on GPIO26, 40 MHz crystal Y1)
+# =============================================================================
+
+# Same bus as the MFP head and swbox r2: 250 kbit/s, 29-bit IDs.
+# Brought up by deploy/bbb-can0.service; boot overlay in deploy/boot-firmware-bbb.conf.
+CAN_INTERFACE = "can0"
+CAN_BITRATE = 250000
 
 
 # =============================================================================

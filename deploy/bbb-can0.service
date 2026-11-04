@@ -1,0 +1,17 @@
+[Unit]
+Description=BBB HAT v2 CAN bring-up (can0, MCP2518FD, 250 kbit/s)
+# can0 only exists once dtoverlay=mcp251xfd (deploy/boot-firmware-bbb.conf) is active.
+BindsTo=sys-subsystem-net-devices-can0.device
+After=sys-subsystem-net-devices-can0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bitrate matches the MFP head and swbox r2 (config.CAN_BITRATE). Sample point is
+# left to the kernel default (CiA 87.5 %); restart-ms recovers from bus-off.
+ExecStartPre=-/sbin/ip link set can0 down
+ExecStart=/sbin/ip link set can0 up type can bitrate 250000 restart-ms 100
+ExecStop=/sbin/ip link set can0 down
+
+[Install]
+WantedBy=sys-subsystem-net-devices-can0.device

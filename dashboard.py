@@ -886,6 +886,31 @@ def _set_pump_stop_output(active, reason):
     return True
 
 
+def set_aux_relay(active, reason="manual"):
+    """Drive K4 (HAT v2 spare relay, config.AUX_RELAY_PIN). HIGH = energized."""
+    if SIM_MODE:
+        return True
+    if not GPIO_AVAILABLE:
+        log_relay_event(f"ERROR: Cannot {'activate' if active else 'release'} K4 aux relay ({reason}); GPIO unavailable")
+        return False
+    GPIO.output(config.AUX_RELAY_PIN, GPIO.HIGH if active else GPIO.LOW)
+    log_relay_event(f"K4 aux relay {'HIGH' if active else 'LOW'} ({reason})")
+    return True
+
+
+def pulse_aux_relay(duration=None, reason="pulse"):
+    """Energize K4 for duration seconds (blocking), then release it."""
+    if duration is None:
+        duration = config.AUX_RELAY_PULSE_DURATION
+    if not set_aux_relay(True, reason):
+        return False
+    try:
+        time.sleep(duration)
+    finally:
+        set_aux_relay(False, reason)
+    return True
+
+
 def set_pump_stop_fault_hold(active, reason="flow meter fault", pulse_on_latch=True):
     """Latch flow-meter fault status and pulse pump stop when the fault starts."""
     global pump_stop_fault_hold_active, pump_stop_fault_hold_reason
@@ -4060,13 +4085,16 @@ def run_self_test():
         # Test 2: Serial Port
         results_text.insert(tk.END, "2. Serial Port Test: ")
         results_text.update()
-        try:
-            import serial
-            ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
-            ser.close()
-            results_text.insert(tk.END, "PASS\n", "pass")
-        except Exception as e:
-            results_text.insert(tk.END, f"FAIL ({e})\n", "fail")
+        if not config.SERIAL_PORT:
+            results_text.insert(tk.END, "SKIP (No UART on HAT v2)\n", "skip")
+        else:
+            try:
+                import serial
+                ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
+                ser.close()
+                results_text.insert(tk.END, "PASS\n", "pass")
+            except Exception as e:
+                results_text.insert(tk.END, f"FAIL ({e})\n", "fail")
         results_text.update()
 
         # Test 3: IOL-HAT
@@ -4244,14 +4272,15 @@ def run_full_test():
 
         time.sleep(0.2)
 
-        # Test 3: Serial Port
-        try:
-            import serial
-            ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
-            ser.close()
-            root.after(0, lambda: mark_tested('serial'))
-        except Exception:
-            pass
+        # Test 3: Serial Port (skipped: HAT v2 has no UART)
+        if config.SERIAL_PORT:
+            try:
+                import serial
+                ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=1)
+                ser.close()
+                root.after(0, lambda: mark_tested('serial'))
+            except Exception:
+                pass
 
         time.sleep(0.2)
 
@@ -7394,6 +7423,13 @@ def serial_listener():
     debug_log = config.SERIAL_DEBUG_LOG
     buffer = ""
 
+    if not config.SERIAL_PORT:
+        # HAT v2 has no UART on GPIO14/15: no serial switch box link.
+        msg = "Serial listener disabled (config.SERIAL_PORT is None; HAT v2 has no UART)"
+        print(msg)
+        log_serial_debug(msg)
+        return
+
     try:
         ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=0.5)
         ser.reset_input_buffer()
@@ -7813,6 +7849,8 @@ def initialize_gpio():
         GPIO.setup(config.PUMP_STOP_RELAY_PIN, GPIO.OUT)
         GPIO.setup(config.FLOW_RESET_PIN, GPIO.OUT)
         GPIO.output(config.FLOW_RESET_PIN, GPIO.LOW)
+        GPIO.setup(config.AUX_RELAY_PIN, GPIO.OUT)
+        GPIO.output(config.AUX_RELAY_PIN, GPIO.LOW)
         GPIO.output(config.PUMP_STOP_RELAY_PIN, GPIO.LOW)
         print(f"GPIO initialized: Relay on pin {config.PUMP_STOP_RELAY_PIN}")
         return True

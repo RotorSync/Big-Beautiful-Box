@@ -373,7 +373,7 @@ if [ -f "$BBB_BOOT_SNIPPET" ]; then
         if ! grep -Fqx "$line" "$BBB_BOOT_CFG"; then
             echo "$line" | sudo tee -a "$BBB_BOOT_CFG" > /dev/null
             case "$line" in
-                enable_uart=*|dtparam=uart0=*|dtoverlay=disable-bt)
+                dtoverlay=spi1-1cs*|dtoverlay=mcp251xfd*)
                     UART_CHANGED=1
                     ;;
             esac
@@ -381,16 +381,18 @@ if [ -f "$BBB_BOOT_SNIPPET" ]; then
     done < "$BBB_BOOT_SNIPPET"
 fi
 
-# Explicitly enforce BBB UART settings for the switch box serial link.
-for uart_line in "enable_uart=0" "dtparam=uart0=on" "dtoverlay=disable-bt"; do
-    if ! grep -Fqx "$uart_line" "$BBB_BOOT_CFG"; then
-        append_if_missing "$BBB_BOOT_CFG" "$uart_line"
+# HAT v2: no UART on GPIO14/15 (the old /dev/ttyAMA0 switch box link is gone).
+# Ensure the MCP2518FD CAN overlay lines are present (UART_CHANGED now means
+# "boot overlay changed").
+for boot_line in "dtoverlay=spi1-1cs,cs0_spidev=off" "dtoverlay=mcp251xfd,spi1-0,oscillator=40000000,interrupt=26"; do
+    if ! grep -Fqx "$boot_line" "$BBB_BOOT_CFG"; then
+        append_if_missing "$BBB_BOOT_CFG" "$boot_line"
         UART_CHANGED=1
     fi
 done
 
 if [ "$UART_CHANGED" -eq 1 ]; then
-    log_warn "Applied UART boot settings for /dev/ttyAMA0. A reboot is required before the switch box serial link will work."
+    log_warn "Applied HAT v2 CAN boot overlay (mcp251xfd on spi1). A reboot is required before can0 exists."
 fi
 
 # Force the desktop/KMS stack to boot the primary HDMI output at 1080p30.
@@ -488,6 +490,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable iol_dashboard.service
 sudo systemctl enable rotorsync.service
 sudo systemctl enable rotorsync_watchdog.service
+# HAT v2 CAN bring-up (can0 at 250 kbit/s once the mcp251xfd overlay is active)
+sudo cp "$SCRIPT_DIR/deploy/bbb-can0.service" /etc/systemd/system/
+sudo systemctl enable bbb-can0.service
 
 # RotorLink: local WiFi link (iPad <-> dashboard bridge) + WiFi maintenance terminal
 if ! python3 -c "import websockets" >/dev/null 2>&1; then
@@ -589,7 +594,7 @@ log_info "Next steps:"
 log_info "  1. Reboot: sudo reboot"
 log_info "  2. Check status: systemctl status iol_dashboard.service"
 log_info "  3. Check BLE status: systemctl status rotorsync.service"
-log_info "  4. After reboot, confirm serial: ls -l /dev/ttyAMA0"
+log_info "  4. After reboot, confirm CAN: ip -details link show can0"
 log_info "  5. View logs: tail -f ~/iol_dashboard.log"
 echo ""
 
